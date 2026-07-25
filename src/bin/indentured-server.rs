@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use build_service::artifacts::spawn_gc_task;
-use build_service::config::Config;
-use build_service::http;
-use build_service::logging::LoggingSettings;
-use build_service::workspace::{spawn_gc_task as spawn_workspace_gc_task, WorkspaceState};
+use indentured_server::artifacts::{prepare_artifact_storage_root, spawn_gc_task};
+use indentured_server::config::Config;
+use indentured_server::http;
+use indentured_server::logging::LoggingSettings;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Host-side build daemon")]
@@ -45,21 +44,20 @@ async fn main() -> ExitCode {
         }
     };
 
-    tracing::info!("build-service starting");
+    tracing::info!("indentured-server starting");
 
-    let workspace_state = Arc::new(WorkspaceState::new(
-        config.build.workspace_root.clone(),
-        config.build.default_workspace_path.clone(),
-        config.build.workspace.clone(),
-    ));
-
-    spawn_gc_task(config.clone());
-    spawn_workspace_gc_task(Arc::clone(&workspace_state));
-
+    if let Err(err) = prepare_artifact_storage_root(&config.artifacts.storage_root) {
+        eprintln!("failed to protect artifact storage root: {err}");
+        return ExitCode::from(1);
+    }
+    if let Err(err) = spawn_gc_task(config.clone()) {
+        eprintln!("failed to start artifact gc: {err}");
+        return ExitCode::from(1);
+    }
     let config = Arc::new(config);
 
-    if let Err(err) = http::run(config, workspace_state).await {
-        eprintln!("build-service failed: {err}");
+    if let Err(err) = http::run(config).await {
+        eprintln!("indentured-server failed: {err}");
         return ExitCode::from(1);
     }
 

@@ -1,0 +1,30 @@
+[Unit]
+Description=Indentured Server
+After=local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/indentured-server --config /etc/indentured-server/config.toml
+Restart=on-failure
+User=root
+
+# The daemon owns credentials/state; each configured task drops to a dedicated
+# non-admin build identity. The config references this runtime path and never
+# contains the token value.
+LoadCredential=bearer-token:/etc/indentured-server/secrets/bearer-token
+RuntimeDirectory=indentured-server/control
+RuntimeDirectoryMode=0700
+StateDirectory=indentured-server
+StateDirectoryMode=0700
+LogsDirectory=indentured-server
+LogsDirectoryMode=0700
+UMask=0077
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/indentured-server /var/log/indentured-server /run/indentured-server
+
+[Install]
+WantedBy=multi-user.target

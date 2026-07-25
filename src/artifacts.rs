@@ -2,22 +2,22 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use glob::glob;
 use tracing::{info, warn};
 use walkdir::WalkDir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions as FileOptions;
 use zip::ZipWriter;
 
-use crate::config::ArtifactsConfig;
-use crate::protocol::{ArtifactArchive, ArtifactRestrictions, ArtifactSpec};
+use crate::config::{ArtifactSpec, ArtifactsConfig};
+use crate::protocol::{ArtifactArchive, ArtifactRestrictions};
 use crate::validation::validate_relative_pattern;
 
 const DEFAULT_GC_INTERVAL_SECS: u64 = 3600;
-const INTERNAL_EXCLUDE_PATTERN: &str = ".build-service/**";
+const INTERNAL_EXCLUDE_PATTERN: &str = ".indentured-server/**";
 const TRANSFER_LIMIT_SENTINEL: &str = "artifacts.max_transfer_bytes exceeded";
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,15 @@ pub enum ArtifactError {
 
     #[error("artifact contents exceed artifacts.max_uncompressed_bytes ({max_bytes} bytes)")]
     UncompressedTooLarge { max_bytes: u64 },
+
+    #[error("artifact file count exceeds artifacts.max_files ({max_files})")]
+    TooManyFiles { max_files: usize },
+
+    #[error("artifact path depth exceeds artifacts.max_depth ({max_depth})")]
+    TooDeep { max_depth: usize },
+
+    #[error("artifact path {path:?} is a symlink or unsupported special file")]
+    UnsupportedFile { path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -85,67 +94,45 @@ pub fn collect_artifacts_zip(
     let mut excludes = spec.exclude.clone();
     excludes.push(INTERNAL_EXCLUDE_PATTERN.to_string());
     let exclude_patterns = compile_patterns(&excludes, "artifacts.exclude")?;
+    let include_patterns = compile_patterns(&spec.include, "artifacts.include")?;
     let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut traversal = TraversalLimits::new(config.max_files, config.max_depth);
 
-    for pattern in &spec.include {
-        validate_relative_pattern(pattern, "artifacts.include").map_err(|err| {
-            ArtifactError::InvalidPattern {
-                message: err.to_string(),
-            }
+    // Walk once and apply every server-owned pattern to each candidate. This keeps
+    // file-count/depth enforcement in front of recursive descent and accumulation;
+    // no glob implementation performs an independent unbounded recursive walk.
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let entry = entry.map_err(|source| ArtifactError::Io {
+            context: "walk artifact root",
+            source: io::Error::other(source.to_string()),
         })?;
-
-        let pattern_root = root.join(pattern).to_string_lossy().into_owned();
-        info!(
-            "artifact glob: pattern={:?} root={:?} full_path={:?}",
-            pattern, root, pattern_root
-        );
-        let entries = glob(&pattern_root).map_err(|source| ArtifactError::GlobPattern {
-            pattern: pattern.to_string(),
+        let rel = entry
+            .path()
+            .strip_prefix(&root)
+            .map_err(|_| ArtifactError::OutsideRoot {
+                path: entry.path().to_path_buf(),
+            })?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        traversal.observe(rel)?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if is_excluded(rel, &exclude_patterns) || !is_included(rel, &include_patterns) {
+            continue;
+        }
+        require_regular_or_directory(entry.path())?;
+        let canonical = fs::canonicalize(entry.path()).map_err(|source| ArtifactError::Io {
+            context: "canonicalize artifact path",
             source,
         })?;
-
-        let mut found = false;
-        if collect_recursive_prefix(pattern, &root, &exclude_patterns, &mut matched_files)? {
-            found = true;
+        if !canonical.starts_with(&root) {
+            return Err(ArtifactError::OutsideRoot { path: canonical });
         }
-
-        for entry in entries {
-            let path = entry.map_err(|source| ArtifactError::Io {
-                context: "expand artifact glob",
-                source: io::Error::other(source.to_string()),
-            })?;
-            info!("artifact glob matched: {:?}", path);
-            found = true;
-            let canonical = fs::canonicalize(&path).map_err(|source| ArtifactError::Io {
-                context: "canonicalize artifact path",
-                source,
-            })?;
-
-            if !canonical.starts_with(&root) {
-                return Err(ArtifactError::OutsideRoot { path: canonical });
-            }
-
-            if canonical.is_dir() {
-                collect_dir_files(&canonical, &root, &exclude_patterns, &mut matched_files)?;
-            } else if canonical.is_file() {
-                let rel = canonical
-                    .strip_prefix(&root)
-                    .map_err(|_| ArtifactError::OutsideRoot {
-                        path: canonical.clone(),
-                    })?
-                    .to_path_buf();
-                if !is_excluded(&rel, &exclude_patterns) {
-                    matched_files.entry(canonical).or_insert(rel);
-                }
-            }
-        }
-
-        if !found {
-            info!(
-                "artifact pattern matched nothing, skipping: pattern={:?} checked_path={:?}",
-                pattern, pattern_root
-            );
-        }
+        matched_files
+            .entry(canonical)
+            .or_insert_with(|| rel.to_path_buf());
     }
 
     let restrictions = apply_restricted_patterns(
@@ -163,28 +150,44 @@ pub fn collect_artifacts_zip(
         });
     }
 
+    validate_artifact_count_and_depth(&matched_files, config.max_files, config.max_depth)?;
+    let total_uncompressed_bytes = sum_matched_file_sizes(&matched_files)?;
+    if total_uncompressed_bytes > config.max_uncompressed_bytes {
+        return Err(ArtifactError::UncompressedTooLarge {
+            max_bytes: config.max_uncompressed_bytes,
+        });
+    }
+
     let dest_dir = config.storage_root.join(build_id);
     fs::create_dir_all(&dest_dir).map_err(|source| ArtifactError::Io {
         context: "create artifact directory",
         source,
     })?;
-
-    let total_uncompressed_bytes = sum_matched_file_sizes(&matched_files)?;
-    if let Some(max_uncompressed_bytes) = config.max_uncompressed_bytes {
-        if total_uncompressed_bytes > max_uncompressed_bytes {
-            return Err(ArtifactError::UncompressedTooLarge {
-                max_bytes: max_uncompressed_bytes,
-            });
+    fs::set_permissions(&dest_dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        ArtifactError::Io {
+            context: "protect artifact directory",
+            source,
         }
-    }
+    })?;
 
     let dest = dest_dir.join("artifacts.zip");
+    let temp_dest = dest_dir.join(".artifacts.zip.tmp");
     let size = write_artifacts_zip(
-        &dest,
+        &temp_dest,
         &matched_files,
         config.max_transfer_bytes,
         config.max_uncompressed_bytes,
     )?;
+    fs::set_permissions(&temp_dest, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        ArtifactError::Io {
+            context: "protect artifact archive",
+            source,
+        }
+    })?;
+    fs::rename(&temp_dest, &dest).map_err(|source| ArtifactError::Io {
+        context: "publish artifact archive",
+        source,
+    })?;
 
     Ok(ArtifactCollection {
         archive: Some(ArtifactArchive {
@@ -193,6 +196,83 @@ pub fn collect_artifacts_zip(
         }),
         restrictions,
     })
+}
+
+fn require_regular_or_directory(path: &Path) -> Result<(), ArtifactError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ArtifactError::Io {
+        context: "inspect artifact path",
+        source,
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink()
+        || !(file_type.is_file() || file_type.is_dir())
+        || file_type.is_fifo()
+        || file_type.is_socket()
+        || file_type.is_block_device()
+        || file_type.is_char_device()
+    {
+        return Err(ArtifactError::UnsupportedFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+struct TraversalLimits {
+    observed: HashSet<PathBuf>,
+    max_files: usize,
+    max_depth: usize,
+}
+
+impl TraversalLimits {
+    fn new(max_files: usize, max_depth: usize) -> Self {
+        Self {
+            observed: HashSet::new(),
+            max_files,
+            max_depth,
+        }
+    }
+
+    fn observe(&mut self, relative: &Path) -> Result<(), ArtifactError> {
+        if relative.components().count() > self.max_depth {
+            return Err(ArtifactError::TooDeep {
+                max_depth: self.max_depth,
+            });
+        }
+        if !self.observed.contains(relative) {
+            if self.observed.len() >= self.max_files {
+                return Err(ArtifactError::TooManyFiles {
+                    max_files: self.max_files,
+                });
+            }
+            self.observed.insert(relative.to_path_buf());
+        }
+        Ok(())
+    }
+}
+
+fn validate_artifact_count_and_depth(
+    matched_files: &HashMap<PathBuf, PathBuf>,
+    max_files: usize,
+    max_depth: usize,
+) -> Result<(), ArtifactError> {
+    if matched_files.len() > max_files {
+        return Err(ArtifactError::TooManyFiles { max_files });
+    }
+    if matched_files
+        .values()
+        .any(|path| path.components().count() > max_depth)
+    {
+        return Err(ArtifactError::TooDeep { max_depth });
+    }
+    let mut folded = HashSet::new();
+    for rel in matched_files.values() {
+        let key = rel.to_string_lossy().to_ascii_lowercase();
+        if !folded.insert(key) {
+            return Err(ArtifactError::UnsupportedFile { path: rel.clone() });
+        }
+    }
+    Ok(())
 }
 
 fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u64, ArtifactError> {
@@ -205,51 +285,6 @@ fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u
         total = total.saturating_add(metadata.len());
     }
     Ok(total)
-}
-
-fn collect_recursive_prefix(
-    pattern: &str,
-    root: &Path,
-    exclude_patterns: &[glob::Pattern],
-    matched_files: &mut HashMap<PathBuf, PathBuf>,
-) -> Result<bool, ArtifactError> {
-    let base = if pattern == "**" {
-        Some("")
-    } else {
-        pattern
-            .strip_suffix("/**")
-            .or_else(|| pattern.strip_suffix("\\**"))
-    };
-
-    let Some(base) = base else {
-        return Ok(false);
-    };
-
-    let base_path = if base.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(base)
-    };
-
-    if !base_path.exists() {
-        return Ok(false);
-    }
-
-    let canonical = fs::canonicalize(&base_path).map_err(|source| ArtifactError::Io {
-        context: "canonicalize artifact prefix",
-        source,
-    })?;
-
-    if !canonical.starts_with(root) {
-        return Err(ArtifactError::OutsideRoot { path: canonical });
-    }
-
-    if canonical.is_dir() {
-        collect_dir_files(&canonical, root, exclude_patterns, matched_files)?;
-        return Ok(true);
-    }
-
-    Ok(false)
 }
 
 fn compile_patterns(patterns: &[String], field: &str) -> Result<Vec<glob::Pattern>, ArtifactError> {
@@ -316,41 +351,6 @@ fn apply_restricted_patterns(
     }))
 }
 
-fn collect_dir_files(
-    dir: &Path,
-    root: &Path,
-    exclude_patterns: &[glob::Pattern],
-    matched_files: &mut HashMap<PathBuf, PathBuf>,
-) -> Result<(), ArtifactError> {
-    for entry in WalkDir::new(dir) {
-        let entry = entry.map_err(|source| ArtifactError::Io {
-            context: "walk artifact dir",
-            source: io::Error::other(source.to_string()),
-        })?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let canonical = fs::canonicalize(entry.path()).map_err(|source| ArtifactError::Io {
-            context: "canonicalize artifact file",
-            source,
-        })?;
-        if !canonical.starts_with(root) {
-            return Err(ArtifactError::OutsideRoot { path: canonical });
-        }
-        let rel = canonical
-            .strip_prefix(root)
-            .map_err(|_| ArtifactError::OutsideRoot {
-                path: canonical.clone(),
-            })?
-            .to_path_buf();
-        if is_excluded(&rel, exclude_patterns) {
-            continue;
-        }
-        matched_files.entry(canonical).or_insert(rel);
-    }
-    Ok(())
-}
-
 fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
     if patterns.is_empty() {
         return false;
@@ -360,20 +360,26 @@ fn is_excluded(path: &Path, patterns: &[glob::Pattern]) -> bool {
     patterns.iter().any(|pattern| pattern.matches(&path_str))
 }
 
+fn is_included(path: &Path, patterns: &[glob::Pattern]) -> bool {
+    patterns.iter().any(|pattern| {
+        path.ancestors()
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .any(|candidate| pattern.matches(&candidate.to_string_lossy()))
+    })
+}
+
 fn write_artifacts_zip(
     dest: &Path,
     matched_files: &HashMap<PathBuf, PathBuf>,
-    max_transfer_bytes: Option<u64>,
-    max_uncompressed_bytes: Option<u64>,
+    max_transfer_bytes: u64,
+    max_uncompressed_bytes: u64,
 ) -> Result<u64, ArtifactError> {
-    use std::os::unix::fs::PermissionsExt;
-
     let result = (|| {
         let file = File::create(dest).map_err(|source| ArtifactError::Io {
             context: "create artifacts.zip",
             source,
         })?;
-        let transfer_limit = Rc::new(Cell::new(max_transfer_bytes));
+        let transfer_limit = Rc::new(Cell::new(Some(max_transfer_bytes)));
         let mut zip = ZipWriter::new(LimitedWriter::new(file, Rc::clone(&transfer_limit)));
 
         let mut items: Vec<_> = matched_files.iter().collect();
@@ -398,9 +404,9 @@ fn write_artifacts_zip(
 
             if let Err(source) = zip.start_file(name, options) {
                 if is_transfer_limit_zip_error(&source) {
-                    finish_after_transfer_limit(&mut zip, &transfer_limit);
+                    transfer_limit.set(None);
                     return Err(ArtifactError::TransferTooLarge {
-                        max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                        max_bytes: max_transfer_bytes,
                     });
                 }
                 return Err(ArtifactError::Zip { source });
@@ -423,17 +429,17 @@ fn write_artifacts_zip(
                 }
 
                 uncompressed_bytes = uncompressed_bytes.saturating_add(bytes as u64);
-                if let Some(limit) = max_uncompressed_bytes {
-                    if uncompressed_bytes > limit {
-                        return Err(ArtifactError::UncompressedTooLarge { max_bytes: limit });
-                    }
+                if uncompressed_bytes > max_uncompressed_bytes {
+                    return Err(ArtifactError::UncompressedTooLarge {
+                        max_bytes: max_uncompressed_bytes,
+                    });
                 }
 
                 if let Err(source) = zip.write_all(&buffer[..bytes]) {
                     if is_transfer_limit_error(&source) {
-                        finish_after_transfer_limit(&mut zip, &transfer_limit);
+                        transfer_limit.set(None);
                         return Err(ArtifactError::TransferTooLarge {
-                            max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                            max_bytes: max_transfer_bytes,
                         });
                     }
                     return Err(ArtifactError::Io {
@@ -444,19 +450,29 @@ fn write_artifacts_zip(
             }
         }
 
-        let writer = match zip.finish() {
+        let mut writer = match zip.finish() {
             Ok(writer) => writer,
             Err(source) => {
                 if is_transfer_limit_zip_error(&source) {
-                    finish_after_transfer_limit(&mut zip, &transfer_limit);
+                    transfer_limit.set(None);
                     return Err(ArtifactError::TransferTooLarge {
-                        max_bytes: max_transfer_bytes.expect("transfer limit must be set"),
+                        max_bytes: max_transfer_bytes,
                     });
                 }
                 return Err(ArtifactError::Zip { source });
             }
         };
-        Ok(writer.bytes_written())
+        writer.flush().map_err(|source| ArtifactError::Io {
+            context: "flush artifact archive",
+            source,
+        })?;
+        drop(writer);
+        fs::metadata(dest)
+            .map(|metadata| metadata.len())
+            .map_err(|source| ArtifactError::Io {
+                context: "stat artifact archive",
+                source,
+            })
     })();
 
     if result.is_err() {
@@ -464,14 +480,6 @@ fn write_artifacts_zip(
     }
 
     result
-}
-
-fn finish_after_transfer_limit<W: io::Write + io::Seek>(
-    zip: &mut ZipWriter<LimitedWriter<W>>,
-    transfer_limit: &Rc<Cell<Option<u64>>>,
-) {
-    transfer_limit.set(None);
-    let _ = zip.finish();
 }
 
 fn is_transfer_limit_error(err: &io::Error) -> bool {
@@ -495,10 +503,6 @@ impl<W> LimitedWriter<W> {
             bytes_written: 0,
             max_bytes,
         }
-    }
-
-    fn bytes_written(&self) -> u64 {
-        self.bytes_written
     }
 }
 
@@ -526,9 +530,60 @@ impl<W: io::Seek> io::Seek for LimitedWriter<W> {
     }
 }
 
-pub fn spawn_gc_task(config: crate::config::Config) {
+pub fn prepare_artifact_storage_root(root: &Path) -> Result<(), ArtifactError> {
+    fs::create_dir_all(root).map_err(|source| ArtifactError::Io {
+        context: "create artifacts root",
+        source,
+    })?;
+    let metadata = fs::symlink_metadata(root).map_err(|source| ArtifactError::Io {
+        context: "inspect artifacts root",
+        source,
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(ArtifactError::Io {
+            context: "validate artifacts root ownership",
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "artifact storage root must be a daemon-owned real directory",
+            ),
+        });
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        ArtifactError::Io {
+            context: "protect artifacts root",
+            source,
+        }
+    })
+}
+
+fn validate_gc_root(root: &Path) -> Result<(), ArtifactError> {
+    let metadata = fs::symlink_metadata(root).map_err(|source| ArtifactError::Io {
+        context: "inspect artifact gc root",
+        source,
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(ArtifactError::Io {
+            context: "validate artifact gc root protection",
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "artifact gc root must be a daemon-owned, mode-0700 real directory",
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub fn spawn_gc_task(config: crate::config::Config) -> Result<(), ArtifactError> {
+    validate_gc_root(&config.artifacts.storage_root)?;
     if config.artifacts.ttl_sec.is_none() && config.artifacts.max_bytes.is_none() {
-        return;
+        return Ok(());
     }
 
     let artifacts = config.artifacts.clone();
@@ -542,9 +597,11 @@ pub fn spawn_gc_task(config: crate::config::Config) {
         }
         std::thread::sleep(Duration::from_secs(interval));
     });
+    Ok(())
 }
 
 fn gc_artifacts(config: &ArtifactsConfig) -> Result<(), ArtifactError> {
+    validate_gc_root(&config.storage_root)?;
     let mut entries = scan_artifact_entries(&config.storage_root)?;
     if entries.is_empty() {
         return Ok(());
@@ -729,6 +786,7 @@ mod tests {
         assert!(archive.path.ends_with("artifacts.zip"));
         let zip_path = config.storage_root.join("bld").join("artifacts.zip");
         assert!(zip_path.exists());
+        assert_eq!(archive.size, std::fs::metadata(zip_path).unwrap().len());
     }
 
     #[test]
@@ -806,7 +864,7 @@ mod tests {
         std::fs::write(root.path().join("large.h"), "artifact payload").expect("write source");
 
         let mut config = artifacts_config(root.path());
-        config.max_uncompressed_bytes = Some(1);
+        config.max_uncompressed_bytes = 1;
         config.restricted_patterns = vec!["*.h".to_string()];
         let spec = ArtifactSpec {
             include: vec!["*.h".to_string()],
@@ -823,7 +881,7 @@ mod tests {
     #[test]
     fn collect_artifacts_internal_excludes_are_not_reported_as_restrictions() {
         let root = tempdir().expect("tempdir");
-        let internal = root.path().join(".build-service");
+        let internal = root.path().join(".indentured-server");
         let output = root.path().join("out");
         std::fs::create_dir_all(&internal).expect("mkdir internal");
         std::fs::create_dir_all(&output).expect("mkdir out");
@@ -862,10 +920,84 @@ mod tests {
         };
 
         let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
-        match err {
-            ArtifactError::OutsideRoot { .. } => {}
-            other => panic!("unexpected error: {other}"),
-        }
+        assert!(matches!(err, ArtifactError::UnsupportedFile { .. }));
+    }
+
+    #[test]
+    fn collect_artifacts_rejects_special_files() {
+        let root = tempdir().expect("tempdir");
+        let socket_path = root.path().join("control.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let config = artifacts_config(root.path());
+        let spec = ArtifactSpec {
+            include: vec!["control.sock".to_string()],
+            exclude: vec![],
+        };
+        assert!(matches!(
+            collect_artifacts_zip(root.path(), &spec, &config, "bld"),
+            Err(ArtifactError::UnsupportedFile { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_gc_independently_rejects_symlinked_or_unprotected_roots() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("artifacts");
+        prepare_artifact_storage_root(&root).unwrap();
+        assert!(validate_gc_root(&root).is_ok());
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_gc_root(&root).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let link = temp.path().join("artifacts-link");
+        symlink(&root, &link).unwrap();
+        assert!(validate_gc_root(&link).is_err());
+        let mut config = artifacts_config(temp.path());
+        config.storage_root = link;
+        assert!(gc_artifacts(&config).is_err());
+    }
+
+    #[test]
+    fn traversal_limits_abort_before_accumulating_over_limit() {
+        let mut limits = TraversalLimits::new(1, 2);
+        limits.observe(Path::new("out/a")).unwrap();
+        assert!(matches!(
+            limits.observe(Path::new("out/b")),
+            Err(ArtifactError::TooManyFiles { max_files: 1 })
+        ));
+        assert_eq!(limits.observed.len(), 1);
+
+        let mut limits = TraversalLimits::new(10, 2);
+        assert!(matches!(
+            limits.observe(Path::new("out/deep/file")),
+            Err(ArtifactError::TooDeep { max_depth: 2 })
+        ));
+        assert!(limits.observed.is_empty());
+    }
+
+    #[test]
+    fn collect_artifacts_enforces_file_count_and_depth() {
+        let root = tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("out/deep")).unwrap();
+        std::fs::write(root.path().join("out/a"), "a").unwrap();
+        std::fs::write(root.path().join("out/deep/b"), "b").unwrap();
+        let spec = ArtifactSpec {
+            include: vec!["out/**".to_string()],
+            exclude: vec![],
+        };
+        let mut config = artifacts_config(root.path());
+        config.max_files = 1;
+        assert!(matches!(
+            collect_artifacts_zip(root.path(), &spec, &config, "bld"),
+            Err(ArtifactError::TooManyFiles { .. })
+        ));
+        config.max_files = 10;
+        config.max_depth = 2;
+        assert!(matches!(
+            collect_artifacts_zip(root.path(), &spec, &config, "bld"),
+            Err(ArtifactError::TooDeep { .. })
+        ));
     }
 
     #[test]
@@ -876,7 +1008,7 @@ mod tests {
         std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
         let config = ArtifactsConfig {
             storage_root: root.path().join("artifacts"),
-            max_uncompressed_bytes: Some(8),
+            max_uncompressed_bytes: 8,
             ..ArtifactsConfig::default()
         };
         let spec = ArtifactSpec {
@@ -907,7 +1039,7 @@ mod tests {
         std::fs::write(output.join("app.txt"), "artifact payload").expect("write");
         let config = ArtifactsConfig {
             storage_root: root.path().join("artifacts"),
-            max_transfer_bytes: Some(1),
+            max_transfer_bytes: 1,
             ..ArtifactsConfig::default()
         };
         let spec = ArtifactSpec {

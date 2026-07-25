@@ -1,76 +1,14 @@
 ## Development guidelines
 
-- For any new feature or behavior change, add or update tests and run `cargo test` before opening a PR (once the Rust project exists); tests must be deterministic and offline.
-- For any new feature or behavior change, update documentation appropriately. See docs and README.md.
-- When updating Rust code in this project, always run `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release` before committing and pushing.
-
-## Changelog
-
-Location: `CHANGELOG.md` (root)
-
-### Format
-
-Use these sections under `## [Unreleased]`:
-- `### Breaking Changes` - API changes requiring migration
-- `### Added` - New features
-- `### Changed` - Changes to existing functionality
-- `### Fixed` - Bug fixes
-- `### Removed` - Removed features
-
-### Rules
-
-- New entries ALWAYS go under `## [Unreleased]`
-- Append to existing subsections (e.g., `### Fixed`), do not create duplicates
-- NEVER modify already-released version sections (e.g., `## [0.0.3]`)
-- Use inline PR links: `([#123](https://github.com/kcosr/build-service/pull/123))`
-
-### Attribution
-
-- Internal changes: `Fixed foo bar ([#123](https://github.com/kcosr/build-service/pull/123))`
-- External contributions: `Added feature X ([#456](https://github.com/kcosr/build-service/pull/456) by [@user](https://github.com/user))`
-
-## Releasing
-
-### During Development
-
-When preparing PRs for main, open the PR first to get the PR number, then update `CHANGELOG.md` under `## [Unreleased]` with that PR number and push a follow-up commit.
-
-### When Ready to Release
-
-1. Checkout and update main:
-   ```bash
-   git checkout main && git pull
-   ```
-2. Verify `## [Unreleased]` in CHANGELOG.md has all changes documented
-3. Run the release script:
-   ```bash
-   node scripts/release.mjs current  # Release current Cargo.toml version
-   node scripts/release.mjs patch    # Bug fixes (0.0.3 -> 0.0.4)
-   node scripts/release.mjs minor    # New features (0.0.4 -> 0.1.0)
-   node scripts/release.mjs major    # Breaking changes (0.1.0 -> 1.0.0)
-   node scripts/release.mjs 0.6.0    # Explicit version
-   ```
-
-`scripts/release.mjs` is the only release entrypoint; version bumping is handled inside that script.
-
-### What the Script Does
-
-1. Verifies the current branch is `main`, the working tree is clean, local `main` matches `origin/main`, required tools are available, GitHub CLI is authenticated, and the local/remote tag is free
-2. Verifies the Rust project with `cargo check` and optionally bumps version in `Cargo.toml` (and `Cargo.lock`)
-3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
-4. Commits "Release vX.Y.Z" and creates git tag
-5. Pushes commit and tag atomically to origin
-6. Creates GitHub release with notes extracted from CHANGELOG
-7. Adds new `## [Unreleased]` section with `_No unreleased changes._` placeholder
-8. Commits "Prepare for next release" and pushes
-
-If GitHub release creation fails after the commit and tag are pushed, create
-the GitHub release manually for the existing tag instead of rerunning the
-script. Then add a fresh `## [Unreleased]` section with the standard
-`_No unreleased changes._` placeholder, commit it as
-`Prepare for next release`, and push `main`.
-
-Release archives are packaged separately after the GitHub release exists. Use
-the README release section as the source of truth for archive names and
-contents. The supported release platforms are currently `linux-x86_64` and
-`macos-arm64`, with `bin/build-service` and `bin/build-cli` in the archive.
+- Use Jujutsu (`jj`) for repository work. Use `jj st`, `jj diff`, `jj edit`, `jj new`, and other Jujutsu commands as appropriate. Do not use direct Git workflow commands such as `git status`, `git diff`, `git add`, `git commit`, `git checkout`, `git branch`, `git reset`, or `git rebase`. The `jj git` namespace is permitted for remote synchronization.
+- For any new feature or behavior change, add or update deterministic, offline tests and update the relevant documentation in `README.md` or `docs/`.
+- When updating Rust code, run:
+  ```sh
+  cargo fmt --all -- --check
+  cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+  cargo test --locked --offline --all-targets --all-features
+  cargo build --locked --offline --release --all-features
+  ```
+- Use the pinned Nix flake and Devenv tasks for reproducible package and development dependencies. Do not use Nix channels, `nix-env`, or imperative dependency installation.
+- Run `nix flake check --print-build-logs` natively on each supported platform; evaluation from another platform is not build attestation. On native Apple-silicon Darwin, also run `scripts/check-darwin.sh`.
+- Run `devenv tasks run integration:packaged-local` when changing package layout or the packaged upload/task/stream/exit/artifact flow.

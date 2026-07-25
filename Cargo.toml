@@ -1,18 +1,17 @@
 [package]
-name = "build-service"
-version = "0.5.2"
+name = "indentured-server"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["kevin <kevin@example.com>"]
-description = "Host-side build service that runs builds on behalf of container clients."
+description = "Synchronous service and CLI for server-owned named build tasks."
 
 [[bin]]
-name = "build-service"
-path = "src/bin/build-service.rs"
+name = "indentured-server"
+path = "src/bin/indentured-server.rs"
 
 [[bin]]
-name = "build-cli"
-path = "src/bin/build-cli.rs"
+name = "indentured"
+path = "src/bin/indentured.rs"
 
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
@@ -27,20 +26,21 @@ libc = "0.2"
 axum = { version = "0.7", features = ["multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1.6"
-blake3 = "1.5"
 glob = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["http1"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls-native-roots", "stream"] }
 rustls = "0.23"
 rustls-pemfile = "2.1"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1.8", features = ["v4"] }
 walkdir = "2.5"
-zip = "0.6"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 tempfile = "3.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+sha2 = "0.10"
+subtle = "2.6"
 
 [dev-dependencies]
 

@@ -1,0 +1,16 @@
+# Used only when no .jj repository marker is found.
+[sources]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+exclude = ["target/**", ".git/**", ".jj/**"]
+
+[connection]
+enabled = true
+endpoint = "https://builder.example.internal"
+token_file = "/run/user/UID/indentured-server/bearer-token"
+local_fallback = false
+
+[output]
+stdout_max_lines = 200
+stderr_max_lines = 200
+stdout_tail_lines = 20
+stderr_tail_lines = 20

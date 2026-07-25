@@ -1,9 +1,10 @@
 pub mod artifacts;
+pub mod bearer_token;
 pub mod build;
+pub mod client_source;
 pub mod config;
 pub mod http;
 pub mod logging;
 pub mod protocol;
 pub mod user;
 pub mod validation;
-pub mod workspace;

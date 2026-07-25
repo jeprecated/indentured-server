@@ -1,35 +1,37 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blake3::Hasher;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::artifacts::{collect_artifacts_zip, ArtifactError};
-use crate::config::Config;
-use crate::protocol::{ArtifactArchive, Request, ResponseEvent, SCHEMA_VERSION};
+use crate::config::{Config, TaskConfig, TaskExecution, SCRIPT_SHELL};
+use crate::protocol::{ArtifactArchive, Request, ResponseEvent, REQUEST_SCHEMA_VERSION};
 use crate::user::{lookup_group_gid, lookup_user, lookup_user_by_name, UserInfo};
-use crate::validation::{
-    validate_cwd, validate_make_args, validate_relative_path, ValidationError,
-};
-use crate::workspace::{WorkspaceGuard, WorkspacePlan, WorkspaceState};
+use crate::validation::{validate_cwd, validate_relative_path, ValidationError};
 
 const TIMEOUT_EXIT_CODE: i32 = 124;
-const TIMEOUT_KILL_GRACE_SECS: u64 = 5;
+#[cfg(not(test))]
+const TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TIMEOUT_KILL_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_CHUNK_SIZE: usize = 4096;
-const WORKSPACE_MANIFEST_FILE: &str = "manifest.json";
+#[cfg(not(test))]
+const OUTPUT_FORWARD_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const OUTPUT_FORWARD_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Default)]
 pub struct CancellationFlag(Arc<AtomicBool>);
@@ -78,265 +80,203 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 pub struct ValidatedRequest {
-    pub request: Request,
-    pub command_path: PathBuf,
-    pub timeout_sec: u64,
+    pub request_id: Option<String>,
+    pub task_id: String,
+    pub task: TaskConfig,
 }
 
 pub fn validate_request(request: Request, config: &Config) -> Result<ValidatedRequest, BuildError> {
-    if request.schema_version_or_default() != SCHEMA_VERSION {
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
         return Err(BuildError::new(
             "schema_version",
-            format!(
-                "unsupported schema_version {}",
-                request.schema_version_or_default()
-            ),
+            format!("unsupported schema_version {}", request.schema_version),
         ));
     }
-
-    if request.command.trim().is_empty() {
-        return Err(BuildError::new("command", "command must not be empty"));
-    }
-
-    let command_path = config
-        .build
-        .commands
-        .get(&request.command)
-        .cloned()
-        .ok_or_else(|| {
-            BuildError::new(
-                "command_not_allowed",
-                format!("command {} not allowed", request.command),
-            )
+    let task =
+        config.tasks.get(&request.task).cloned().ok_or_else(|| {
+            BuildError::new("unknown_task", format!("unknown task {}", request.task))
         })?;
-
-    let timeout = request
-        .timeout_sec
-        .unwrap_or(config.build.timeouts.default_sec);
-    if timeout == 0 {
-        return Err(BuildError::new(
-            "timeout",
-            "timeout_sec must be greater than zero",
-        ));
-    }
-    let timeout = timeout.min(config.build.timeouts.max_sec);
-
-    if let Some(env) = &request.env {
-        for key in env.keys() {
-            if key.trim().is_empty() {
-                return Err(BuildError::new("env", "env keys must not be empty"));
-            }
-            if !config
-                .build
-                .environment
-                .allow
-                .iter()
-                .any(|allowed| allowed == key)
-            {
-                return Err(BuildError::new(
-                    "env_not_allowed",
-                    format!("env {key} is not allowed"),
-                ));
-            }
-        }
-    }
-
-    for pattern in &request.artifacts.include {
-        if let Err(err) = crate::validation::validate_relative_pattern(pattern, "artifacts.include")
-        {
-            return Err(BuildError::new("artifact_pattern", err.to_string()));
-        }
-    }
-    for pattern in &request.artifacts.exclude {
-        if let Err(err) = crate::validation::validate_relative_pattern(pattern, "artifacts.exclude")
-        {
-            return Err(BuildError::new("artifact_pattern", err.to_string()));
-        }
-    }
-
-    if let Some(cwd) = &request.cwd {
-        if let Err(err) = validate_relative_path(cwd, "cwd") {
-            return Err(BuildError::new("cwd", err.to_string()));
-        }
-    }
-
     Ok(ValidatedRequest {
-        request,
-        command_path,
-        timeout_sec: timeout,
+        request_id: request.request_id,
+        task_id: request.task,
+        task,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn execute_build(
     validated: ValidatedRequest,
-    config: std::sync::Arc<Config>,
-    workspace_state: Arc<WorkspaceState>,
-    workspace_plan: WorkspacePlan,
-    source_archive: Option<PathBuf>,
+    config: Arc<Config>,
+    source_archive: tempfile::TempPath,
     sender: Sender<ResponseEvent>,
     cancellation: CancellationFlag,
-    workspace_guard: Option<WorkspaceGuard>,
 ) {
-    let _workspace_guard = workspace_guard;
-    let workspace_id = workspace_plan.managed_id.clone();
-
-    if let Err(err) = run_build(
-        validated,
-        &config,
-        &workspace_state,
-        &workspace_plan,
-        source_archive.as_deref(),
-        &sender,
-        &cancellation,
-    ) {
-        let _ = sender.blocking_send(ResponseEvent::Error {
-            code: err.code.to_string(),
-            message: Some(err.message),
-            pattern: err.pattern,
-        });
-        let _ = sender.blocking_send(ResponseEvent::Exit {
-            code: 1,
-            timed_out: false,
-            artifacts: None,
-            artifact_restrictions: None,
-            workspace_id,
-        });
-    }
-
-    if let Some(source_archive) = source_archive {
-        if let Err(err) = std::fs::remove_file(&source_archive) {
-            warn!(
-                "failed to remove source archive {:?}: {err}",
-                source_archive
-            );
-        }
+    if let Err(err) = run_build(validated, &config, &source_archive, &sender, &cancellation) {
+        let _ = send_response(
+            &sender,
+            ResponseEvent::Error {
+                code: err.code.to_string(),
+                message: Some(err.message),
+                pattern: err.pattern,
+            },
+        );
+        let _ = send_response(
+            &sender,
+            ResponseEvent::Exit {
+                code: 1,
+                timed_out: false,
+                artifacts: None,
+                artifact_restrictions: None,
+            },
+        );
     }
 }
 
 fn run_build(
     validated: ValidatedRequest,
     config: &Config,
-    workspace_state: &WorkspaceState,
-    workspace_plan: &WorkspacePlan,
-    source_archive: Option<&Path>,
+    source_archive: &Path,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
     let build_id = format!("bld_{}", Uuid::new_v4().simple());
-
-    sender
-        .blocking_send(ResponseEvent::Build {
+    send_response(
+        sender,
+        ResponseEvent::Build {
             id: build_id.clone(),
             status: "started".to_string(),
-        })
-        .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
+        },
+    )
+    .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
 
     let run_as = resolve_run_as(config)?;
+    std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
+        BuildError::new(
+            "workspace_create_failed",
+            format!("failed to create workspace root: {err}"),
+        )
+    })?;
+    let workspace = tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&config.build.workspace_root)
+        .map_err(|err| {
+            BuildError::new(
+                "workspace_create_failed",
+                format!("failed to create fresh workspace: {err}"),
+            )
+        })?;
+    extract_source_archive(
+        source_archive,
+        workspace.path(),
+        config.sources.max_uncompressed_bytes,
+        config.sources.max_files,
+        config.sources.max_depth,
+    )?;
+    prepare_workspace_ownership(workspace.path(), &run_as)?;
 
-    let workspace = prepare_workspace(config, workspace_plan, source_archive)?;
-    let workspace_id = workspace_plan.managed_id.as_deref();
-    let result = run_build_in_workspace(
+    run_build_in_workspace(
         &validated,
         config,
         &run_as,
-        &workspace,
+        workspace.path(),
         &build_id,
-        workspace_id,
         sender,
         cancellation,
-    );
-
-    if workspace_plan.record_use {
-        if let Err(err) = workspace_state.record_use(workspace_plan) {
-            warn!(
-                "failed to update workspace metadata {:?}: {err}",
-                workspace_plan.managed_id
-            );
-        }
-    }
-
-    result
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_build_in_workspace(
     validated: &ValidatedRequest,
     config: &Config,
     run_as: &RunAs,
     workspace_root: &Path,
     build_id: &str,
-    workspace_id: Option<&str>,
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
-    let cwd = resolve_cwd(workspace_root, validated.request.cwd.as_deref())?;
-
-    if validated.request.command == "make" {
-        validate_make_args(&validated.request.args, &cwd, workspace_root)
-            .map_err(to_validation_error)?;
-    }
-
-    let request_id = validated.request.request_id.as_deref().unwrap_or("-");
+    let cwd = resolve_cwd(workspace_root, Some(&validated.task.cwd))?;
+    let request_id = validated.request_id.as_deref().unwrap_or("-");
     info!(
-        "build started build_id={} request_id={} cwd={} args={:?}",
-        build_id,
-        request_id,
-        cwd.display(),
-        validated.request.args
+        "build started build_id={} request_id={} task={}",
+        build_id, request_id, validated.task_id
     );
 
-    let env = build_env(config, &validated.request.env, &run_as.user);
-
-    let mut command = Command::new(&validated.command_path);
+    let env = build_env(&validated.task, &run_as.user);
+    let mut command = match validated.task.execution() {
+        TaskExecution::Script(script) => {
+            let mut command = Command::new(SCRIPT_SHELL);
+            command.arg("-eu").arg("-c").arg(script);
+            command
+        }
+        TaskExecution::Executable { path, args } => {
+            let mut command = Command::new(path);
+            command.args(args);
+            command
+        }
+    };
     command
-        .args(&validated.request.args)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
-
     for (key, value) in env {
         command.env(key, value);
     }
-
     configure_command(&mut command, run_as)?;
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return Err(BuildError::new(
-                "spawn_failed",
-                format!("failed to spawn build: {err}"),
-            ));
-        }
-    };
-
+    let mut child = command
+        .spawn()
+        .map_err(|err| BuildError::new("spawn_failed", format!("failed to spawn task: {err}")))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| BuildError::new("io", "failed to capture stdout from build"))?;
+        .ok_or_else(|| BuildError::new("io", "failed to capture stdout from task"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| BuildError::new("io", "failed to capture stderr from build"))?;
-
-    let stdout_handle = spawn_output_thread(stdout, sender.clone(), StreamKind::Stdout);
-    let stderr_handle = spawn_output_thread(stderr, sender.clone(), StreamKind::Stderr);
+        .ok_or_else(|| BuildError::new("io", "failed to capture stderr from task"))?;
+    let output_bytes = Arc::new(AtomicU64::new(0));
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_handle = spawn_output_thread(
+        stdout,
+        sender.clone(),
+        StreamKind::Stdout,
+        config.build.max_output_bytes,
+        Arc::clone(&output_bytes),
+        Arc::clone(&output_exceeded),
+        cancellation.clone(),
+    );
+    let stderr_handle = spawn_output_thread(
+        stderr,
+        sender.clone(),
+        StreamKind::Stderr,
+        config.build.max_output_bytes,
+        Arc::clone(&output_bytes),
+        Arc::clone(&output_exceeded),
+        cancellation.clone(),
+    );
 
     let start = Instant::now();
-    let outcome = wait_with_timeout(&mut child, validated.timeout_sec, cancellation)
+    let outcome = wait_with_timeout(&mut child, validated.task.timeout_sec, cancellation)
         .map_err(|err| BuildError::new("wait_failed", err.to_string()))?;
+    join_output_thread(stdout_handle);
+    join_output_thread(stderr_handle);
 
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
+    if output_exceeded.load(Ordering::SeqCst) {
+        return Err(BuildError::new(
+            "output_limit",
+            format!(
+                "task output exceeds build.max_output_bytes ({} bytes)",
+                config.build.max_output_bytes
+            ),
+        ));
+    }
 
     let (exit_code, timed_out) = match outcome {
         WaitOutcome::Exited { code, timed_out } => (code, timed_out),
         WaitOutcome::Cancelled => {
             warn!(
-                "build cancelled build_id={} request_id={} duration_sec={} cwd={}",
+                "task cancelled build_id={} request_id={} duration_sec={} cwd={}",
                 build_id,
                 request_id,
                 start.elapsed().as_secs(),
@@ -348,83 +288,78 @@ fn run_build_in_workspace(
 
     if timed_out {
         warn!(
-            "build timed out build_id={} request_id={} duration_sec={} cwd={}",
+            "task timed out build_id={} request_id={} duration_sec={} cwd={}",
             build_id,
             request_id,
             start.elapsed().as_secs(),
             cwd.display()
         );
+    } else if exit_code == 0 {
+        info!(
+            "task completed build_id={} task={} exit_code=0 duration_sec={}",
+            build_id,
+            validated.task_id,
+            start.elapsed().as_secs()
+        );
     } else {
-        let level = if exit_code == 0 { "info" } else { "error" };
-        if level == "info" {
-            info!(
-                "build completed build_id={} exit_code={} duration_sec={}",
-                build_id,
-                exit_code,
-                start.elapsed().as_secs()
-            );
-        } else {
-            error!(
-                "build completed build_id={} exit_code={} duration_sec={}",
-                build_id,
-                exit_code,
-                start.elapsed().as_secs()
-            );
-        }
+        error!(
+            "task completed build_id={} task={} exit_code={} duration_sec={}",
+            build_id,
+            validated.task_id,
+            exit_code,
+            start.elapsed().as_secs()
+        );
     }
 
-    if timed_out || exit_code != 0 {
-        sender
-            .blocking_send(ResponseEvent::Exit {
-                code: exit_code,
-                timed_out,
-                artifacts: None,
-                artifact_restrictions: None,
-                workspace_id: workspace_id.map(|id| id.to_string()),
-            })
-            .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
-        return Ok(());
-    }
-
+    // The terminated task no longer owns the fresh workspace. Collect its
+    // configured outputs for success, ordinary failure, and timeout alike;
+    // the exit event below always preserves the original task status.
     let artifacts = match collect_artifacts_zip(
         workspace_root,
-        &validated.request.artifacts,
+        &validated.task.artifacts,
         &config.artifacts,
         build_id,
     ) {
         Ok(archive) => archive,
         Err(err) => {
             let build_err = map_artifact_error(err);
-            sender
-                .blocking_send(ResponseEvent::Error {
+            send_response(
+                sender,
+                ResponseEvent::Error {
                     code: build_err.code.to_string(),
                     message: Some(build_err.message.clone()),
                     pattern: build_err.pattern.clone(),
-                })
-                .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
-            sender
-                .blocking_send(ResponseEvent::Exit {
-                    code: 1,
-                    timed_out: false,
+                },
+            )
+            .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
+            send_response(
+                sender,
+                ResponseEvent::Exit {
+                    code: if exit_code == 0 && !timed_out {
+                        1
+                    } else {
+                        exit_code
+                    },
+                    timed_out,
                     artifacts: None,
                     artifact_restrictions: None,
-                    workspace_id: workspace_id.map(|id| id.to_string()),
-                })
-                .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
+                },
+            )
+            .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
             return Ok(());
         }
     };
 
-    sender
-        .blocking_send(ResponseEvent::Exit {
+    send_response(
+        sender,
+        ResponseEvent::Exit {
             code: exit_code,
             timed_out,
             artifacts: artifacts.archive,
             artifact_restrictions: artifacts.restrictions,
-            workspace_id: workspace_id.map(|id| id.to_string()),
-        })
-        .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
-
+        },
+    )
+    .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
     Ok(())
 }
 
@@ -456,85 +391,49 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
     }
 }
 
-fn prepare_workspace(
-    config: &Config,
-    plan: &WorkspacePlan,
-    source_archive: Option<&Path>,
-) -> Result<PathBuf, BuildError> {
-    let workspace = plan.path.clone();
-    let existed = workspace.exists();
-
-    if existed && !workspace.is_dir() {
-        return Err(BuildError::new(
-            "workspace_not_directory",
-            "workspace path exists but is not a directory",
-        ));
+fn prepare_workspace_ownership(workspace: &Path, run_as: &RunAs) -> Result<(), BuildError> {
+    if !run_as.set_ids {
+        return Ok(());
     }
-
-    if plan.record_use {
-        std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
+    for entry in walkdir::WalkDir::new(workspace).follow_links(false) {
+        let entry = entry.map_err(|err| {
             BuildError::new(
-                "workspace_create_failed",
-                format!("failed to create workspace root: {err}"),
+                "workspace_ownership",
+                format!("failed to inspect fresh workspace: {err}"),
             )
         })?;
-    }
-
-    if plan.record_use && plan.client_supplied && !plan.create && !existed {
-        return Err(BuildError::new(
-            "workspace_not_found",
-            "workspace not found",
-        ));
-    }
-
-    if !existed {
-        if plan.record_use {
-            std::fs::create_dir_all(&workspace).map_err(|err| {
-                BuildError::new(
-                    "workspace_create_failed",
-                    format!("failed to create workspace: {err}"),
-                )
-            })?;
-        } else {
+        let path = CString::new(entry.path().as_os_str().as_bytes())
+            .map_err(|_| BuildError::new("workspace_ownership", "workspace path contains NUL"))?;
+        let result = unsafe {
+            libc::lchown(
+                path.as_ptr(),
+                run_as.user.uid as libc::uid_t,
+                run_as.gid as libc::gid_t,
+            )
+        };
+        if result != 0 {
             return Err(BuildError::new(
-                "workspace_not_found",
-                "default workspace not found",
+                "workspace_ownership",
+                format!(
+                    "failed to assign fresh workspace to task user: {}",
+                    io::Error::last_os_error()
+                ),
             ));
         }
     }
-
-    if plan.record_use {
-        let meta_dir = workspace.join(".build-service");
-        std::fs::create_dir_all(&meta_dir).map_err(|err| {
-            BuildError::new(
-                "workspace_create_failed",
-                format!("failed to create workspace metadata dir: {err}"),
-            )
-        })?;
-    }
-
-    if let Some(source_archive) = source_archive {
-        extract_source_archive(
-            source_archive,
-            &workspace,
-            config.sources.max_uncompressed_bytes,
-            plan.record_use,
-            plan.refresh,
-        )?;
-    }
-
-    Ok(workspace)
+    Ok(())
 }
 
 fn extract_source_archive(
     source_archive: &Path,
     dest: &Path,
     max_uncompressed_bytes: u64,
-    use_manifest: bool,
-    refresh: bool,
+    max_files: usize,
+    max_depth: usize,
 ) -> Result<(), BuildError> {
     use std::os::unix::fs::PermissionsExt;
 
+    preflight_source_archive(source_archive, max_uncompressed_bytes, max_files, max_depth)?;
     let file = std::fs::File::open(source_archive).map_err(|err| {
         BuildError::new(
             "source_archive",
@@ -547,270 +446,229 @@ fn extract_source_archive(
             format!("failed to read source archive: {err}"),
         )
     })?;
-
-    let mut manifest = if use_manifest {
-        load_workspace_manifest(dest)
-    } else {
-        WorkspaceManifest::default()
-    };
-    let mut manifest_dirty = false;
-    let mut seen_source_paths = HashSet::new();
-
     let mut extracted_bytes = 0u64;
     let mut buffer = vec![0u8; 8192];
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|err| {
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| {
             BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
         })?;
-
-        validate_zip_entry_path(file.name())?;
-
-        let Some(enclosed) = file.enclosed_name() else {
-            return Err(BuildError::new(
-                "source_archive",
-                "zip entry had invalid path",
-            ));
-        };
-
-        if is_internal_build_service_path(enclosed) {
-            continue;
-        }
-
-        let out_path = dest.join(enclosed);
-        let unix_mode = file.unix_mode();
-        let entry_size = file.size();
-        let rel_path = enclosed.to_string_lossy().replace('\\', "/");
-
-        if file.is_dir() {
-            std::fs::create_dir_all(&out_path)
+        let is_symlink = entry.is_symlink();
+        let normalized = normalized_zip_path(entry.name(), entry.is_dir(), max_depth)?;
+        let output = dest.join(&normalized);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output)
                 .map_err(|err| BuildError::new("source_archive", format!("mkdir failed: {err}")))?;
+            if let Some(mode) = entry.unix_mode() {
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(mode & 0o777))
+                    .map_err(|err| {
+                        BuildError::new("source_archive", format!("set permissions failed: {err}"))
+                    })?;
+            }
             continue;
         }
-        seen_source_paths.insert(rel_path.clone());
-
-        if let Some(parent) = out_path.parent() {
+        if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| BuildError::new("source_archive", format!("mkdir failed: {err}")))?;
         }
-
-        let maybe_entry = manifest.entries.get(&rel_path);
-        let should_compare = use_manifest
-            && !refresh
-            && out_path.exists()
-            && maybe_entry
-                .map(|entry| entry.size == entry_size)
-                .unwrap_or(false);
-
-        if should_compare {
-            let parent = out_path.parent().unwrap_or(dest);
-            let mut temp = tempfile::Builder::new()
-                .prefix(".build-service-tmp-")
-                .tempfile_in(parent)
-                .map_err(|err| {
-                    BuildError::new("source_archive", format!("tempfile failed: {err}"))
-                })?;
-            let mut hasher = Hasher::new();
-
-            loop {
-                let bytes = file.read(&mut buffer).map_err(|err| {
-                    BuildError::new("source_archive", format!("read zip entry failed: {err}"))
-                })?;
-                if bytes == 0 {
-                    break;
-                }
-
-                extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_uncompressed_bytes {
-                    return Err(BuildError::new(
-                        "source_archive",
-                        format!(
-                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
-                        ),
-                    ));
-                }
-
-                hasher.update(&buffer[..bytes]);
-                temp.write_all(&buffer[..bytes]).map_err(|err| {
-                    BuildError::new("source_archive", format!("write file failed: {err}"))
-                })?;
-            }
-
-            let hash = hasher.finalize().to_hex().to_string();
-            let unchanged = maybe_entry.map(|entry| entry.hash == hash).unwrap_or(false);
-            if unchanged {
-                continue;
-            }
-
-            if out_path.exists() {
-                std::fs::remove_file(&out_path).map_err(|err| {
-                    BuildError::new("source_archive", format!("remove file failed: {err}"))
-                })?;
-            }
-
-            temp.persist(&out_path).map_err(|err| {
-                BuildError::new("source_archive", format!("persist temp file failed: {err}"))
+        if is_symlink {
+            let mut target = Vec::new();
+            entry.take(4097).read_to_end(&mut target).map_err(|err| {
+                BuildError::new(
+                    "source_archive",
+                    format!("read symlink target failed: {err}"),
+                )
             })?;
-
-            if let Some(mode) = unix_mode {
-                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
-                    .map_err(|err| {
-                        BuildError::new("source_archive", format!("set permissions failed: {err}"))
-                    })?;
+            extracted_bytes = extracted_bytes.saturating_add(target.len() as u64);
+            if extracted_bytes > max_uncompressed_bytes {
+                return Err(BuildError::new(
+                    "source_archive",
+                    "extracted size exceeds sources.max_uncompressed_bytes",
+                ));
             }
-
-            manifest.entries.insert(
-                rel_path.clone(),
-                ManifestEntry {
-                    size: entry_size,
-                    hash,
-                },
-            );
-            manifest_dirty = true;
-        } else {
-            let mut outfile = std::fs::File::create(&out_path).map_err(|err| {
+            let target = std::str::from_utf8(&target)
+                .map_err(|_| BuildError::new("source_archive", "symlink target is not UTF-8"))?;
+            crate::client_source::validate_symlink_target(&normalized, target)
+                .map_err(|err| BuildError::new("source_archive", err.to_string()))?;
+            std::os::unix::fs::symlink(target, &output).map_err(|err| {
+                BuildError::new("source_archive", format!("create symlink failed: {err}"))
+            })?;
+            continue;
+        }
+        let mut output_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|err| {
                 BuildError::new("source_archive", format!("create file failed: {err}"))
             })?;
-            let mut hasher = if use_manifest {
-                Some(Hasher::new())
-            } else {
-                None
-            };
-
-            loop {
-                let bytes = file.read(&mut buffer).map_err(|err| {
-                    BuildError::new("source_archive", format!("read zip entry failed: {err}"))
+        loop {
+            let bytes = entry.read(&mut buffer).map_err(|err| {
+                BuildError::new("source_archive", format!("read zip entry failed: {err}"))
+            })?;
+            if bytes == 0 {
+                break;
+            }
+            extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
+            if extracted_bytes > max_uncompressed_bytes {
+                return Err(BuildError::new(
+                    "source_archive",
+                    format!("extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"),
+                ));
+            }
+            output_file.write_all(&buffer[..bytes]).map_err(|err| {
+                BuildError::new("source_archive", format!("write file failed: {err}"))
+            })?;
+        }
+        if let Some(mode) = entry.unix_mode() {
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(mode & 0o777))
+                .map_err(|err| {
+                    BuildError::new("source_archive", format!("set permissions failed: {err}"))
                 })?;
-                if bytes == 0 {
-                    break;
-                }
-
-                extracted_bytes = extracted_bytes.saturating_add(bytes as u64);
-                if extracted_bytes > max_uncompressed_bytes {
-                    return Err(BuildError::new(
-                        "source_archive",
-                        format!(
-                            "extracted size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)"
-                        ),
-                    ));
-                }
-
-                if let Some(ref mut hasher) = hasher {
-                    hasher.update(&buffer[..bytes]);
-                }
-
-                outfile.write_all(&buffer[..bytes]).map_err(|err| {
-                    BuildError::new("source_archive", format!("write file failed: {err}"))
-                })?;
-            }
-
-            if let Some(hasher) = hasher {
-                let hash = hasher.finalize().to_hex().to_string();
-                manifest.entries.insert(
-                    rel_path.clone(),
-                    ManifestEntry {
-                        size: entry_size,
-                        hash,
-                    },
-                );
-                manifest_dirty = true;
-            }
-
-            // Restore Unix permissions if present in zip
-            if let Some(mode) = unix_mode {
-                std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))
-                    .map_err(|err| {
-                        BuildError::new("source_archive", format!("set permissions failed: {err}"))
-                    })?;
-            }
         }
     }
-
-    if use_manifest && remove_stale_manifest_entries(dest, &mut manifest, &seen_source_paths)? {
-        manifest_dirty = true;
-    }
-
-    if use_manifest && manifest_dirty {
-        write_workspace_manifest(dest, &manifest)?;
-    }
-
     Ok(())
 }
 
-fn remove_stale_manifest_entries(
-    dest: &Path,
-    manifest: &mut WorkspaceManifest,
-    seen_source_paths: &HashSet<String>,
-) -> Result<bool, BuildError> {
-    let stale_paths: Vec<String> = manifest
-        .entries
-        .keys()
-        .filter(|path| !seen_source_paths.contains(*path))
-        .cloned()
-        .collect();
-    let mut changed = false;
+fn preflight_source_archive(
+    source_archive: &Path,
+    max_uncompressed_bytes: u64,
+    max_files: usize,
+    max_depth: usize,
+) -> Result<(), BuildError> {
+    let file = std::fs::File::open(source_archive).map_err(|err| {
+        BuildError::new(
+            "source_archive",
+            format!("failed to open source archive: {err}"),
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| {
+        BuildError::new(
+            "source_archive",
+            format!("failed to read source archive: {err}"),
+        )
+    })?;
+    let mut exact = HashSet::new();
+    let mut folded = HashSet::new();
+    let mut files = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut folded_files = HashSet::new();
+    let mut folded_directories = HashSet::new();
+    let mut declared_bytes = 0u64;
+    let mut entry_count = 0usize;
 
-    for rel_path in stale_paths {
-        let Some(path) = safe_manifest_path(dest, &rel_path) else {
-            warn!("skipping unsafe stale workspace manifest path {rel_path:?}");
-            continue;
-        };
-
-        if !stale_path_parent_stays_in_workspace(dest, &path)? {
-            warn!("skipping stale workspace manifest path through external parent: {rel_path:?}");
-            continue;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|err| {
+            BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
+        })?;
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > max_files {
+            return Err(BuildError::new(
+                "source_archive",
+                format!("source entry count exceeds sources.max_files ({max_files})"),
+            ));
         }
-
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                std::fs::remove_file(&path).map_err(|err| {
-                    BuildError::new(
-                        "source_archive",
-                        format!("failed to remove stale source file {rel_path}: {err}"),
-                    )
-                })?;
-                manifest.entries.remove(&rel_path);
-                changed = true;
-                prune_empty_parent_dirs(dest, path.parent())?;
+        let is_dir = entry.is_dir();
+        let is_symlink = entry.is_symlink();
+        let normalized = normalized_zip_path(entry.name(), is_dir, max_depth)?;
+        validate_zip_type(entry.unix_mode(), is_dir, is_symlink)?;
+        if !exact.insert(normalized.clone()) || !folded.insert(normalized.to_ascii_lowercase()) {
+            return Err(BuildError::new(
+                "source_archive",
+                "zip contains duplicate or case-colliding paths",
+            ));
+        }
+        let components: Vec<&str> = normalized.split('/').collect();
+        let mut ancestor = String::new();
+        for component in &components[..components.len().saturating_sub(1)] {
+            if !ancestor.is_empty() {
+                ancestor.push('/');
             }
-            Ok(metadata) if metadata.is_dir() => {
-                warn!("stale source manifest path is now a directory: {:?}", path);
-                manifest.entries.remove(&rel_path);
-                changed = true;
-            }
-            Ok(_) => {
-                warn!(
-                    "stale source manifest path is not a regular file: {:?}",
-                    path
-                );
-                manifest.entries.remove(&rel_path);
-                changed = true;
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                manifest.entries.remove(&rel_path);
-                changed = true;
-            }
-            Err(err) => {
+            ancestor.push_str(component);
+            let folded_ancestor = ancestor.to_ascii_lowercase();
+            if files.contains(&ancestor) || folded_files.contains(&folded_ancestor) {
                 return Err(BuildError::new(
                     "source_archive",
-                    format!("failed to stat stale source file {rel_path}: {err}"),
+                    "zip contains a file/directory path collision",
                 ));
+            }
+            directories.insert(ancestor.clone());
+            folded_directories.insert(folded_ancestor);
+        }
+        let folded_normalized = normalized.to_ascii_lowercase();
+        if is_dir {
+            if files.contains(&normalized) || folded_files.contains(&folded_normalized) {
+                return Err(BuildError::new(
+                    "source_archive",
+                    "zip contains a file/directory path collision",
+                ));
+            }
+            directories.insert(normalized);
+            folded_directories.insert(folded_normalized);
+        } else {
+            if directories.contains(&normalized) || folded_directories.contains(&folded_normalized)
+            {
+                return Err(BuildError::new(
+                    "source_archive",
+                    "zip contains a file/directory path collision",
+                ));
+            }
+            if is_symlink {
+                let mut target = Vec::new();
+                entry.take(4097).read_to_end(&mut target).map_err(|err| {
+                    BuildError::new(
+                        "source_archive",
+                        format!("read symlink target failed: {err}"),
+                    )
+                })?;
+                if target.len() > 4096 {
+                    return Err(BuildError::new(
+                        "source_archive",
+                        "symlink target exceeds 4096 bytes",
+                    ));
+                }
+                let target = std::str::from_utf8(&target).map_err(|_| {
+                    BuildError::new("source_archive", "symlink target is not UTF-8")
+                })?;
+                crate::client_source::validate_symlink_target(&normalized, target)
+                    .map_err(|err| BuildError::new("source_archive", err.to_string()))?;
+                declared_bytes = declared_bytes.saturating_add(target.len() as u64);
+            } else {
+                declared_bytes = declared_bytes.saturating_add(entry.size());
+            }
+            folded_files.insert(folded_normalized);
+            files.insert(normalized);
+            if declared_bytes > max_uncompressed_bytes {
+                return Err(BuildError::new("source_archive", format!("declared size exceeds sources.max_uncompressed_bytes ({max_uncompressed_bytes} bytes)")));
             }
         }
     }
-
-    Ok(changed)
+    Ok(())
 }
 
-fn validate_zip_entry_path(name: &str) -> Result<(), BuildError> {
-    if name.contains('\\') {
+fn normalized_zip_path(name: &str, is_dir: bool, max_depth: usize) -> Result<String, BuildError> {
+    if name.is_empty() || name.contains(['\\', '\0']) || !name.is_ascii() {
         return Err(BuildError::new(
             "source_archive",
             "zip entry had invalid path",
         ));
     }
-
-    let path = Path::new(name);
+    let trimmed = if is_dir {
+        name.trim_end_matches('/')
+    } else {
+        name
+    };
+    if trimmed.is_empty()
+        || trimmed
+            .split('/')
+            .any(|component| component.is_empty() || component == ".")
+    {
+        return Err(BuildError::new(
+            "source_archive",
+            "zip entry had invalid path",
+        ));
+    }
+    let path = Path::new(trimmed);
     if path.components().any(|component| {
         matches!(
             component,
@@ -822,172 +680,40 @@ fn validate_zip_entry_path(name: &str) -> Result<(), BuildError> {
             "zip entry had invalid path",
         ));
     }
-
-    Ok(())
-}
-
-fn safe_manifest_path(dest: &Path, rel_path: &str) -> Option<PathBuf> {
-    let path = Path::new(rel_path);
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        )
-    }) || is_internal_build_service_path(path)
-    {
-        return None;
-    }
-
-    Some(dest.join(path))
-}
-
-fn stale_path_parent_stays_in_workspace(dest: &Path, path: &Path) -> Result<bool, BuildError> {
-    let canonical_dest = std::fs::canonicalize(dest).map_err(|err| {
-        BuildError::new(
+    let depth = trimmed.split('/').count();
+    if depth > max_depth {
+        return Err(BuildError::new(
             "source_archive",
-            format!("failed to canonicalize workspace: {err}"),
-        )
-    })?;
+            format!("source path depth exceeds sources.max_depth ({max_depth})"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
 
-    let Some(parent) = path.parent() else {
-        return Ok(false);
-    };
-    let canonical_parent = match std::fs::canonicalize(parent) {
-        Ok(parent) => parent,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(err) => {
+fn validate_zip_type(mode: Option<u32>, is_dir: bool, is_symlink: bool) -> Result<(), BuildError> {
+    let Some(mode) = mode else {
+        if is_symlink {
             return Err(BuildError::new(
                 "source_archive",
-                format!("failed to canonicalize stale source parent: {err}"),
+                "symlink entry is missing Unix mode",
             ));
         }
-    };
-
-    Ok(canonical_parent.starts_with(canonical_dest))
-}
-
-fn prune_empty_parent_dirs(dest: &Path, parent: Option<&Path>) -> Result<(), BuildError> {
-    let Some(mut current) = parent else {
         return Ok(());
     };
-
-    while current != dest && current.starts_with(dest) {
-        if current
-            .strip_prefix(dest)
-            .ok()
-            .is_some_and(is_internal_build_service_path)
-        {
-            break;
-        }
-
-        match std::fs::remove_dir(current) {
-            Ok(_) => {}
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::DirectoryNotEmpty
-                        | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                break;
-            }
-            Err(err) => {
-                return Err(BuildError::new(
-                    "source_archive",
-                    format!(
-                        "failed to prune empty source directory {:?}: {err}",
-                        current
-                    ),
-                ));
-            }
-        }
-
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent;
-    }
-
-    Ok(())
-}
-
-fn is_internal_build_service_path(path: &Path) -> bool {
-    path.components()
-        .next()
-        .map(|component| component.as_os_str() == ".build-service")
-        .unwrap_or(false)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WorkspaceManifest {
-    version: u32,
-    entries: HashMap<String, ManifestEntry>,
-}
-
-impl Default for WorkspaceManifest {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            entries: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ManifestEntry {
-    size: u64,
-    hash: String,
-}
-
-fn workspace_manifest_path(dest: &Path) -> PathBuf {
-    dest.join(".build-service").join(WORKSPACE_MANIFEST_FILE)
-}
-
-fn load_workspace_manifest(dest: &Path) -> WorkspaceManifest {
-    let path = workspace_manifest_path(dest);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return WorkspaceManifest::default(),
-        Err(err) => {
-            warn!("failed to read workspace manifest {:?}: {err}", path);
-            return WorkspaceManifest::default();
-        }
+    let kind = mode & libc::S_IFMT;
+    let expected = if is_dir {
+        libc::S_IFDIR
+    } else if is_symlink {
+        libc::S_IFLNK
+    } else {
+        libc::S_IFREG
     };
-
-    let manifest: WorkspaceManifest = match serde_json::from_slice(&bytes) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            warn!("failed to parse workspace manifest {:?}: {err}", path);
-            return WorkspaceManifest::default();
-        }
-    };
-
-    if manifest.version != 1 {
-        warn!(
-            "unsupported workspace manifest version {} at {:?}",
-            manifest.version, path
-        );
-        return WorkspaceManifest::default();
+    if kind != 0 && kind != expected {
+        return Err(BuildError::new(
+            "source_archive",
+            "zip entry has an unsupported special file type",
+        ));
     }
-
-    manifest
-}
-
-fn write_workspace_manifest(dest: &Path, manifest: &WorkspaceManifest) -> Result<(), BuildError> {
-    let path = workspace_manifest_path(dest);
-    let payload = serde_json::to_vec(manifest).map_err(|err| {
-        BuildError::new(
-            "workspace_manifest",
-            format!("failed to serialize manifest: {err}"),
-        )
-    })?;
-    std::fs::write(&path, payload).map_err(|err| {
-        BuildError::new(
-            "workspace_manifest",
-            format!("failed to write manifest: {err}"),
-        )
-    })?;
     Ok(())
 }
 
@@ -995,6 +721,87 @@ struct RunAs {
     user: UserInfo,
     gid: u32,
     set_ids: bool,
+}
+
+pub fn preflight_run_as(config: &Config) -> Result<(), BuildError> {
+    preflight_run_as_with_effective_uid(config, unsafe { libc::geteuid() })
+}
+
+fn preflight_run_as_with_effective_uid(
+    config: &Config,
+    effective_uid: u32,
+) -> Result<(), BuildError> {
+    let run_as = resolve_run_as(config)?;
+    let transport_enabled = config.service.socket.enabled || config.service.http.enabled;
+    if effective_uid == 0
+        && transport_enabled
+        && (!run_as.set_ids || run_as.user.uid == 0 || run_as.user.uid == effective_uid)
+    {
+        return Err(BuildError::new(
+            "run_as_user",
+            "a root daemon requires a configured distinct non-root task execution identity on every enabled transport",
+        ));
+    }
+
+    if config.service.socket.enabled {
+        if !run_as.set_ids {
+            return Err(BuildError::new(
+                "run_as_user",
+                "enabled UDS requires a dedicated task execution identity",
+            ));
+        }
+        if run_as.user.uid == 0 || run_as.user.uid == effective_uid {
+            return Err(BuildError::new(
+                "run_as_user",
+                "enabled UDS requires a non-root task identity distinct from the daemon socket owner",
+            ));
+        }
+        if effective_uid != 0 {
+            return Err(BuildError::new(
+                "run_as_user",
+                "enabled UDS privilege dropping requires a root daemon",
+            ));
+        }
+        let mode = config
+            .service
+            .socket
+            .parse_mode()
+            .map_err(|err| BuildError::new("socket_mode", err.to_string()))?;
+        if mode & 0o077 != 0 || config.service.socket.group.is_some() {
+            return Err(BuildError::new(
+                "socket_mode",
+                "enabled UDS must be owner-only with no socket group",
+            ));
+        }
+    }
+    if config.service.http.enabled && config.service.http.auth.required {
+        if !run_as.set_ids {
+            return Err(BuildError::new(
+                "run_as_user",
+                "authenticated HTTP service requires build.run_as_user",
+            ));
+        }
+        if run_as.user.uid == 0 {
+            return Err(BuildError::new(
+                "run_as_user",
+                "build.run_as_user must be a non-root identity",
+            ));
+        }
+        if effective_uid != 0 {
+            return Err(BuildError::new(
+                "run_as_user",
+                "authenticated HTTP privilege dropping requires a root daemon",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn resolved_run_as_uid(config: &Config) -> Result<Option<u32>, BuildError> {
+    if config.build.run_as_user.is_none() && config.build.run_as_group.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_run_as(config)?.user.uid))
 }
 
 fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
@@ -1031,38 +838,64 @@ fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
     Ok(RunAs { user, gid, set_ids })
 }
 
-fn build_env(
-    config: &Config,
-    request_env: &Option<HashMap<String, String>>,
-    user: &UserInfo,
-) -> Vec<(String, String)> {
-    let env_map: HashMap<String, String> = std::env::vars().collect();
-    let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+fn build_env(task: &TaskConfig, user: &UserInfo) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = task
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !task.environment.contains_key("HOME") {
+        result.push((
+            "HOME".to_string(),
+            user.home_dir.to_string_lossy().into_owned(),
+        ));
+    }
+    if !task.environment.contains_key("USER") {
+        result.push(("USER".to_string(), user.username.clone()));
+    }
+    if !task.environment.contains_key("LOGNAME") {
+        result.push(("LOGNAME".to_string(), user.username.clone()));
+    }
+    result
+}
 
-    for key in &config.build.environment.allow {
-        if !seen.insert(key) {
-            continue;
-        }
+trait PrivilegeDropOps {
+    fn initgroups(&mut self, username: &CString, gid: u32) -> io::Result<()>;
+    fn setgid(&mut self, gid: u32) -> io::Result<()>;
+    fn setuid(&mut self, uid: u32) -> io::Result<()>;
+}
 
-        match key.as_str() {
-            "HOME" => {
-                result.push((key.clone(), user.home_dir.to_string_lossy().into_owned()));
-            }
-            "USER" | "LOGNAME" => {
-                result.push((key.clone(), user.username.clone()));
-            }
-            _ => {
-                if let Some(value) = request_env.as_ref().and_then(|env| env.get(key)) {
-                    result.push((key.clone(), value.clone()));
-                } else if let Some(value) = env_map.get(key) {
-                    result.push((key.clone(), value.clone()));
-                }
-            }
-        }
+struct LibcPrivilegeDropOps;
+
+impl PrivilegeDropOps for LibcPrivilegeDropOps {
+    fn initgroups(&mut self, username: &CString, gid: u32) -> io::Result<()> {
+        initgroups_for_platform(username.as_ptr(), gid)
     }
 
-    result
+    fn setgid(&mut self, gid: u32) -> io::Result<()> {
+        if unsafe { libc::setgid(gid as libc::gid_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn setuid(&mut self, uid: u32) -> io::Result<()> {
+        if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+fn apply_privilege_drop(
+    ops: &mut impl PrivilegeDropOps,
+    username: &CString,
+    gid: u32,
+    uid: u32,
+) -> io::Result<()> {
+    ops.initgroups(username, gid)?;
+    ops.setgid(gid)?;
+    ops.setuid(uid)
 }
 
 fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildError> {
@@ -1080,13 +913,7 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
             if should_set_ids {
                 let c_username = CString::new(username.clone())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid username"))?;
-                initgroups_for_platform(c_username.as_ptr(), gid)?;
-                if libc::setgid(gid as libc::gid_t) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::setuid(uid as libc::uid_t) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                apply_privilege_drop(&mut LibcPrivilegeDropOps, &c_username, gid, uid)?;
             }
             Ok(())
         });
@@ -1118,8 +945,22 @@ fn spawn_output_thread(
     stream: impl Read + Send + 'static,
     sender: Sender<ResponseEvent>,
     kind: StreamKind,
+    max_bytes: u64,
+    output_bytes: Arc<AtomicU64>,
+    output_exceeded: Arc<AtomicBool>,
+    cancellation: CancellationFlag,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || stream_output(stream, sender, kind))
+    thread::spawn(move || {
+        stream_output(
+            stream,
+            sender,
+            kind,
+            max_bytes,
+            &output_bytes,
+            &output_exceeded,
+            &cancellation,
+        );
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1128,20 +969,88 @@ enum StreamKind {
     Stderr,
 }
 
-fn stream_output(mut reader: impl Read, sender: Sender<ResponseEvent>, kind: StreamKind) {
+fn send_response(sender: &Sender<ResponseEvent>, mut event: ResponseEvent) -> Result<(), ()> {
+    let deadline = Instant::now() + OUTPUT_FORWARD_GRACE;
+    loop {
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Closed(_)) => return Err(()),
+            Err(TrySendError::Full(returned)) => {
+                event = returned;
+                if Instant::now() >= deadline {
+                    return Err(());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn forward_output(
+    sender: &Sender<ResponseEvent>,
+    mut event: ResponseEvent,
+    cancellation: &CancellationFlag,
+) -> bool {
+    let deadline = Instant::now() + OUTPUT_FORWARD_GRACE;
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        match sender.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                event = returned;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn join_output_thread(handle: thread::JoinHandle<()>) {
+    let deadline = Instant::now() + OUTPUT_FORWARD_GRACE;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        warn!("output reader did not stop within bounded forwarding grace; detaching it");
+    }
+}
+
+fn stream_output(
+    mut reader: impl Read,
+    sender: Sender<ResponseEvent>,
+    kind: StreamKind,
+    max_bytes: u64,
+    output_bytes: &AtomicU64,
+    output_exceeded: &AtomicBool,
+    cancellation: &CancellationFlag,
+) {
     let mut buf = vec![0u8; OUTPUT_CHUNK_SIZE];
 
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                let previous = output_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                if previous.saturating_add(n as u64) > max_bytes {
+                    output_exceeded.store(true, Ordering::SeqCst);
+                    cancellation.cancel();
+                    break;
+                }
                 let data = String::from_utf8_lossy(&buf[..n]).into_owned();
                 let event = match kind {
                     StreamKind::Stdout => ResponseEvent::Stdout { data },
                     StreamKind::Stderr => ResponseEvent::Stderr { data },
                 };
 
-                if sender.blocking_send(event).is_err() {
+                if !forward_output(&sender, event, cancellation) {
+                    cancellation.cancel();
                     break;
                 }
             }
@@ -1170,8 +1079,10 @@ fn wait_with_timeout(
 
     loop {
         if let Some(status) = child.try_wait()? {
+            let code = exit_code(status);
+            terminate_remaining_group(child.id() as i32)?;
             return Ok(WaitOutcome::Exited {
-                code: exit_code(status),
+                code,
                 timed_out: false,
             });
         }
@@ -1200,48 +1111,99 @@ fn terminate_process(child: &mut Child, reason: TerminationReason) -> io::Result
         TerminationReason::Timeout => "timed-out",
         TerminationReason::Cancelled => "cancelled",
     };
-
+    let pgid = child.id() as i32;
     if let Err(err) = signal_process_group(child, libc::SIGTERM) {
-        warn!(
-            "failed to terminate {label} process group (pid {}): {}",
-            child.id(),
-            err
-        );
+        warn!("failed to terminate {label} process group (pid {pgid}): {err}");
     }
-
-    if let Some(code) = wait_for_exit(child, Duration::from_secs(TIMEOUT_KILL_GRACE_SECS))? {
-        return Ok(code);
+    let (mut code, group_gone) = wait_for_group_and_exit(child, pgid, TIMEOUT_KILL_GRACE)?;
+    if !group_gone {
+        if let Err(err) = signal_group(pgid, libc::SIGKILL) {
+            warn!("failed to force kill {label} process group (pid {pgid}): {err}");
+        }
+        let result = wait_for_group_and_exit(child, pgid, TIMEOUT_KILL_GRACE)?;
+        code = code.or(result.0);
+        if !result.1 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process group survived SIGKILL",
+            ));
+        }
     }
-
-    if let Err(err) = signal_process_group(child, libc::SIGKILL) {
-        warn!(
-            "failed to force kill {label} process group (pid {}): {}",
-            child.id(),
-            err
-        );
+    if code.is_none() {
+        code = child.try_wait()?.map(exit_code);
     }
-
-    if let Some(code) = wait_for_exit(child, Duration::from_secs(TIMEOUT_KILL_GRACE_SECS))? {
-        return Ok(code);
-    }
-
-    Ok(TIMEOUT_EXIT_CODE)
+    Ok(code.unwrap_or(TIMEOUT_EXIT_CODE))
 }
 
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<i32>> {
-    let start = Instant::now();
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(exit_code(status)));
-        }
-
-        if start.elapsed() >= timeout {
-            return Ok(None);
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
+fn terminate_remaining_group(pgid: i32) -> io::Result<()> {
+    if !process_group_exists(pgid)? {
+        return Ok(());
     }
+    signal_group(pgid, libc::SIGTERM)?;
+    let start = Instant::now();
+    while start.elapsed() < TIMEOUT_KILL_GRACE {
+        if !process_group_exists(pgid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    signal_group(pgid, libc::SIGKILL)?;
+    let start = Instant::now();
+    while start.elapsed() < TIMEOUT_KILL_GRACE {
+        if !process_group_exists(pgid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "process group survived SIGKILL",
+    ))
+}
+
+fn wait_for_group_and_exit(
+    child: &mut Child,
+    pgid: i32,
+    timeout: Duration,
+) -> io::Result<(Option<i32>, bool)> {
+    let start = Instant::now();
+    let mut code = None;
+    loop {
+        if code.is_none() {
+            code = child.try_wait()?.map(exit_code);
+        }
+        let group_gone = !process_group_exists(pgid)?;
+        if group_gone {
+            return Ok((code, true));
+        }
+        if start.elapsed() >= timeout {
+            return Ok((code, false));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn process_group_exists(pgid: i32) -> io::Result<bool> {
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(err),
+    }
+}
+
+fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -1290,202 +1252,449 @@ pub fn artifacts_for_build(build_id: &str, config: &Config) -> Option<ArtifactAr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        ArtifactsConfig, BuildConfig, Config, LoggingConfig, ServiceConfig, SourcesConfig,
-    };
-    use crate::workspace::WorkspacePlan;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::{tempdir, NamedTempFile};
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions as FileOptions;
     use zip::ZipWriter;
 
     #[test]
-    fn extract_source_archive_enforces_max_uncompressed_bytes() {
+    fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
+        let raw = r#"
+schema_version = "6"
+tasks = {}
+[service.http]
+enabled = true
+[service.http.auth]
+required = false
+"#;
+        let mut config: Config = toml::from_str(raw).expect("minimal HTTP config");
+        let error = preflight_run_as_with_effective_uid(&config, 0).unwrap_err();
+        assert!(error.message.contains("root daemon"));
+
+        let current_uid = unsafe { libc::geteuid() };
+        if current_uid != 0 {
+            preflight_run_as_with_effective_uid(&config, current_uid)
+                .expect("non-root development HTTP remains usable without privilege drop");
+            let current = lookup_user(current_uid).expect("current user");
+            config.build.run_as_user = Some(current.username);
+            preflight_run_as_with_effective_uid(&config, 0)
+                .expect("simulated root daemon accepts a configured non-root identity");
+        }
+    }
+
+    #[test]
+    fn extract_source_archive_enforces_uncompressed_limit() {
         let temp = tempdir().expect("tempdir");
         let source = create_test_zip("input.txt", b"0123456789").expect("zip");
-        let dest = temp.path().join("workspace");
-        std::fs::create_dir_all(&dest).expect("dest dir");
-
-        let err = extract_source_archive(source.path(), &dest, 5, false, false).unwrap_err();
+        let err = extract_source_archive(source.path(), temp.path(), 5, 10, 10).unwrap_err();
         assert_eq!(err.code, "source_archive");
+        assert!(err.message.contains("sources.max_uncompressed_bytes"));
+    }
+
+    #[test]
+    fn extract_source_archive_rejects_traversal_and_backslashes() {
+        for path in ["../outside", "foo/../outside", "..\\outside"] {
+            let temp = tempdir().expect("tempdir");
+            let source = create_test_zip(path, b"bad").expect("zip");
+            let err = extract_source_archive(source.path(), temp.path(), 1024, 10, 10).unwrap_err();
+            assert_eq!(err.code, "source_archive", "{path}");
+            assert!(err.message.contains("invalid path"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn source_archive_rejects_case_collisions_file_count_depth_and_special_files() {
+        let temp = tempdir().expect("tempdir");
+        let duplicate = create_multi_zip(&[("Out/file", b"a", 0o644), ("out/FILE", b"b", 0o644)]);
         assert!(
-            err.message.contains("sources.max_uncompressed_bytes"),
-            "unexpected error: {}",
-            err.message
+            extract_source_archive(duplicate.path(), temp.path(), 1024, 10, 10)
+                .unwrap_err()
+                .message
+                .contains("colliding")
         );
+
+        let prefix = create_multi_zip(&[("prefix", b"a", 0o644), ("prefix/file", b"b", 0o644)]);
+        assert!(
+            extract_source_archive(prefix.path(), temp.path(), 1024, 10, 10)
+                .unwrap_err()
+                .message
+                .contains("file/directory")
+        );
+        for entries in [
+            [
+                ("Foo", b"a".as_slice(), 0o644),
+                ("foo/bar", b"b".as_slice(), 0o644),
+            ],
+            [
+                ("foo/bar", b"b".as_slice(), 0o644),
+                ("Foo", b"a".as_slice(), 0o644),
+            ],
+        ] {
+            let collision = create_multi_zip(&entries);
+            assert!(
+                extract_source_archive(collision.path(), temp.path(), 1024, 10, 10)
+                    .unwrap_err()
+                    .message
+                    .contains("file/directory")
+            );
+        }
+
+        let count = create_multi_zip(&[("a", b"a", 0o644), ("b", b"b", 0o644)]);
+        assert!(
+            extract_source_archive(count.path(), temp.path(), 1024, 1, 10)
+                .unwrap_err()
+                .message
+                .contains("max_files")
+        );
+
+        let depth = create_test_zip("a/b/c", b"x").expect("zip");
+        assert!(
+            extract_source_archive(depth.path(), temp.path(), 1024, 10, 2)
+                .unwrap_err()
+                .message
+                .contains("max_depth")
+        );
+
+        assert!(validate_zip_type(Some(libc::S_IFLNK | 0o777), false, true).is_ok());
     }
 
     #[test]
-    fn extract_source_archive_removes_stale_manifest_sources_only() {
-        let temp = tempdir().expect("tempdir");
-        let dest = temp.path().join("workspace");
-        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
-        let first = create_test_zip_entries(&[
-            ("src/current.txt", b"current" as &[u8]),
-            ("src/stale.txt", b"stale" as &[u8]),
-        ])
-        .expect("first zip");
-        let second = create_test_zip_entries(&[("src/current.txt", b"current" as &[u8])])
-            .expect("second zip");
-
-        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
-        std::fs::write(dest.join("src/generated.o"), b"object").expect("generated file");
-
-        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
-
-        assert!(dest.join("src/current.txt").is_file());
-        assert!(!dest.join("src/stale.txt").exists());
-        assert!(dest.join("src/generated.o").is_file());
-        let manifest = load_workspace_manifest(&dest);
-        assert!(manifest.entries.contains_key("src/current.txt"));
-        assert!(!manifest.entries.contains_key("src/stale.txt"));
-    }
-
-    #[test]
-    fn extract_source_archive_drops_stale_manifest_entry_when_path_is_directory() {
-        let temp = tempdir().expect("tempdir");
-        let dest = temp.path().join("workspace");
-        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
-        let first = create_test_zip_entries(&[
-            ("src/current.txt", b"current" as &[u8]),
-            ("src/stale.txt", b"stale" as &[u8]),
-        ])
-        .expect("first zip");
-        let second = create_test_zip_entries(&[("src/current.txt", b"current" as &[u8])])
-            .expect("second zip");
-
-        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
-        std::fs::remove_file(dest.join("src/stale.txt")).expect("remove stale file");
-        std::fs::create_dir(dest.join("src/stale.txt")).expect("directory replacement");
-
-        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
-
-        assert!(dest.join("src/stale.txt").is_dir());
-        let manifest = load_workspace_manifest(&dest);
-        assert!(!manifest.entries.contains_key("src/stale.txt"));
-    }
-
-    #[test]
-    fn extract_source_archive_rejects_parent_dir_internal_bypass() {
-        let temp = tempdir().expect("tempdir");
-        let dest = temp.path().join("workspace");
-        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
-        let source = create_test_zip("foo/../.build-service/manifest.json", b"bad").expect("zip");
-
-        let err = extract_source_archive(source.path(), &dest, 1024, true, false).unwrap_err();
-
-        assert_eq!(err.code, "source_archive");
-        assert!(err.message.contains("invalid path"));
-        assert!(!dest.join(".build-service/manifest.json").exists());
-    }
-
-    #[test]
-    fn extract_source_archive_rejects_backslash_paths() {
-        let temp = tempdir().expect("tempdir");
-        let dest = temp.path().join("workspace");
-        std::fs::create_dir_all(&dest).expect("dest dir");
-        let source = create_test_zip("..\\.build-service\\manifest.json", b"bad").expect("zip");
-
-        let err = extract_source_archive(source.path(), &dest, 1024, true, false).unwrap_err();
-
-        assert_eq!(err.code, "source_archive");
-        assert!(err.message.contains("invalid path"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn extract_source_archive_skips_stale_path_through_symlinked_parent() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempdir().expect("tempdir");
-        let dest = temp.path().join("workspace");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(dest.join(".build-service")).expect("dest metadata dir");
-        std::fs::create_dir_all(&outside).expect("outside dir");
-        let first = create_test_zip("src/foo.txt", b"owned").expect("first zip");
-        let second = create_test_zip("other.txt", b"other").expect("second zip");
-
-        extract_source_archive(first.path(), &dest, 1024, true, false).expect("first extract");
-        std::fs::remove_file(dest.join("src/foo.txt")).expect("remove source file");
-        std::fs::remove_dir(dest.join("src")).expect("remove source dir");
-        std::fs::write(outside.join("foo.txt"), b"outside").expect("outside file");
-        symlink(&outside, dest.join("src")).expect("symlink source parent");
-
-        extract_source_archive(second.path(), &dest, 1024, true, false).expect("second extract");
-
+    fn source_archive_round_trips_safe_symlinks_and_rejects_escaping_targets() {
+        let archive = NamedTempFile::new().unwrap();
+        let mut zip = ZipWriter::new(archive.reopen().unwrap());
+        zip.start_file("dir/target", FileOptions::default().unix_permissions(0o644))
+            .unwrap();
+        zip.write_all(b"target").unwrap();
+        zip.add_symlink("link", "dir/target", FileOptions::default())
+            .unwrap();
+        zip.finish().unwrap();
+        let destination = tempdir().unwrap();
+        extract_source_archive(archive.path(), destination.path(), 1024, 10, 10).unwrap();
         assert_eq!(
-            std::fs::read(outside.join("foo.txt")).expect("outside file"),
-            b"outside"
+            std::fs::read_link(destination.path().join("link")).unwrap(),
+            PathBuf::from("dir/target")
         );
-        let manifest = load_workspace_manifest(&dest);
-        assert!(manifest.entries.contains_key("src/foo.txt"));
-        assert!(manifest.entries.contains_key("other.txt"));
+        assert_eq!(
+            std::fs::read(destination.path().join("dir/target")).unwrap(),
+            b"target"
+        );
+
+        let unsafe_archive = NamedTempFile::new().unwrap();
+        let mut zip = ZipWriter::new(unsafe_archive.reopen().unwrap());
+        zip.add_symlink("link", "../escape", FileOptions::default())
+            .unwrap();
+        zip.finish().unwrap();
+        let destination = tempdir().unwrap();
+        assert!(
+            extract_source_archive(unsafe_archive.path(), destination.path(), 1024, 10, 10)
+                .is_err()
+        );
+        assert!(!destination.path().join("link").exists());
     }
 
     #[test]
-    fn wait_with_timeout_cancels_on_disconnect() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 60")
-            .spawn()
-            .expect("spawn sleep");
+    fn output_limit_counts_raw_combined_bytes_and_cancels() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let bytes = AtomicU64::new(4);
+        let exceeded = AtomicBool::new(false);
+        let cancellation = CancellationFlag::default();
+        stream_output(
+            io::Cursor::new(vec![0xff, 0xfe]),
+            sender,
+            StreamKind::Stdout,
+            5,
+            &bytes,
+            &exceeded,
+            &cancellation,
+        );
+        assert!(exceeded.load(Ordering::SeqCst));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(bytes.load(Ordering::SeqCst), 6);
+    }
 
+    #[test]
+    fn full_output_channel_cancels_at_forwarding_deadline_below_output_limit() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(ResponseEvent::Stdout {
+                data: "channel-sentinel".to_string(),
+            })
+            .expect("prefill output channel");
+        let bytes = Arc::new(AtomicU64::new(0));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationFlag::default();
+        let produced = vec![b'x'; OUTPUT_CHUNK_SIZE];
+        let max_bytes = (OUTPUT_CHUNK_SIZE * 2) as u64;
+        let started = Instant::now();
+        let output = spawn_output_thread(
+            io::Cursor::new(produced),
+            sender,
+            StreamKind::Stdout,
+            max_bytes,
+            Arc::clone(&bytes),
+            Arc::clone(&exceeded),
+            cancellation.clone(),
+        );
+
+        let completion_deadline = Instant::now() + OUTPUT_FORWARD_GRACE + Duration::from_secs(1);
+        while !output.is_finished() && Instant::now() < completion_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            output.is_finished(),
+            "output forwarding thread exceeded its bounded deadline"
+        );
+        output.join().expect("output forwarding thread");
+
+        assert!(started.elapsed() >= OUTPUT_FORWARD_GRACE);
+        assert!(cancellation.is_cancelled());
+        assert!(!exceeded.load(Ordering::SeqCst));
+        assert_eq!(bytes.load(Ordering::SeqCst), OUTPUT_CHUNK_SIZE as u64);
+        assert!(matches!(
+            receiver.try_recv().expect("prefilled event"),
+            ResponseEvent::Stdout { data } if data == "channel-sentinel"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[derive(Default)]
+    struct RecordingPrivilegeOps {
+        calls: Vec<String>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl PrivilegeDropOps for RecordingPrivilegeOps {
+        fn initgroups(&mut self, _username: &CString, gid: u32) -> io::Result<()> {
+            self.calls.push(format!("initgroups:{gid}"));
+            if self.fail_at == Some("initgroups") {
+                return Err(io::Error::other("initgroups failed"));
+            }
+            Ok(())
+        }
+
+        fn setgid(&mut self, gid: u32) -> io::Result<()> {
+            self.calls.push(format!("setgid:{gid}"));
+            if self.fail_at == Some("setgid") {
+                return Err(io::Error::other("setgid failed"));
+            }
+            Ok(())
+        }
+
+        fn setuid(&mut self, uid: u32) -> io::Result<()> {
+            self.calls.push(format!("setuid:{uid}"));
+            if self.fail_at == Some("setuid") {
+                return Err(io::Error::other("setuid failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn portable_privilege_drop_harness_exercises_real_sequence_and_fail_closed_errors() {
+        let username = CString::new("task-user").unwrap();
+        let mut ops = RecordingPrivilegeOps::default();
+        apply_privilege_drop(&mut ops, &username, 123, 456).unwrap();
+        assert_eq!(ops.calls, ["initgroups:123", "setgid:123", "setuid:456"]);
+
+        for failure in ["initgroups", "setgid", "setuid"] {
+            let mut ops = RecordingPrivilegeOps {
+                calls: Vec::new(),
+                fail_at: Some(failure),
+            };
+            assert!(apply_privilege_drop(&mut ops, &username, 123, 456).is_err());
+            assert_eq!(ops.calls.last().unwrap().split(':').next(), Some(failure));
+        }
+    }
+
+    #[test]
+    fn privileged_real_child_reports_dropped_identity_and_denied_daemon_state() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping real setuid child branch: test process is not root");
+            return;
+        }
+        let Ok(task_user) = lookup_user_by_name("nobody") else {
+            eprintln!("skipping real setuid child branch: nobody user is unavailable");
+            return;
+        };
+        assert_ne!(task_user.uid, 0);
+        let temp = tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let credential = temp.path().join("credential");
+        std::fs::write(&credential, "secret").unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let state = temp.path().join("state");
+        let control = temp.path().join("control");
+        for directory in [&artifacts, &state, &control] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket = control.join("server.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let run_as = RunAs {
+            gid: task_user.gid,
+            user: task_user.clone(),
+            set_ids: true,
+        };
+        let script = format!(
+            "set -eu; printf '%s\\n' \"$(id -u):$(id -g):$(id -G)\"; test ! -r '{}'; test ! -x '{}'; test ! -x '{}'; if command -v curl >/dev/null 2>&1; then ! curl --silent --max-time 1 --unix-socket '{}' http://localhost/ >/dev/null 2>&1; fi",
+            credential.display(),
+            artifacts.display(),
+            state.display(),
+            socket.display(),
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).stdout(Stdio::piped());
+        configure_command(&mut command, &run_as).unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8(output.stdout).unwrap();
+        let mut fields = report.trim().split(':');
+        assert_eq!(
+            fields.next().unwrap().parse::<u32>().unwrap(),
+            task_user.uid
+        );
+        assert_eq!(
+            fields.next().unwrap().parse::<u32>().unwrap(),
+            task_user.gid
+        );
+        let groups: Vec<u32> = fields
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert!(groups.contains(&task_user.gid));
+        assert!(!groups.contains(&0));
+    }
+
+    #[test]
+    fn wait_with_timeout_cancels_configured_process_group_and_descendant() {
+        let user = lookup_user(unsafe { libc::getuid() }).expect("current user");
+        let run_as = RunAs {
+            gid: user.gid,
+            user,
+            set_ids: false,
+        };
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; (trap '' TERM; sleep 60) & wait");
+        configure_command(&mut command, &run_as).expect("configure process group");
+        let mut child = command.spawn().expect("spawn process group");
+        let pgid = child.id() as i32;
         let cancellation = CancellationFlag::default();
         let cancel_clone = cancellation.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             cancel_clone.cancel();
         });
-
-        let outcome = wait_with_timeout(&mut child, 60, &cancellation).expect("wait result");
+        let outcome = wait_with_timeout(&mut child, 60, &cancellation).expect("wait");
         assert!(matches!(outcome, WaitOutcome::Cancelled));
-        let _ = child.wait();
+        assert!(!process_group_exists(pgid).expect("group lookup"));
     }
 
     #[test]
-    fn prepare_workspace_rejects_missing_default_workspace() {
-        let temp = tempdir().expect("tempdir");
-        let workspace = temp.path().join("missing-default");
-        let config = Config {
-            schema_version: "3".to_string(),
-            service: ServiceConfig::default(),
-            build: BuildConfig::default(),
-            sources: SourcesConfig::default(),
-            artifacts: ArtifactsConfig::default(),
-            logging: LoggingConfig::default(),
-        };
-        let plan = WorkspacePlan {
-            path: workspace,
-            managed_id: None,
-            record_use: false,
-            ttl_sec: None,
-            create: false,
-            client_supplied: false,
-            refresh: false,
-            lock_key: None,
+    fn real_timeout_and_output_limit_remove_configured_process_groups() {
+        let user = lookup_user(unsafe { libc::getuid() }).expect("current user");
+        let run_as = RunAs {
+            gid: user.gid,
+            user,
+            set_ids: false,
         };
 
-        let err = prepare_workspace(&config, &plan, None).unwrap_err();
-        assert_eq!(err.code, "workspace_not_found");
-        assert!(
-            err.message.contains("default workspace not found"),
-            "unexpected error: {}",
-            err.message
+        let mut timeout_command = Command::new("sh");
+        timeout_command
+            .arg("-c")
+            .arg("trap '' TERM; (trap '' TERM; sleep 60) & wait");
+        configure_command(&mut timeout_command, &run_as).unwrap();
+        let mut timeout_child = timeout_command.spawn().unwrap();
+        let timeout_pgid = timeout_child.id() as i32;
+        let outcome =
+            wait_with_timeout(&mut timeout_child, 0, &CancellationFlag::default()).unwrap();
+        assert!(matches!(
+            outcome,
+            WaitOutcome::Exited {
+                timed_out: true,
+                ..
+            }
+        ));
+        assert!(!process_group_exists(timeout_pgid).unwrap());
+
+        let mut output_command = Command::new("sh");
+        output_command
+            .arg("-c")
+            .arg("trap '' TERM; (trap '' TERM; while :; do printf 0123456789abcdef; done) & wait");
+        output_command.stdout(Stdio::piped()).stderr(Stdio::null());
+        configure_command(&mut output_command, &run_as).unwrap();
+        let mut output_child = output_command.spawn().unwrap();
+        let output_pgid = output_child.id() as i32;
+        let stdout = output_child.stdout.take().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let drain = thread::spawn(move || while receiver.blocking_recv().is_some() {});
+        let bytes = Arc::new(AtomicU64::new(0));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationFlag::default();
+        let output = spawn_output_thread(
+            stdout,
+            sender,
+            StreamKind::Stdout,
+            1024,
+            Arc::clone(&bytes),
+            Arc::clone(&exceeded),
+            cancellation.clone(),
         );
+        let outcome = wait_with_timeout(&mut output_child, 30, &cancellation).unwrap();
+        join_output_thread(output);
+        assert!(matches!(
+            outcome,
+            WaitOutcome::Cancelled
+                | WaitOutcome::Exited {
+                    timed_out: false,
+                    ..
+                }
+        ));
+        assert!(exceeded.load(Ordering::SeqCst));
+        assert!(!process_group_exists(output_pgid).unwrap());
+        drain.join().unwrap();
+    }
+
+    fn create_multi_zip(entries: &[(&str, &[u8], u32)]) -> NamedTempFile {
+        let temp = NamedTempFile::new().expect("temp zip");
+        let mut zip = ZipWriter::new(temp.reopen().unwrap());
+        for (name, contents, mode) in entries {
+            zip.start_file(
+                *name,
+                FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .unix_permissions(*mode),
+            )
+            .unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        zip.finish().unwrap();
+        temp
     }
 
     fn create_test_zip(name: &str, contents: &[u8]) -> io::Result<NamedTempFile> {
-        create_test_zip_entries(&[(name, contents)])
-    }
-
-    fn create_test_zip_entries(entries: &[(&str, &[u8])]) -> io::Result<NamedTempFile> {
         let temp = NamedTempFile::new()?;
-        let file = temp.reopen()?;
-        let mut zip = ZipWriter::new(file);
-        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for (name, contents) in entries {
-            zip.start_file(*name, options)?;
-            zip.write_all(contents)?;
-        }
+        let mut zip = ZipWriter::new(temp.reopen()?);
+        zip.start_file(
+            name,
+            FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644),
+        )?;
+        zip.write_all(contents)?;
         zip.finish()?;
         Ok(temp)
     }

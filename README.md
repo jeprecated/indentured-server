@@ -1,531 +1,298 @@
-# Build Service
+# indentured-server
 
-A build service that optionally accepts source uploads from clients, runs an allowed command on the host, streams NDJSON output, and optionally returns a single `artifacts.zip` that the client automatically extracts into the local workspace.
+`indentured-server` is a small synchronous build service and client for running server-owned named tasks against an uploaded source tree. The daemon streams stdout and stderr as NDJSON and can return only the artifacts allowed by the selected task.
 
-It can be used for builds that depend on proprietary host libraries that cannot be exposed inside containers, as well as for offloading builds to remote, more powerful servers or centralizing build tooling.
+The authority boundary is deliberately narrow: callers select a task, not a command. Initial scope explicitly excludes remote-shell transport, source publication, caller/request-controlled shell execution, asynchronous jobs or queues, signing credentials, physical-device access, durable schedulers, and third-party orchestration integrations.
 
-## ⚠️ Security Considerations
+## Security model
 
-This service executes build commands on the host (or the configured run-as user). It includes basic guardrails, but it does not provide strong sandboxing. If a build script or Makefile reads or copies files outside the workspace and the service user has access, it can still access them. If that is a concern, run the service inside a container or a dedicated VM.
+A request may contain only:
 
-Built-in protections to review and tune:
-- **Command allowlist** (`build.commands`)
-- **Environment allowlist** (`build.environment.allow`)
-- **Workspace scoping** (managed reusable workspaces or a configured default workspace, with relative path validation for sources/artifacts/cwd)
-- **Transfer size and timeouts** (`sources.max_transfer_bytes`, `sources.max_uncompressed_bytes`, `build.timeouts`)
-- **Transport controls** (socket permissions, optional HTTP auth)
+- the required request protocol version;
+- an optional bounded request identifier;
+- a bounded server task identifier; and
+- closed source metadata describing the required ZIP payload.
 
-If your environment includes untrusted or semi-trusted workloads, consider additional isolation around the service.
+The selected server task owns the absolute executable, fixed arguments, relative working directory, fixed environment, timeout, artifact allowlist, and fresh-workspace policy. Unknown fields—including every former command, argv, cwd, environment, timeout, artifact, and workspace field—are rejected. Missing, legacy, and unknown request versions are rejected before source bytes are accepted, a workspace is created, an archive is extracted, or a process is spawned.
+
+Every accepted run receives a new unpredictable workspace under `build.workspace_root`. The workspace is removed after execution and artifact collection. Clients cannot identify, reuse, reset, or delete server workspaces. Protocol v3 command requests are not parsed, even as a compatibility mode.
+
+Uploaded build systems still execute code with the daemon's configured task identity. Named tasks remove caller control over process configuration; they are not a sandbox. Use a dedicated secretless non-admin account, container, or VM when uploaded source is not fully trusted. The root/service daemon loads credentials and owns artifacts/control paths before task processes drop to that separate identity; task environments are cleared and never receive daemon credentials.
+
+Bearer values are loaded once at startup from protected runtime files, reduced to SHA-256 digests, and compared as fixed-size values without an early successful return. Each 1–4096-byte file contains exactly one RFC 6750 `b64token` line and at most one final LF; the daemon and client enforce the same parser. The token file and its direct runtime directory must be owned by the effective daemon UID; the file is mode `0600` or stricter, while the real, non-symlink parent is not group/other writable or owned by the task identity. Token values, headers, and digests are never logged or included in errors. Restart the daemon to rotate credentials.
+
+The global active-build limit defaults to one. Admission uses an immediate non-waiting check after authentication and metadata/task validation but before accepting source bytes. Excess requests receive `503` with `{"error":"busy"}` and `Retry-After: 0`; this is throughput control, not a queue.
 
 ## Components
 
-- **build-service**: host daemon. Validates requests, optionally extracts uploaded sources into a workspace, runs the configured command, streams output, and packages artifacts.
-- **build-cli**: client that resolves config from CLI/env/config file, optionally packages sources, sends requests (HTTP or UDS), relays NDJSON output, and extracts artifacts when present.
-- **build wrapper**: a POSIX shell shim that replaces build tools in containers.
+- `indentured-server`: host daemon.
+- `indentured`: client that pins and packages the current Jujutsu tree (or reviewed filesystem patterns outside Jujutsu), submits one named task, streams output, and stores non-destructive run evidence.
 
-## Install
+The service supports HTTP/HTTPS and explicitly enabled Unix-domain sockets. UDS is disabled by default and bypasses bearer authentication: its parent-directory ownership and socket mode are its entire authority boundary. Every enabled UDS deployment requires a root daemon, a configured non-root task identity distinct from the daemon/socket owner, no socket group, and mode `0600` or stricter. Startup fails closed otherwise. A hardened macOS deployment must not expose that socket to its build identity. Built-in rustls TLS is optional server-side transport encryption for generic direct deployments; it does not authenticate clients or accept a client-CA setting. Bearer authentication remains required wherever application authority is needed.
 
-Download the latest archive for your platform from GitHub Releases:
+## Build and test
 
-```text
-https://github.com/kcosr/build-service/releases
+### Nix packages and apps
+
+The flake exposes native packages and apps for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`:
+
+```sh
+nix build --no-link .#indentured-server
+nix build --no-link .#indentured
+nix run .#indentured-server -- --help
+nix run .#indentured -- --help
 ```
 
-Supported release platforms are currently:
+`nix build .` and `nix run .` default to the `indentured-server` daemon. The server and client packages are separate outputs of one Cargo compilation; each named package contains only its matching executable. `Cargo.lock` is the authoritative Rust dependency lock.
 
-- `linux-x86_64`
-- `macos-arm64`
+Run `nix flake check --print-build-logs` natively on each supported system. A Linux check builds only that native Linux system's outputs; evaluating the `aarch64-darwin` attributes from Linux does not attest Darwin SDK linkage or runtime behavior. On Apple-silicon Darwin, `scripts/check-darwin.sh` performs the native package/layout checks and package builds. The Darwin package and Devenv shell use the Nix-provided clang wrapper, Apple SDK/frameworks, and Rust toolchain without invoking ambient/host `xcrun` or `xcodebuild` and without depending on `/Applications/Xcode`; Nix-provided SDK tooling is allowed. The full `cargo:test` task remains a Linux validation obligation because its protected-runtime credential test currently uses Linux `/run/user/<uid>`; Darwin flake validation intentionally claims package/compile coverage only. The native hardened macOS deployment behavioral gate below also remains required.
 
-Extract the archive on the host that will run the service. The archive contains
-the optimized service and client binaries, sample config, systemd unit,
-wrapper script, and project documentation.
+### Devenv contributor tasks
 
-Install on the host:
+Enter the pinned contributor environment or run its named tasks directly:
 
-```bash
-RELEASE_ROOT=/path/to/build-service-VERSION-PLATFORM
-
-sudo install -m 0755 "$RELEASE_ROOT/bin/build-service" /usr/local/bin/build-service
-sudo install -m 0755 "$RELEASE_ROOT/bin/build-cli" /usr/local/bin/build-cli
-sudo install -d -m 0755 /etc/build-service
-sudo install -m 0644 "$RELEASE_ROOT/config/config.toml" /etc/build-service/config.toml
-sudo install -d -m 0755 /var/log/build-service
-sudo install -m 0644 "$RELEASE_ROOT/systemd/build-service.service" \
-  /etc/systemd/system/build-service.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now build-service
+```sh
+devenv shell
+devenv tasks list
+devenv tasks run cargo:fmt
+devenv tasks run cargo:clippy
+devenv tasks run cargo:test
+devenv tasks run cargo:release-build
+devenv tasks run integration:packaged-local
+devenv tasks run nix:flake-check
 ```
 
-For unsupported platforms or local development, build from source in the
-[Development](#development) section.
+The same deterministic Cargo obligations remain available without Devenv:
 
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph Client
-        CLI[build-cli]
-    end
-
-    subgraph Host
-        SERVICE[build-service]
-        CMD[exec allowed command]
-    end
-
-    CLI -->|metadata + optional source.zip| SERVICE
-    SERVICE -->|NDJSON stream| CLI
-    SERVICE -->|artifacts.zip| CLI
-    SERVICE -->|validate request| CMD
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --locked --offline --all-targets --all-features
+cargo build --locked --offline --release --all-features
 ```
 
-## Build Flow
+The offline Cargo commands require the locked crates to be present in the local Cargo cache. Nix package builds vendor dependencies from `Cargo.lock` and are the clean-checkout reproducibility path.
 
-- You run `make` (or another tool) through the wrapper; it uses `build-cli` when `.build-service/config.toml` exists or `BUILD_SERVICE_ENDPOINT` is set.
-- `build-cli` layers client settings as config file -> env vars -> CLI flags.
-- If source patterns are configured, `build-cli` zips matching files and posts `metadata` + `source.zip`; otherwise it sends metadata only.
-- The server resolves either a managed reusable workspace (`workspace.reuse = true`) or the configured `build.default_workspace_path`.
-- For managed reusable workspaces, source extraction syncs manifest-owned source files: files from prior source uploads that are absent from the latest source archive are removed, while generated files and build outputs are left alone.
-- The client streams stdout/stderr from NDJSON; on success the server emits `artifacts.zip` info only when artifacts were requested and collected.
-- `build-cli` downloads and extracts `artifacts.zip` back into the local working tree only when the exit event includes artifacts.
+The Cargo release build creates:
 
-## Configuration
+- `target/release/indentured-server`
+- `target/release/indentured`
 
-Sample config: `config/config.toml`
+## Server configuration
 
-Key fields:
-- `schema_version`: config schema version (currently "3").
-- `service.socket.*`: Unix socket enablement, path, optional group ownership, and mode.
-- `service.http.*`: HTTP enablement, listen address, auth, and optional TLS.
-- `build.workspace_root`: base directory for temp workspaces.
-- `build.default_workspace_path`: optional permanent workspace used when no reusable workspace is requested; the server does not GC or clean this directory.
-- `build.workspace.*`: defaults and GC settings for reusable workspaces.
-- `sources.max_transfer_bytes`: max source archive size accepted by the server (default 128MB).
-- `sources.max_uncompressed_bytes`: max total extracted source size accepted by the server (default 10x transfer limit).
-- `build.run_as_user` / `build.run_as_group`: optional run-as user/group.
-- `build.commands`: allowlist mapping `command` -> absolute binary path.
-- `build.timeouts.*`: default timeout and max timeout.
-- `build.environment.allow`: allowlist of environment variables passed to the build.
-- `sources.*`: upload-side transfer and uncompressed-content limits for source archives.
-- `artifacts.storage_root`: artifact storage root (per-build subdirs).
-- `artifacts.max_transfer_bytes`: optional max artifact zip size per request.
-- `artifacts.max_uncompressed_bytes`: optional max total uncompressed artifact content size per request.
-- `artifacts.restricted_patterns`: optional server-side artifact glob patterns to omit from returned archives, even when requested by the client.
-- `artifacts.*`: TTL/GC settings for artifact retention.
-
-Environment overrides:
-- `BUILD_SERVICE_CONFIG`: alternate config path.
-- `BUILD_SERVICE_LOG_LEVEL`: override `logging.level`.
-
-## Repo-local Client Config
-
-File: `.build-service/config.toml`
-
-This file is optional. If it is absent, `build-cli` can run from CLI flags and `BUILD_SERVICE_*` env vars alone.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `6`; request protocol versions are separate. Schema 5 configurations fail closed and must explicitly migrate the version; existing absolute-executable/fixed-argument task bodies remain supported.
 
 ```toml
-[sources]
-include = ["**/*"]
-exclude = [".git/**", ".build-service/**", "target/**"]
+schema_version = "6"
 
-[artifacts]
-include = ["out/**", "dist/*.tar.gz"]
-exclude = ["**/*.tmp"]
-
-[connection]
-# enabled = true  # if false, skip build-service and run local tool
-# endpoint = "unix:///run/build-service.sock"
-# endpoint = "https://build.example.com"
-# token = "..."
-# local_fallback = false  # if true, fall back to local build when endpoint is unreachable
-
-[request]
-# optional defaults
-# timeout_sec = 900
-# cwd = "subdir"
-
-[request.env]
-CC = "clang"
-CFLAGS = "-O2 -g"
-
-[workspace]
-# reuse = true
-# id = "custom_id"   # supports {repo}, {branch}, and {uid} macros
-# create = true
-# refresh = false
-# ttl_sec = 3600
-
-[output]
-# capture_logs = true
-# log_dir = "captured-logs"  # relative to the directory where build-cli starts
-# stdout_max_lines = 2000
-# stderr_max_lines = 1000
-# stdout_tail_lines = 50
-# stderr_tail_lines = 50
-```
-
-Notes:
-- `sources` and `artifacts` patterns must be relative and cannot use `..`.
-- Source include patterns that match nothing are skipped.
-- Source upload is optional. If no source include patterns are configured anywhere, the client sends metadata only.
-- Artifact download is optional. If no artifact include patterns are configured anywhere, the client skips artifact download entirely.
-- In env-only mode, source packaging and artifact extraction are rooted at the current working directory because there is no repo config root to anchor them.
-- When `output.capture_logs = true`, `build-cli` writes complete stream transcripts to `<base>/<build_id>/stdout.log` and `<base>/<build_id>/stderr.log`. If `output.log_dir` is unset, `<base>` defaults to `std::env::temp_dir().join("build-service")`; if it is relative, it is resolved against the directory where the `build-cli` process starts.
-- Output limits are optional and still apply only to terminal output; unset means unlimited, `0` disables output. When capture is healthy, the suppression notice points to the saved log path for that stream. If capture is unavailable, the CLI falls back to the existing env-var hint (`BUILD_SERVICE_STDOUT_MAX_LINES` / `BUILD_SERVICE_STDERR_MAX_LINES`) and later summarizes suppressed lines.
-- When log capture initializes successfully, the CLI prints a final `stderr` notice with both saved log paths even if no suppression occurred.
-- Temp-dir retention is OS-managed. If you rely on saved logs, set `output.log_dir` to a persistent location and clean up old build directories yourself.
-- When workspace reuse is enabled, the CLI reads `.build-service/workspace-id` if no workspace id is configured and writes it when the server returns `workspace_id`.
-- `workspace.id` and `BUILD_SERVICE_WORKSPACE_ID` support `{repo}`, `{branch}`, and `{uid}`; the CLI expands `{repo}` to the repo root directory name, `{branch}` to the current git branch, and `{uid}` to the effective user id, and the server sanitizes the resulting workspace id.
-- Reusable workspace source extraction removes previously uploaded source files that are no longer present in the latest source archive. It does not clean object files, caches, or other files that were not written from a source archive.
-- Set `BUILD_SERVICE_WORKSPACE_REFRESH=true` to force rewriting current source files for the next build.
-- Set `connection.enabled = false` (or `BUILD_SERVICE_ENABLED=false`) to force the wrapper to skip build-service and run the local tool. `BUILD_SERVICE_ENABLED` overrides the config when set.
-- If no config file is found, `BUILD_SERVICE_ENDPOINT` or `--endpoint` is required.
-- When a config file is present, endpoint resolution still falls back to `unix:///run/build-service.sock`.
-- When `connection.local_fallback = true`, the wrapper falls back to the local command if the build service endpoint is unreachable.
-- The configured default workspace is serialized behind a single lock; concurrent requests against it return `workspace_busy`.
-- Endpoint must start with `http://`, `https://`, or `unix://`.
-- HTTPS endpoints use the OS trust store at runtime, so `build-cli` honors system-installed CA certificates (including local intercepting proxy CAs).
-- Connection precedence: CLI flags > env vars > `.build-service/config.toml`. With a config file present, the final fallback endpoint is `unix:///run/build-service.sock`.
-- Source/artifact pattern precedence is additive: config file, then comma-separated env vars, then repeatable CLI flags.
-- Env overrides: `BUILD_SERVICE_ENABLED`, `BUILD_SERVICE_ENDPOINT`, `BUILD_SERVICE_TOKEN`, `BUILD_SERVICE_SOURCES`, `BUILD_SERVICE_SOURCES_EXCLUDE`, `BUILD_SERVICE_ARTIFACTS`, `BUILD_SERVICE_ARTIFACTS_EXCLUDE`, `BUILD_SERVICE_CWD`, `BUILD_SERVICE_TIMEOUT`, `BUILD_SERVICE_STDOUT_MAX_LINES`, `BUILD_SERVICE_STDERR_MAX_LINES`, `BUILD_SERVICE_WORKSPACE_REUSE`, `BUILD_SERVICE_WORKSPACE_ID`, `BUILD_SERVICE_WORKSPACE_CREATE`, `BUILD_SERVICE_WORKSPACE_REFRESH`, `BUILD_SERVICE_WORKSPACE_TTL`.
-
-## Protocol
-
-### Start Build (multipart)
-`POST /v1/builds` over TCP or Unix socket (HTTP over UDS)
-`Authorization: Bearer <token>` when HTTP auth is enabled.
-
-`multipart/form-data` parts:
-- `metadata` (application/json)
-- `source` (application/zip, optional)
-
-Metadata JSON:
-
-```json
-{
-  "schema_version": "3",
-  "request_id": "<optional>",
-  "command": "make",
-  "args": ["-j4", "all"],
-  "cwd": "subdir",
-  "timeout_sec": 600,
-  "artifacts": {"include": ["out/**"], "exclude": []},
-  "env": {"CC": "clang"},
-  "workspace": {"reuse": true, "id": "custom_id", "create": true, "ttl_sec": 3600}
-}
-```
-
-### Response Stream (NDJSON)
-Streamed as `application/x-ndjson` until exit.
-
-```json
-{"type":"build","id":"bld_123","status":"started"}
-{"type":"stdout","data":"..."}
-{"type":"stderr","data":"..."}
-{"type":"exit","code":0,"timed_out":false,
- "workspace_id":"custom_id",
- "artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":123456},
- "artifact_restrictions":{"omitted_count":2,"matched_patterns":["**/*.cpp","**/*.h"]}}
-```
-
-Artifact patterns that match no files are skipped (logged at info level). If no files match any pattern, `artifacts` is `null` in the exit event.
-Server-side `artifacts.restricted_patterns` are applied after client artifact includes/excludes and before artifact size limits. Restricted files are omitted, do not fail the build, do not count toward artifact size limits, and are reported only by omitted count plus matched restriction patterns. File paths are never listed.
-For managed reusable workspaces, the exit event includes `workspace_id`. Builds that use the default workspace omit it.
-
-### Artifact Download
-`GET /v1/builds/{build_id}/artifacts.zip`
-
-### Managed Workspace Lifecycle
-`POST /v1/workspaces/{workspace_id}/reset`
-
-Clears a managed reusable workspace and recreates its `.build-service` metadata directory. This does not operate on `build.default_workspace_path`.
-
-`DELETE /v1/workspaces/{workspace_id}`
-
-Deletes a managed reusable workspace and drops its metadata.
-
-Lifecycle endpoints share the build endpoint's transport auth model: Unix socket requests do not send bearer auth, and TCP requests require bearer auth when `service.http.auth.required = true`.
-
-Both endpoints return JSON on success:
-
-```json
-{"workspace_id":"custom_id","status":"reset"}
-```
-
-`DELETE` returns `"status":"deleted"`. Active workspaces return `409 workspace_busy`; missing workspaces return `404`.
-
-## Path Validation
-
-- `cwd` and all glob patterns must be relative and cannot contain `..`.
-- `-C`/`--directory` and `-f`/`--file` args are validated for `make` to prevent escapes.
-- Source extraction and artifact paths are canonicalized to prevent traversal.
-
-## Timeout Handling
-
-On timeout:
-1. Send `SIGTERM` to the process group
-2. Wait 5 seconds
-3. Send `SIGKILL` if still running
-4. Emit `{"type":"exit","code":124,"timed_out":true}`
-
-## Development
-
-Use source builds for local development or unsupported release platforms. Run
-build commands from the cloned repository root.
-
-```bash
-cargo build --release
-```
-
-The release binaries are:
-
-```text
-target/release/build-service
-target/release/build-cli
-```
-
-For substantial code changes, run:
-
-```bash
-cargo fmt
-cargo clippy
-cargo test
-cargo build --release
-```
-
-## Release
-
-Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-Use `current` when `Cargo.toml` already has the intended release version, use
-`patch`, `minor`, or `major`, or pass an explicit version:
-
-```bash
-node scripts/release.mjs current
-node scripts/release.mjs patch
-node scripts/release.mjs minor
-node scripts/release.mjs major
-node scripts/release.mjs 0.6.0
-```
-
-The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
-matching git tag, creates a GitHub release with notes from the changelog,
-then commits a fresh `Unreleased` section for the next cycle.
-
-If GitHub release creation fails after the commit and tag are pushed, recover
-by creating the release manually for the existing tag instead of rerunning the
-script. Then add a fresh `## [Unreleased]` section with the standard
-`_No unreleased changes._` placeholder, commit it as
-`Prepare for next release`, and push `main`.
-
-Release binaries are packaged separately after the target-platform binaries
-have been built by the release operator. Build Linux x86_64 on Linux, and build
-macOS ARM64 natively on Apple Silicon. Supported release archives currently use
-these names:
-
-```text
-build-service-VERSION-linux-x86_64.tar.gz
-build-service-VERSION-macos-arm64.tar.gz
-```
-
-Each archive should contain one top-level directory named
-`build-service-VERSION-PLATFORM` with:
-
-- `bin/build-service` - service daemon.
-- `bin/build-cli` - client CLI.
-- `README.md`
-- `LICENSE`
-- `CHANGELOG.md`
-- `config/`
-- `systemd/`
-- `scripts/build-wrapper.sh`
-- `docs/`
-
-Example packaging flow:
-
-```bash
-VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
-PLATFORM=linux-x86_64 # or macos-arm64
-OUT=/tmp/build-service-release-${VERSION}
-ROOT="build-service-${VERSION}-${PLATFORM}"
-
-rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
-mkdir -p "$OUT/$ROOT/bin" "$OUT/$ROOT/scripts"
-install -m 755 target/release/build-service "$OUT/$ROOT/bin/build-service"
-install -m 755 target/release/build-cli "$OUT/$ROOT/bin/build-cli"
-cp README.md LICENSE CHANGELOG.md "$OUT/$ROOT/"
-cp scripts/build-wrapper.sh "$OUT/$ROOT/scripts/"
-cp -R config systemd docs "$OUT/$ROOT/"
-tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
-```
-
-## CLI Usage
-
-```
-# Config-backed mode
-build-cli build make -j4 all
-build-cli build --timeout 1800 make clean all
-
-# Env-only mode
-BUILD_SERVICE_ENDPOINT=unix:///tmp/build-service.sock build-cli build make -j4 all
-build-cli --endpoint unix:///tmp/build-service.sock build --cwd project cargo test
-build-cli --endpoint unix:///tmp/build-service.sock build --source 'src/**' --artifact 'dist/**' make
-
-# HTTP
-build-cli --endpoint https://builds.example.com --token <token> build make -j4 all
-
-# Managed workspace lifecycle
-build-cli workspace reset --workspace-id custom_id
-build-cli workspace delete --workspace-id custom_id
-build-cli --endpoint unix:///tmp/build-service.sock workspace reset --workspace-id custom_id
-```
-
-For `build-cli workspace reset` and `build-cli workspace delete`, `409 workspace_busy` exits with code `2` and `404 workspace not found` exits with code `3`.
-
-Environment:
-- `BUILD_SERVICE_ENDPOINT`: endpoint URL (`http://`, `https://`, or `unix://`)
-- `BUILD_SERVICE_TOKEN`: bearer token (HTTP only)
-- `BUILD_SERVICE_SOURCES` / `BUILD_SERVICE_SOURCES_EXCLUDE`: comma-separated source patterns
-- `BUILD_SERVICE_ARTIFACTS` / `BUILD_SERVICE_ARTIFACTS_EXCLUDE`: comma-separated artifact patterns
-- `BUILD_SERVICE_CWD`: request working directory relative to the remote workspace
-- `BUILD_SERVICE_TIMEOUT`: timeout in seconds
-- `BUILD_SERVICE_STDOUT_MAX_LINES`: override stdout line limit
-- `BUILD_SERVICE_STDERR_MAX_LINES`: override stderr line limit
-
-## Build Wrapper
-
-Install the wrapper earlier in `PATH` than the real build tools:
-
-```
-cp scripts/build-wrapper.sh /usr/local/bin/build-wrapper
-chmod 755 /usr/local/bin/build-wrapper
-```
-
-During deployment, symlink each build tool name to the wrapper (so the wrapper can detect the command name from `argv[0]`):
-
-```
-ln -s /usr/local/bin/build-wrapper /usr/local/bin/make
-ln -s /usr/local/bin/build-wrapper /usr/local/bin/cargo
-```
-
-Ensure the real tools are still available later in `PATH` (for example in `/usr/bin`). The wrapper removes its own directory from `PATH` before falling back, so it will pick the system tool instead of re-invoking itself.
-
-The wrapper runs `build-cli build` with the command name it was invoked as (for example `make` or `cargo`) when either a repo-local config exists or `BUILD_SERVICE_ENDPOINT` is set. If you maintain custom wrapper scripts, update them to call `build-cli build <tool> ...`.
-
-The wrapper falls back to the local command in two cases:
-1. Neither `.build-service/config.toml` nor `BUILD_SERVICE_ENDPOINT` is present
-2. `build-cli` exits with code `222` because build-service is disabled or the endpoint is unreachable with local fallback enabled
-
-## Logging
-
-Logs are written using `tracing` in a plain-text format. Configure log directory/rotation in `[logging]`.
-
-## Non-Build Example
-
-This service is not limited to build tools. If a command is whitelisted in `build.commands`, a remote client can upload input files and ask your local machine to run that command inside the configured default workspace.
-
-One concrete example is previewing an HTML file with a local [`glimpseui`](https://github.com/hazat/glimpse) install while driving it from a remote shell on `srv`.
-
-1. On your local machine, create a config that keeps everything under `/tmp/build-service` and whitelists `glimpseui`.
-
-```toml
-schema_version = "3"
+[service]
+max_concurrent_builds = 1
 
 [service.socket]
-enabled = true
-path = "/tmp/build-service/build-service.sock"
-mode = "0660"
+enabled = false
+path = "/run/indentured-server/control/server.sock"
+mode = "0600"
 
 [service.http]
+enabled = true
+listen_addr = "127.0.0.1:8080"
+
+[service.http.auth]
+type = "bearer"
+required = true
+token_files = ["/run/credentials/indentured-server.service/bearer-token"]
+
+[service.http.tls]
 enabled = false
+# cert_path = "/etc/indentured-server/tls/server.crt"
+# key_path = "/etc/indentured-server/tls/server.key"
 
 [build]
-workspace_root = "/tmp/build-service/workspaces"
-default_workspace_path = "/tmp/build-service/default"
+workspace_root = "/var/lib/indentured-server/workspaces"
+max_timeout_sec = 1800
+max_output_bytes = 67108864
+run_as_user = "indentured-build"
+run_as_group = "indentured-build"
 
-[build.commands]
-glimpseui = "/usr/local/bin/glimpseui"
+[tasks.build]
+script = '''
+printf 'starting build\n'
+make -j4 all
+'''
+cwd = "."
+timeout_sec = 600
+workspace = "fresh"
+
+[tasks.build.environment]
+PATH = "/usr/bin:/bin"
+LANG = "C.UTF-8"
+
+[tasks.build.artifacts]
+include = ["out/**"]
+exclude = ["out/**/*.tmp"]
 
 [sources]
 max_transfer_bytes = 134217728
 max_uncompressed_bytes = 1342177280
+max_files = 50000
+max_depth = 64
+upload_timeout_sec = 120
 
 [artifacts]
-storage_root = "/tmp/build-service/artifacts"
+storage_root = "/var/lib/indentured-server/artifacts"
+max_transfer_bytes = 536870912
+max_uncompressed_bytes = 2147483648
+max_files = 10000
+max_depth = 64
+# restricted_patterns = ["*.key", "**/*.key"]
+
+[logging]
+level = "info"
+directory = "/var/log/indentured-server"
+max_bytes = 104857600
+max_files = 5
+console = false
 ```
 
-2. On your local machine, create the directories and start `build-service`.
+Task validation occurs at daemon startup:
 
-```bash
-mkdir -p /tmp/build-service/default
-mkdir -p /tmp/build-service/workspaces
-mkdir -p /tmp/build-service/artifacts
-build-service --config /path/to/build-service.toml
+- task names must match `[A-Za-z0-9_-]+` and are bounded to 64 bytes;
+- each task defines exactly one of a server-owned `script` or an absolute `executable`; executable mode retains optional fixed `args` compatibility;
+- scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
+- scripts run exactly as `/bin/sh -eu -c SCRIPT`; `/bin/sh` and configured executables must be accessible executable regular files;
+- script tasks require an explicit nonempty `PATH` whose colon-separated components are all absolute and nonempty;
+- `cwd` and artifact patterns must be relative and contain no parent traversal;
+- task timeouts must be nonzero and no larger than `build.max_timeout_sec`;
+- arguments and environment entries must be NUL-free;
+- the only workspace policy is the required value `fresh`.
+
+The task environment is fixed by configuration. The daemon clears its inherited environment, applies task values, and supplies `HOME`, `USER`, and `LOGNAME` from the configured execution identity only when the task does not set them. Configure `PATH` only with root-controlled or immutable Nix-store directories; validation proves only that components are absolute, not their ownership or immutability.
+
+Absolute executable and fixed-argument compatibility mode remains available:
+
+```toml
+[tasks.compat_build]
+executable = "/usr/bin/make"
+args = ["-j4", "all"]
+cwd = "."
+timeout_sec = 600
+workspace = "fresh"
+
+[tasks.compat_build.environment]
+PATH = "/usr/bin:/bin"
+
+[tasks.compat_build.artifacts]
+include = ["out/**"]
+exclude = []
 ```
 
-3. On your local machine, create a reverse Unix-socket tunnel so `srv` can reach your local daemon.
+A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
-```bash
-ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
-  -R /tmp/build-service.sock:/tmp/build-service/build-service.sock \
-  srv
+```toml
+schema_version = "6"
+
+[tasks.ci]
+script = '''
+exec devenv shell -- /bin/sh -eu -c '
+  cargo build --locked --release
+  cargo test --locked
+'
+'''
+cwd = "."
+timeout_sec = 1800
+workspace = "fresh"
+
+[tasks.ci.environment]
+PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+
+[tasks.ci.artifacts]
+include = ["target/release/**"]
+exclude = []
 ```
 
-4. On `srv`, run `build-cli` against the forwarded socket and upload the HTML file you want to open locally.
+The configured `PATH` controls initial unpinned `devenv` resolution; Devenv then intentionally establishes the inner command environment. Configured script bodies and excerpts are redacted from daemon configuration diagnostics. Normal task stdout/stderr can still contain text deliberately emitted by the server-owned script.
 
-```bash
-build-cli \
-  --endpoint unix:///tmp/build-service.sock \
-  build \
-  --source demo.html \
-  glimpseui demo.html
+## Client configuration and use
+
+`indentured` searches upward for `.indentured-server/config.toml`. Copy [`config/client.toml.example`](config/client.toml.example) to that path to start from the strict client schema. The live `.indentured-server/config.toml` is ignored local state: review its endpoint and credential-file path for the current environment before enabling remote submission. The optional source patterns apply only when no `.jj` repository marker is found.
+
+Run one configured task:
+
+```sh
+indentured run build
+indentured --endpoint unix:///run/indentured-server/control/server.sock run --request-id agent-42 build
+indentured run --result-root /var/tmp/my-run-evidence build
+# Outside a Jujutsu repository only:
+indentured run --source 'src/**' --source 'Cargo.*' --source-exclude 'target/**' build
 ```
 
-Or create a small `glimpseui` wrapper script on `srv` and place it earlier in `PATH`. This version resolves the input file, changes into its directory, and invokes `build-cli` with the right relative arguments:
+Inside a Jujutsu repository, the first stateful operation snapshots and pins `@` to one full commit ID. The client uses documented `jj file list` JSONL metadata and `jj file show` bytes; a temporary full workspace is used only to read symlink targets and is forgotten before upload. There is no `jj archive`, fetch, push, remote, or source-publication operation. Deleted paths and ignored/untracked caches or credentials are absent from the pinned tree; new tracked paths are present. Executable bits and safe relative symlinks are preserved. Conflicts, submodules, unsafe paths/links, and incompatible Jujutsu installations fail closed. Every tracked path is intentional submitted source, so secrets must remain untracked and ignored.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+The pinned commit is an exact immutable tree. Jujutsu does not document the initial live-filesystem snapshot as atomic against a concurrent writer; provenance therefore records `initial_snapshot_atomicity = "not-guaranteed"`. Changes after the full ID is returned cannot change that run's export.
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <html-file>" >&2
-  exit 2
-fi
+Outside Jujutsu repositories, explicit include/exclude selection uses no-follow traversal and before/after manifest and file-identity checks. This detects common concurrent changes but is not an atomic filesystem snapshot.
 
-input="$1"
+The CLI has no command arguments, remote cwd/environment/timeout/artifact flags, or workspace lifecycle subcommands. Artifact selection remains server-owned.
 
-if [ ! -f "$input" ]; then
-  echo "file not found: $input" >&2
-  exit 1
-fi
+Connection precedence is CLI, `INDENTURED_SERVER_ENDPOINT`/`INDENTURED_SERVER_TOKEN_FILE`, then client config. Only credential **paths** are accepted (`--token-file`, the environment variable, or `connection.token_file`); raw-token CLI/environment/TOML surfaces are rejected. A configured credential must remain outside both submitted source and the entire configured result-root base, including canonical symlink aliases. `connection.enabled = false` or `INDENTURED_SERVER_ENABLED=false` returns exit code 222 without running a local command. When an unreachable endpoint has `local_fallback = true`, the client also returns 222; no wrapper shim is shipped.
 
-endpoint="${BUILD_SERVICE_ENDPOINT:-unix:///tmp/build-service.sock}"
-abs_dir="$(cd "$(dirname "$input")" && pwd)"
-base="$(basename "$input")"
+Every invocation creates a unique mode-0700 result directory under `$XDG_STATE_HOME/indentured/runs/<run-id>/` or `$HOME/.local/state/indentured/runs/<run-id>/`; an explicit `--result-root` must be absolute and must not overlap the submitted source in either direction. The resolved path is printed immediately. `stdout.log`, `stderr.log`, `source-manifest.json`, and atomically updated `provenance.json` are retained even on failure or interruption. Artifacts are collected and downloaded after successful, ordinary nonzero, and timed-out remote tasks into a private staging tree and atomically published only as `<run>/artifacts/`; they never overwrite source or run evidence. Failure keeps the task's exit code, while timeout keeps `timed_out: true` and the client exits 124. SIGINT is controlled from source preparation onward: active Jujutsu process groups are killed/reaped, temporary workspace cleanup is attempted for a bounded interval, or the live request stream is dropped so the server cancels the remote process group. Evidence records `interrupted` and the client exits 130.
 
-cd "$abs_dir"
+## Request protocol v1
 
-exec build-cli \
-  --endpoint "$endpoint" \
-  build \
-  --source "$base" \
-  glimpseui "$base"
+`POST /v1/builds` requires multipart fields in this exact order:
+
+1. `metadata` (`application/json`, maximum 64 KiB)
+2. `source` (`application/zip`, bounded by `sources.max_transfer_bytes`)
+
+Metadata example:
+
+```json
+{
+  "schema_version": "1",
+  "request_id": "agent-42",
+  "task": "build",
+  "source": {"format": "zip"}
+}
 ```
 
-With that wrapper in `PATH`, usage on `srv` becomes:
+`request_id` is optional and bounded to 128 bytes. Unknown top-level or source-metadata fields fail closed. Source-first, duplicate, missing, and unknown multipart fields are rejected.
 
-```bash
-glimpseui demo.html
+Responses use `application/x-ndjson`:
+
+```json
+{"type":"build","id":"bld_123","status":"started"}
+{"type":"stdout","data":"compiling...\n"}
+{"type":"stderr","data":"warning...\n"}
+{"type":"exit","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":1234}}
 ```
 
-What happens:
-- `build-cli` on `srv` uploads `demo.html`
-- your local daemon extracts it into `/tmp/build-service/default`
-- your local machine runs the whitelisted command `glimpseui demo.html`
+Artifacts are available at `GET /v1/builds/{build_id}/artifacts.zip`. There are no client workspace endpoints in protocol v1.
 
-This same pattern works for other whitelisted local commands. The important constraint is that the daemon only executes commands listed in `build.commands`; the remote client cannot invoke arbitrary binaries.
+Disconnecting the response stream cancels the running process group. Timeout, disconnect, or combined stdout/stderr exceeding `build.max_output_bytes` sends SIGTERM to the configured process group, waits a bounded five-second grace, then sends SIGKILL if any group member remains. A configured timeout returns exit code 124 with `timed_out: true`; output exhaustion returns a stable `output_limit` error. Process groups are cleanup, not a sandbox: uploaded code may attempt `setsid` or exploit the host.
 
-## Notes
+Source ZIPs are bounded during upload and extraction by a server-owned upload deadline, compressed bytes, declared/actual uncompressed bytes, file/symlink count, and path depth. The single `sources.upload_timeout_sec` deadline covers source-field and multipart-trailer consumption; timeout returns `408` with `source_upload_timeout`, removes the partial file, and releases admission. Traversal, non-ASCII/normalization ambiguity, duplicates, case collisions, file/directory collisions, unsafe symlinks, and special files are rejected before extraction. Safe relative symlinks are created only after complete archive preflight and may not escape the fresh workspace. Artifacts use the server task allowlist and global restrictions, reject symlinks and every explicit Unix special-file mode, and enforce transfer, uncompressed, file-count, and depth limits before or during archive creation. Client preflight accepts only explicit Unix regular-file/directory kinds; missing or zero mode-kind fields remain compatible with portable non-Unix ZIP producers and are interpreted from directory spelling.
 
-- Builds run as the service process user by default, or `build.run_as_user`/`build.run_as_group` if set.
-- If the client disconnects, the service cancels the build and terminates the process group.
-- Artifacts are bundled into `artifacts.zip` and extracted by the client only when requested and returned.
-- Unix file permissions are preserved in both source and artifact archives.
+## macOS launchd and Tailscale deployment
+
+[`docs/macos-launchd-tailscale-deployment.md`](docs/macos-launchd-tailscale-deployment.md) defines the portable macOS/launchd/Tailscale contract for deployment automation. A hardened deployment runs a root daemon with a dedicated non-admin task identity, protected bearer token files, fresh workspaces, one active run with immediate busy rejection, synchronous disconnect/SIGINT cancellation, and private retained client evidence.
+
+The service exposes only a loopback HTTP origin behind Tailscale Serve. Serve terminates external TLS and proxies plaintext HTTP to `127.0.0.1:<port>`; application bearer authentication remains independently required. Built-in rustls HTTPS remains supported for generic direct deployments as server-side transport encryption only; it neither verifies client certificates nor replaces bearer authority, and it is not this Serve edge. The Unix socket is disabled in this topology.
+
+This repository owns generic packages/apps, behavior, documentation, and a parameterized launchd example. Deployment automation/operator policy owns concrete users/groups, the authoritative launchd module and activation, trusted server-configured script or executable/fixed-argv task definitions, secrets/rotation, retention values, Tailscale reconciliation, and the native behavioral acceptance gate. The local packaged harness is:
+
+```sh
+devenv tasks run integration:packaged-local
+```
+
+It executes the exact Nix package binaries through local package/upload/named-task/stream/exit/artifact behavior without a forge, remote shell, source publication, Xcode, or remote Mac.
+
+## systemd
+
+Install `systemd/indentured-server.service`, the daemon binary, and the server configuration using paths appropriate for the host. The checked-in unit expects `/usr/local/bin/indentured-server` and `/etc/indentured-server/config.toml`, provisions the bearer with `LoadCredential=`, uses daemon-only runtime/state/log directories, and sets `UMask=0077`. The daemon intentionally starts as root so it can own protected state and then drop each task to `build.run_as_user`; do not place bearer values in `Environment=`.
+
+Linux tests and an Apple-target compile do not prove macOS privilege behavior. Before deployment, the operator must run the detailed guide's native checks for configured UID/GID and supplementary groups, credential/artifact/control unreadability, process-group cancellation, workspace cleanup, immediate busy behavior, edge topology, retention, and rotation. That native macOS deployment gate is an external prerequisite.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

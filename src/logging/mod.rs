@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -12,7 +13,7 @@ use tracing_subscriber::fmt::SubscriberBuilder;
 
 use crate::config::LoggingConfig;
 
-const LOG_FILENAME: &str = "build-service.log";
+const LOG_FILENAME: &str = "indentured-server.log";
 const LOG_QUEUE_CAPACITY: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +98,29 @@ impl LoggingSettings {
                 path: directory.clone(),
                 source,
             })?;
+            let metadata =
+                fs::symlink_metadata(directory).map_err(|source| LoggingError::CreateDir {
+                    path: directory.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(LoggingError::CreateDir {
+                    path: directory.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "log directory must be a daemon-owned real directory",
+                    ),
+                });
+            }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(
+                |source| LoggingError::CreateDir {
+                    path: directory.clone(),
+                    source,
+                },
+            )?;
 
             let log_path = directory.join(LOG_FILENAME);
             let file_writer =
@@ -269,7 +293,9 @@ impl RotatingFileWriter {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&base_path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
         Ok(Self {
@@ -303,7 +329,10 @@ impl RotatingFileWriter {
         self.file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&self.base_path)?;
+        self.file
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
         self.size = 0;
 
         Ok(())

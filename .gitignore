@@ -3,7 +3,11 @@
 *.swp
 *.swo
 .DS_Store
-.release-notes-tmp.md
+/.indentured-server/config.toml
 .codemap
 .specs
-.build-service/workspace-id
+/.pi-subagents/
+/.devenv/
+/.direnv/
+/devenv.local.nix
+/devenv.local.yaml

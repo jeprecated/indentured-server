@@ -1,79 +1,77 @@
-schema_version = "3"
+schema_version = "6"
 
 [service]
+# Immediate admission control; excess authenticated requests receive HTTP 503.
+max_concurrent_builds = 1
 
 [service.socket]
-enabled = true
-path = "/run/build-service.sock"
-# group = "users"
-mode = "0660"
+# Disabled by default. When explicitly enabled, socket filesystem permissions
+# are the entire authority boundary; the task identity must not be able to connect.
+enabled = false
+path = "/run/indentured-server/control/server.sock"
+mode = "0600"
 
 [service.http]
-enabled = false
-listen_addr = "0.0.0.0:8080"
+enabled = true
+listen_addr = "127.0.0.1:8080"
 
 [service.http.auth]
 type = "bearer"
-required = false
-# tokens = ["<secret token>"]
+required = true
+# Runtime files contain one token each, mode 0600, outside repositories/Nix store.
+token_files = ["/run/credentials/indentured-server.service/bearer-token"]
 
 [service.http.tls]
 enabled = false
-# cert_path = "/etc/build-service/tls/server.crt"
-# key_path = "/etc/build-service/tls/server.key"
-# ca_path = "/etc/build-service/tls/ca.crt"
+# Optional server-side transport encryption only; clients are authenticated by bearer token.
+# cert_path = "/etc/indentured-server/tls/server.crt"
+# key_path = "/etc/indentured-server/tls/server.key"
 
 [build]
-workspace_root = "/var/lib/build-service/workspaces"
-# default_workspace_path = "/home/build/workspace"  # server never GC's or cleans this path
-# optional: run builds as this user/group (default: service process user)
-# run_as_user = "build"
-# run_as_group = "build"
+workspace_root = "/var/lib/indentured-server/workspaces"
+max_timeout_sec = 1800
+max_output_bytes = 67108864
+run_as_user = "indentured-build"
+run_as_group = "indentured-build"
 
-[build.workspace]
-# default_ttl_sec = 7200
-# allow_permanent = false
-# gc_interval_sec = 3600
+[tasks.build]
+script = '''
+printf 'starting build\n'
+make -j4 all
+'''
+cwd = "."
+timeout_sec = 600
+workspace = "fresh"
 
-[build.commands]
-make = "/usr/bin/make"
+[tasks.build.environment]
+PATH = "/usr/bin:/bin"
+LANG = "C.UTF-8"
 
-[build.timeouts]
-default_sec = 600
-max_sec = 1800
-
-[build.environment]
-allow = [
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "LANG",
-    "CC",
-    "CXX",
-    "CFLAGS",
-    "CXXFLAGS",
-    "LDFLAGS",
-    "PKG_CONFIG_PATH",
-    "MAKEFLAGS",
-]
+[tasks.build.artifacts]
+include = ["out/**"]
+exclude = ["out/**/*.tmp"]
 
 [sources]
 max_transfer_bytes = 134217728
 max_uncompressed_bytes = 1342177280
+max_files = 50000
+max_depth = 64
+upload_timeout_sec = 120
 
 [artifacts]
-storage_root = "/var/lib/build-service/artifacts"
+storage_root = "/var/lib/indentured-server/artifacts"
 # ttl_sec = 86400
 # gc_interval_sec = 3600
 # max_bytes = 1073741824
-# max_transfer_bytes = 536870912
-# max_uncompressed_bytes = 2147483648
-# restricted_patterns = ["*.cc", "**/*.cc", "*.cpp", "**/*.cpp", "*.h", "**/*.h", "*.hpp", "**/*.hpp"]
+max_transfer_bytes = 536870912
+max_uncompressed_bytes = 2147483648
+max_files = 10000
+max_depth = 64
+# restricted_patterns = ["*.key", "**/*.key"]
 
 [logging]
 level = "info"
-directory = "/var/log/build-service"
+directory = "/var/log/indentured-server"
 max_bytes = 104857600
 max_files = 5
 console = false

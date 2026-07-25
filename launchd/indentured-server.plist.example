@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.example.indentured-server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/nix/store/REPLACE_WITH_PINNED_OUTPUT/bin/indentured-server</string>
+    <string>--config</string>
+    <string>/etc/indentured-server/config.toml</string>
+  </array>
+
+  <!-- The daemon owns protected state as root and drops each task to the
+       non-admin identity configured by build.run_as_user/run_as_group. -->
+  <key>UserName</key>
+  <string>root</string>
+  <key>WorkingDirectory</key>
+  <string>/var/empty</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- Decimal 63 is octal 077. -->
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/indentured-server/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/indentured-server/launchd.stderr.log</string>
+</dict>
+</plist>
