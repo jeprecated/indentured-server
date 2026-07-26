@@ -149,6 +149,7 @@ fn run_build(
     .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
 
     let run_as = resolve_run_as(config)?;
+    validate_run_as_uid(&run_as, unsafe { libc::geteuid() })?;
     std::fs::create_dir_all(&config.build.workspace_root).map_err(|err| {
         BuildError::new(
             "workspace_create_failed",
@@ -838,6 +839,16 @@ fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
     Ok(RunAs { user, gid, set_ids })
 }
 
+fn validate_run_as_uid(run_as: &RunAs, effective_uid: u32) -> Result<(), BuildError> {
+    if effective_uid == 0 && run_as.user.uid == 0 {
+        return Err(BuildError::new(
+            "run_as_user",
+            "a root daemon must not execute tasks as UID 0",
+        ));
+    }
+    Ok(())
+}
+
 fn build_env(task: &TaskConfig, user: &UserInfo) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = task
         .environment
@@ -899,6 +910,7 @@ fn apply_privilege_drop(
 }
 
 fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildError> {
+    validate_run_as_uid(run_as, unsafe { libc::geteuid() })?;
     let should_set_ids = run_as.set_ids;
     let username = run_as.user.username.clone();
     let gid = run_as.gid;
@@ -910,6 +922,12 @@ fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildE
                 return Err(io::Error::last_os_error());
             }
 
+            if libc::geteuid() == 0 && uid == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "a root daemon must not execute tasks as UID 0",
+                ));
+            }
             if should_set_ids {
                 let c_username = CString::new(username.clone())
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid username"))?;
@@ -1280,6 +1298,50 @@ required = false
             preflight_run_as_with_effective_uid(&config, 0)
                 .expect("simulated root daemon accepts a configured non-root identity");
         }
+    }
+
+    #[test]
+    fn execution_time_resolution_rejects_root_task_uid_for_root_daemon() {
+        let run_as = RunAs {
+            user: UserInfo {
+                username: "root-after-nss-change".to_string(),
+                uid: 0,
+                gid: 0,
+                home_dir: PathBuf::from("/root"),
+            },
+            gid: 0,
+            set_ids: true,
+        };
+        let error = validate_run_as_uid(&run_as, 0).unwrap_err();
+        assert_eq!(error.code, "run_as_user");
+        assert!(error.message.contains("UID 0"));
+        let mut no_privilege_drop = run_as;
+        no_privilege_drop.set_ids = false;
+        assert!(validate_run_as_uid(&no_privilege_drop, 0).is_err());
+        validate_run_as_uid(&no_privilege_drop, 1000)
+            .expect("non-root daemons cannot setuid to root");
+    }
+
+    #[test]
+    fn command_configuration_rejects_numeric_root_target_before_spawn() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping root-only command guard test");
+            return;
+        }
+        let run_as = RunAs {
+            user: UserInfo {
+                username: "inconsistent-nss-root".to_string(),
+                uid: 0,
+                gid: 0,
+                home_dir: PathBuf::from("/root"),
+            },
+            gid: 0,
+            set_ids: true,
+        };
+        let mut command = Command::new("true");
+        let error = configure_command(&mut command, &run_as).unwrap_err();
+        assert_eq!(error.code, "run_as_user");
+        assert!(error.message.contains("UID 0"));
     }
 
     #[test]

@@ -209,10 +209,12 @@ fn validate_credential_parent(
         }
         if authority_metadata.file_type().is_symlink()
             || !authority_metadata.is_dir()
+            || (task_uid.is_some_and(|uid| authority_metadata.uid() == uid))
+            || (authority_metadata.uid() != daemon_uid && authority_metadata.uid() != 0)
             || (authority_mode & 0o022 != 0 && authority_mode & libc::S_ISVTX == 0)
         {
             return Err(HttpError::Credential(format!(
-                "containing runtime directory {authority:?} must be real and prevent replacement of the credential path"
+                "containing runtime directory {authority:?} must be a real directory owned by the daemon or root and prevent replacement of the credential path"
             )));
         }
     }
@@ -1048,6 +1050,32 @@ mod tests {
                 0
             );
             assert!(AuthSecrets::load(&[parent_token], None).is_err());
+
+            let foreign_ancestor = temp.path().join("foreign-ancestor");
+            let foreign_runtime = foreign_ancestor.join("runtime");
+            std::fs::create_dir_all(&foreign_runtime).unwrap();
+            std::fs::set_permissions(&foreign_ancestor, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            std::fs::set_permissions(&foreign_runtime, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let foreign_token = foreign_runtime.join("token");
+            std::fs::write(&foreign_token, "foreign-ancestor\n").unwrap();
+            std::fs::set_permissions(&foreign_token, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let c_ancestor = CString::new(foreign_ancestor.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe { libc::chown(c_ancestor.as_ptr(), 1, !0 as libc::gid_t) },
+                0
+            );
+            assert!(AuthSecrets::load(&[foreign_token], None).is_err());
+
+            std::fs::create_dir_all(&foreign_runtime).unwrap();
+            let c_task_ancestor = CString::new(foreign_ancestor.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe { libc::chown(c_task_ancestor.as_ptr(), 1, !0 as libc::gid_t) },
+                0
+            );
+            assert!(AuthSecrets::load(&[foreign_runtime.join("token")], Some(1)).is_err());
         }
     }
 
