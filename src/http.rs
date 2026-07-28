@@ -211,7 +211,7 @@ fn validate_credential_parent(
             || !authority_metadata.is_dir()
             || (task_uid.is_some_and(|uid| authority_metadata.uid() == uid))
             || (authority_metadata.uid() != daemon_uid && authority_metadata.uid() != 0)
-            || (authority_mode & 0o022 != 0 && authority_mode & libc::S_ISVTX == 0)
+            || (authority_mode & 0o022 != 0 && authority_mode & 0o1000 == 0)
         {
             return Err(HttpError::Credential(format!(
                 "containing runtime directory {authority:?} must be a real directory owned by the daemon or root and prevent replacement of the credential path"

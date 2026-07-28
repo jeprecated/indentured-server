@@ -1825,8 +1825,8 @@ fn validate_artifact_zip_type(mode: Option<u32>, is_dir: bool) -> io::Result<()>
         // remains authoritative for those archives, preserving compatibility.
         return Ok(());
     };
-    let kind = mode & libc::S_IFMT;
-    let expected = if is_dir { libc::S_IFDIR } else { libc::S_IFREG };
+    let kind = mode & 0o170000;
+    let expected = if is_dir { 0o040000 } else { 0o100000 };
     // Some non-Unix ZIP producers expose permissions with a zero type field.
     // Accept that portable form, but reject every explicit non-file/non-directory
     // Unix kind rather than relying on zip::ZipFile::is_file().
@@ -2239,8 +2239,8 @@ mod tests {
         }
 
         let _ = assert_rejected_without_staging(&raw_unix_archive(&[
-            ("same", libc::S_IFREG | 0o644),
-            ("same", libc::S_IFREG | 0o644),
+            ("same", 0o100644),
+            ("same", 0o100644),
         ]));
         for entries in [
             vec![("Name", false), ("name", false)],

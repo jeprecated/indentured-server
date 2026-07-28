@@ -701,13 +701,13 @@ fn validate_zip_type(mode: Option<u32>, is_dir: bool, is_symlink: bool) -> Resul
         }
         return Ok(());
     };
-    let kind = mode & libc::S_IFMT;
+    let kind = mode & 0o170000;
     let expected = if is_dir {
-        libc::S_IFDIR
+        0o040000
     } else if is_symlink {
-        libc::S_IFLNK
+        0o120000
     } else {
-        libc::S_IFREG
+        0o100000
     };
     if kind != 0 && kind != expected {
         return Err(BuildError::new(
@@ -1417,7 +1417,7 @@ required = false
                 .contains("max_depth")
         );
 
-        assert!(validate_zip_type(Some(libc::S_IFLNK | 0o777), false, true).is_ok());
+        assert!(validate_zip_type(Some(0o120777), false, true).is_ok());
     }
 
     #[test]
