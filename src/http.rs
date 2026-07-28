@@ -5,6 +5,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -101,11 +103,20 @@ impl AuthSecrets {
         }
     }
 
+    #[cfg(test)]
     fn load(paths: &[PathBuf], task_uid: Option<u32>) -> Result<Self, HttpError> {
+        Self::load_with_groups(paths, task_uid, &[])
+    }
+
+    fn load_with_groups(
+        paths: &[PathBuf],
+        task_uid: Option<u32>,
+        task_group_ids: &[u32],
+    ) -> Result<Self, HttpError> {
         let daemon_uid = unsafe { libc::geteuid() };
         let mut digests = Vec::with_capacity(paths.len());
         for path in paths {
-            validate_credential_parent(path, daemon_uid, task_uid)?;
+            validate_credential_parent(path, daemon_uid, task_uid, task_group_ids)?;
             let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
@@ -169,10 +180,92 @@ impl AuthSecrets {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_task_group_ids(stdout: &[u8], primary_gid: u32) -> Result<Vec<u32>, HttpError> {
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|_| HttpError::Credential("task groups are malformed".to_string()))?;
+    let mut groups = stdout
+        .split_ascii_whitespace()
+        .map(|group| {
+            group
+                .parse::<u32>()
+                .map_err(|_| HttpError::Credential("task groups are malformed".to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if groups.is_empty() {
+        return Err(HttpError::Credential(
+            "task groups are malformed".to_string(),
+        ));
+    }
+    if !groups.contains(&primary_gid) {
+        groups.push(primary_gid);
+    }
+    Ok(groups)
+}
+
+fn resolved_task_group_ids(
+    username: Option<&str>,
+    primary_gid: Option<u32>,
+) -> Result<Vec<u32>, HttpError> {
+    #[cfg(target_os = "macos")]
+    {
+        let username = username.ok_or_else(|| {
+            HttpError::Credential("cannot resolve task groups without a task user".to_string())
+        })?;
+        let primary_gid = primary_gid.ok_or_else(|| {
+            HttpError::Credential("cannot resolve task groups without a primary group".to_string())
+        })?;
+        let output = Command::new("/usr/bin/id")
+            .args(["-G", username])
+            .env_clear()
+            .output()
+            .map_err(|_| HttpError::Credential("cannot inspect task groups".to_string()))?;
+        if !output.status.success() {
+            return Err(HttpError::Credential(
+                "cannot inspect task groups".to_string(),
+            ));
+        }
+        parse_task_group_ids(&output.stdout, primary_gid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (username, primary_gid);
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeAuthorityMetadata {
+    is_symlink: bool,
+    is_directory: bool,
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+}
+
+fn is_trusted_runtime_authority(
+    authority: &Path,
+    metadata: RuntimeAuthorityMetadata,
+    task_uid: Option<u32>,
+    task_group_ids: &[u32],
+    macos: bool,
+) -> bool {
+    (authority == Path::new("/var/run") && metadata.is_symlink)
+        || (macos
+            && authority == Path::new("/private/var/run")
+            && !metadata.is_symlink
+            && metadata.is_directory
+            && metadata.owner_uid == 0
+            && task_uid != Some(0)
+            && !task_group_ids.contains(&metadata.owner_gid)
+            && metadata.mode & 0o002 == 0)
+}
+
 fn validate_credential_parent(
     path: &Path,
     daemon_uid: u32,
     task_uid: Option<u32>,
+    task_group_ids: &[u32],
 ) -> Result<(), HttpError> {
     let parent = path.parent().ok_or_else(|| {
         HttpError::Credential(format!(
@@ -202,9 +295,19 @@ fn validate_credential_parent(
             ))
         })?;
         let authority_mode = authority_metadata.permissions().mode();
-        let trusted_var_run_link =
-            authority == Path::new("/var/run") && authority_metadata.file_type().is_symlink();
-        if trusted_var_run_link {
+        if is_trusted_runtime_authority(
+            authority,
+            RuntimeAuthorityMetadata {
+                is_symlink: authority_metadata.file_type().is_symlink(),
+                is_directory: authority_metadata.is_dir(),
+                owner_uid: authority_metadata.uid(),
+                owner_gid: authority_metadata.gid(),
+                mode: authority_mode,
+            },
+            task_uid,
+            task_group_ids,
+            cfg!(target_os = "macos"),
+        ) {
             continue;
         }
         if authority_metadata.file_type().is_symlink()
@@ -231,12 +334,22 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
     crate::artifacts::prepare_artifact_storage_root(&config.artifacts.storage_root)
         .map_err(|err| HttpError::Serve(err.to_string()))?;
     crate::build::preflight_run_as(&config).map_err(|err| HttpError::Serve(err.to_string()))?;
-    let task_uid = crate::build::resolved_run_as_uid(&config)
+    let task_identity = crate::build::resolved_run_as_identity(&config)
         .map_err(|err| HttpError::Serve(err.to_string()))?;
+    let task_uid = task_identity.as_ref().map(|identity| identity.0);
+    let task_group_ids = if config.service.http.auth.required {
+        resolved_task_group_ids(
+            task_identity.as_ref().map(|identity| identity.1.as_str()),
+            task_identity.as_ref().map(|identity| identity.2),
+        )?
+    } else {
+        Vec::new()
+    };
     let auth = if config.service.http.auth.required {
-        Arc::new(AuthSecrets::load(
+        Arc::new(AuthSecrets::load_with_groups(
             &config.service.http.auth.token_files,
             task_uid,
+            &task_group_ids,
         )?)
     } else {
         Arc::new(AuthSecrets::empty())
@@ -877,6 +990,96 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(prepare_protected_directory(&link, 0o700).is_err());
+    }
+
+    #[test]
+    fn task_group_parser_includes_the_configured_primary_group() {
+        assert_eq!(parse_task_group_ids(b"1 2\n", 550).unwrap(), [1, 2, 550]);
+        assert_eq!(parse_task_group_ids(b"1 550\n", 550).unwrap(), [1, 550]);
+        assert!(parse_task_group_ids(b"", 550).is_err());
+        assert!(parse_task_group_ids(b"1 nope\n", 550).is_err());
+    }
+
+    #[test]
+    fn runtime_authority_accepts_only_the_exact_native_macos_root() {
+        let macos_var_run = Path::new("/private/var/run");
+        let native = RuntimeAuthorityMetadata {
+            is_symlink: false,
+            is_directory: true,
+            owner_uid: 0,
+            owner_gid: 1,
+            mode: 0o040775,
+        };
+        assert!(is_trusted_runtime_authority(
+            macos_var_run,
+            native,
+            Some(550),
+            &[550],
+            true,
+        ));
+        assert!(is_trusted_runtime_authority(
+            Path::new("/var/run"),
+            RuntimeAuthorityMetadata {
+                is_symlink: true,
+                is_directory: false,
+                owner_uid: 0,
+                owner_gid: 0,
+                mode: 0o120777,
+            },
+            Some(550),
+            &[550],
+            false,
+        ));
+        assert!(!is_trusted_runtime_authority(
+            macos_var_run,
+            native,
+            Some(550),
+            &[1, 550],
+            true,
+        ));
+        for invalid in [
+            RuntimeAuthorityMetadata {
+                is_symlink: true,
+                ..native
+            },
+            RuntimeAuthorityMetadata {
+                owner_uid: 1,
+                ..native
+            },
+            RuntimeAuthorityMetadata {
+                mode: 0o040777,
+                ..native
+            },
+        ] {
+            assert!(!is_trusted_runtime_authority(
+                macos_var_run,
+                invalid,
+                Some(550),
+                &[550],
+                true,
+            ));
+        }
+        assert!(!is_trusted_runtime_authority(
+            macos_var_run,
+            native,
+            Some(0),
+            &[550],
+            true,
+        ));
+        assert!(!is_trusted_runtime_authority(
+            macos_var_run,
+            native,
+            Some(550),
+            &[550],
+            false,
+        ));
+        assert!(!is_trusted_runtime_authority(
+            Path::new("/private/var/tmp"),
+            native,
+            Some(550),
+            &[550],
+            true,
+        ));
     }
 
     #[test]

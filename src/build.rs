@@ -798,11 +798,12 @@ fn preflight_run_as_with_effective_uid(
     Ok(())
 }
 
-pub fn resolved_run_as_uid(config: &Config) -> Result<Option<u32>, BuildError> {
+pub fn resolved_run_as_identity(config: &Config) -> Result<Option<(u32, String, u32)>, BuildError> {
     if config.build.run_as_user.is_none() && config.build.run_as_group.is_none() {
         return Ok(None);
     }
-    Ok(Some(resolve_run_as(config)?.user.uid))
+    let run_as = resolve_run_as(config)?;
+    Ok(Some((run_as.user.uid, run_as.user.username, run_as.gid)))
 }
 
 fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
