@@ -100,9 +100,11 @@ fn streamed_output_is_always_captured_in_xdg_run_directory() {
     let state = TempDir::new().unwrap();
     let body = concat!(
         "{\"type\":\"build\",\"id\":\"bld_123\",\"status\":\"started\"}\n",
+        "{\"type\":\"build\",\"id\":\"bld_123\",\"status\":\"phase_started\",\"phase\":\"run\"}\n",
         "{\"type\":\"stdout\",\"data\":\"one\\ntwo\\n\"}\n",
         "{\"type\":\"stderr\",\"data\":\"err-one\\nerr-two\\n\"}\n",
-        "{\"type\":\"exit\",\"code\":0,\"timed_out\":false}\n"
+        "{\"type\":\"build\",\"id\":\"bld_123\",\"status\":\"phase_finished\",\"phase\":\"run\",\"duration_ms\":42,\"exit_code\":0,\"timed_out\":false}\n",
+        "{\"type\":\"exit\",\"code\":0,\"timed_out\":false,\"phases\":[{\"phase\":\"run\",\"duration_ms\":42,\"exit_code\":0,\"timed_out\":false}]}\n"
     )
     .to_string();
     let (endpoint, handle) = start_stream_server(body);
@@ -142,7 +144,11 @@ fn streamed_output_is_always_captured_in_xdg_run_directory() {
             & 0o777,
         0o600
     );
-    assert!(run.join("provenance.json").exists());
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(provenance["schema_version"], 2);
+    assert_eq!(provenance["phases"][0]["phase"], "run");
+    assert_eq!(provenance["phases"][0]["duration_ms"], 42);
     assert!(run.join("source-manifest.json").exists());
     assert!(
         fs::read_dir(&run).unwrap().all(|entry| !entry
@@ -152,7 +158,10 @@ fn streamed_output_is_always_captured_in_xdg_run_directory() {
             .starts_with(".source-")),
         "temporary source archives must be removed"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains(run.to_str().unwrap()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(run.to_str().unwrap()));
+    assert!(stderr.contains("run phase started"));
+    assert!(stderr.contains("run phase finished in 0.042s"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("one\n"));
 }
 
@@ -196,7 +205,7 @@ fn start_real_server(root: &Path) -> (String, Child) {
     fs::write(
         &config,
         format!(
-            r#"schema_version = "6"
+            r#"schema_version = "7"
 [service]
 max_concurrent_builds = 1
 [service.socket]

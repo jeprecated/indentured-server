@@ -800,9 +800,10 @@ mod tests {
     use super::*;
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, Config, LoggingConfig, ScriptText,
-        ServiceConfig, SourcesConfig, TaskConfig, WorkspacePolicy, CONFIG_SCHEMA_VERSION,
+        ServiceConfig, SourcesConfig, TaskConfig, TaskSetupConfig, WorkspacePolicy,
+        CONFIG_SCHEMA_VERSION,
     };
-    use crate::protocol::{Request, ResponseEvent, SourceFormat, SourceMetadata};
+    use crate::protocol::{BuildPhase, Request, ResponseEvent, SourceFormat, SourceMetadata};
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
     use std::collections::HashMap;
@@ -1462,6 +1463,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_and_run_share_one_stream_workspace_and_cleanup_contract() {
+        let env = setup_env();
+        let workspace_root = env.workspace_root.clone();
+        let process_pids = env.process_pids.clone();
+        let slots = Arc::clone(&env.build_slots);
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::time::timeout(
+            LIFECYCLE_SCENARIO_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let base = format!("http://{addr}");
+                let client = bounded_lifecycle_client();
+
+                let events = run_task_events_through_eof(&client, &base, "phased");
+                let finished: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        ResponseEvent::Build {
+                            status,
+                            phase: Some(phase),
+                            duration_ms: Some(_),
+                            ..
+                        } if status == "phase_finished" => Some(*phase),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(finished, [BuildPhase::Setup, BuildPhase::Run]);
+                assert!(matches!(
+                    events.last(),
+                    Some(ResponseEvent::Exit {
+                        code: 0,
+                        timed_out: false,
+                        failed_phase: None,
+                        phases,
+                        ..
+                    }) if phases.iter().map(|result| result.phase).collect::<Vec<_>>()
+                        == [BuildPhase::Setup, BuildPhase::Run]
+                ));
+                wait_for_slot_and_cleanup(&slots, &workspace_root);
+
+                let (errors, exit) = run_task_events(&client, &base, "shared-output");
+                assert!(errors.iter().any(|code| code == "output_limit"));
+                assert_eq!(exit, (1, false));
+                wait_for_slot_and_cleanup(&slots, &workspace_root);
+
+                let events = run_task_events_through_eof(&client, &base, "setup-error");
+                assert!(matches!(
+                    events.last(),
+                    Some(ResponseEvent::Exit {
+                        code: 9,
+                        timed_out: false,
+                        failed_phase: Some(BuildPhase::Setup),
+                        phases,
+                        ..
+                    }) if phases.len() == 1 && phases[0].phase == BuildPhase::Setup
+                ));
+                assert!(!process_pids.join("run-after-setup-error").exists());
+                wait_for_slot_and_cleanup(&slots, &workspace_root);
+
+                let events = run_task_events_through_eof(&client, &base, "setup-timeout");
+                assert!(matches!(
+                    events.last(),
+                    Some(ResponseEvent::Exit {
+                        timed_out: true,
+                        failed_phase: Some(BuildPhase::Setup),
+                        phases,
+                        ..
+                    }) if phases.len() == 1
+                        && phases[0].phase == BuildPhase::Setup
+                        && phases[0].timed_out
+                ));
+                let setup_pid = read_pid(&process_pids.join("setup-timeout.pid"));
+                assert!(!process_exists(setup_pid));
+                assert!(!process_pids.join("run-after-setup-timeout").exists());
+                wait_for_slot_and_cleanup(&slots, &workspace_root);
+            }),
+        )
+        .await
+        .expect("two-phase lifecycle scenario exceeded its deadline")
+        .expect("two-phase lifecycle task");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn real_error_timeout_output_limit_and_disconnect_release_slot_and_cleanup() {
         let env = setup_env();
         let workspace_root = env.workspace_root.clone();
@@ -1577,8 +1661,9 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  setup) printf 'prepared\n' > setup.txt ;;\n  setup-error) printf setup-failed > out/setup-failed.txt; exit 9 ;;\n  setup-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  phase-output) dd if=/dev/zero bs=1048576 count=17 2>/dev/null ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
                 marker.display(),
+                process_pids.display(),
                 process_pids.display(),
                 process_pids.display(),
                 process_pids.display()
@@ -1610,6 +1695,7 @@ mod tests {
                     script: None,
                     executable: Some(script.clone()),
                     args: vec!["fixed".to_string()],
+                    setup: None,
                     cwd: "work".to_string(),
                     timeout_sec: 30,
                     environment: HashMap::from([
@@ -1646,6 +1732,38 @@ mod tests {
                     task.artifacts.include.clear();
                     task
                 };
+                let phased_task = |setup_arg: &str, setup_timeout_sec: u64| {
+                    let mut task = build_task.clone();
+                    task.script = Some(ScriptText::new(format!(
+                        "IFS= read -r prepared < setup.txt\ntest \"$prepared\" = prepared\nexec '{}' fixed",
+                        script.display()
+                    )));
+                    task.executable = None;
+                    task.args.clear();
+                    task.setup = Some(TaskSetupConfig {
+                        script: None,
+                        executable: Some(script.clone()),
+                        args: vec![setup_arg.to_string()],
+                        timeout_sec: setup_timeout_sec,
+                    });
+                    task
+                };
+                let mut setup_error = phased_task("setup-error", 30);
+                setup_error.script = Some(ScriptText::new(format!(
+                    "printf forbidden > '{}'",
+                    process_pids.join("run-after-setup-error").display()
+                )));
+                let mut setup_timeout = phased_task("setup-timeout", 1);
+                setup_timeout.script = Some(ScriptText::new(format!(
+                    "printf forbidden > '{}'",
+                    process_pids.join("run-after-setup-timeout").display()
+                )));
+                let mut shared_output = phased_task("phase-output", 30);
+                shared_output.script = Some(ScriptText::new(format!(
+                    "exec '{}' phase-output",
+                    script.display()
+                )));
+                shared_output.artifacts.include.clear();
                 HashMap::from([
                     ("build".to_string(), build_task.clone()),
                     ("error".to_string(), process_task("error", 30)),
@@ -1653,6 +1771,10 @@ mod tests {
                     ("disconnect".to_string(), process_task("disconnect", 30)),
                     ("output".to_string(), process_task("output", 30)),
                     ("nonreader".to_string(), process_task("nonreader", 10)),
+                    ("phased".to_string(), phased_task("setup", 10)),
+                    ("setup-error".to_string(), setup_error),
+                    ("setup-timeout".to_string(), setup_timeout),
+                    ("shared-output".to_string(), shared_output),
                     (
                         "errexit".to_string(),
                         shell_behavior_task(format!(

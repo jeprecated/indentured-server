@@ -18,7 +18,9 @@ use uuid::Uuid;
 
 use crate::artifacts::{collect_artifacts_zip, ArtifactError};
 use crate::config::{Config, TaskConfig, TaskExecution, SCRIPT_SHELL};
-use crate::protocol::{ArtifactArchive, Request, ResponseEvent, REQUEST_SCHEMA_VERSION};
+use crate::protocol::{
+    ArtifactArchive, BuildPhase, PhaseResult, Request, ResponseEvent, REQUEST_SCHEMA_VERSION,
+};
 use crate::user::{lookup_group_gid, lookup_user, lookup_user_by_name, UserInfo};
 use crate::validation::{validate_cwd, validate_relative_path, ValidationError};
 
@@ -51,6 +53,8 @@ pub struct BuildError {
     pub code: &'static str,
     pub message: String,
     pub pattern: Option<String>,
+    pub phase: Option<BuildPhase>,
+    pub phases: Vec<PhaseResult>,
 }
 
 impl BuildError {
@@ -59,6 +63,8 @@ impl BuildError {
             code,
             message: message.into(),
             pattern: None,
+            phase: None,
+            phases: Vec::new(),
         }
     }
 
@@ -67,7 +73,19 @@ impl BuildError {
             code,
             message: message.into(),
             pattern: Some(pattern),
+            phase: None,
+            phases: Vec::new(),
         }
+    }
+
+    fn in_phase(mut self, phase: BuildPhase) -> Self {
+        self.phase = Some(phase);
+        self
+    }
+
+    fn with_phases(mut self, phases: Vec<PhaseResult>) -> Self {
+        self.phases = phases;
+        self
     }
 }
 
@@ -111,12 +129,20 @@ pub fn execute_build(
     cancellation: CancellationFlag,
 ) {
     if let Err(err) = run_build(validated, &config, &source_archive, &sender, &cancellation) {
+        let BuildError {
+            code,
+            message,
+            pattern,
+            phase,
+            phases,
+        } = err;
         let _ = send_response(
             &sender,
             ResponseEvent::Error {
-                code: err.code.to_string(),
-                message: Some(err.message),
-                pattern: err.pattern,
+                code: code.to_string(),
+                message: Some(message),
+                pattern,
+                phase,
             },
         );
         let _ = send_response(
@@ -126,6 +152,8 @@ pub fn execute_build(
                 timed_out: false,
                 artifacts: None,
                 artifact_restrictions: None,
+                failed_phase: phase,
+                phases,
             },
         );
     }
@@ -144,6 +172,10 @@ fn run_build(
         ResponseEvent::Build {
             id: build_id.clone(),
             status: "started".to_string(),
+            phase: None,
+            duration_ms: None,
+            exit_code: None,
+            timed_out: None,
         },
     )
     .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -202,7 +234,115 @@ fn run_build_in_workspace(
     );
 
     let env = build_env(&validated.task, &run_as.user);
-    let mut command = match validated.task.execution() {
+    let output_bytes = Arc::new(AtomicU64::new(0));
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let mut phases = Vec::with_capacity(2);
+
+    if let Some(setup) = &validated.task.setup {
+        let result = run_phase(
+            setup.execution(),
+            setup.timeout_sec,
+            BuildPhase::Setup,
+            validated,
+            config,
+            run_as,
+            &cwd,
+            build_id,
+            request_id,
+            &env,
+            sender,
+            cancellation,
+            &output_bytes,
+            &output_exceeded,
+        )?;
+        let failed = result.exit_code != 0 || result.timed_out;
+        let exit_code = result.exit_code;
+        let timed_out = result.timed_out;
+        phases.push(result);
+        if failed {
+            return finish_build(
+                validated,
+                config,
+                workspace_root,
+                build_id,
+                sender,
+                exit_code,
+                timed_out,
+                Some(BuildPhase::Setup),
+                phases,
+            );
+        }
+    }
+
+    let result = run_phase(
+        validated.task.execution(),
+        validated.task.timeout_sec,
+        BuildPhase::Run,
+        validated,
+        config,
+        run_as,
+        &cwd,
+        build_id,
+        request_id,
+        &env,
+        sender,
+        cancellation,
+        &output_bytes,
+        &output_exceeded,
+    )
+    .map_err(|err| err.with_phases(phases.clone()))?;
+    let failed_phase = (result.exit_code != 0 || result.timed_out).then_some(BuildPhase::Run);
+    let exit_code = result.exit_code;
+    let timed_out = result.timed_out;
+    phases.push(result);
+    finish_build(
+        validated,
+        config,
+        workspace_root,
+        build_id,
+        sender,
+        exit_code,
+        timed_out,
+        failed_phase,
+        phases,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_phase(
+    execution: TaskExecution<'_>,
+    timeout_sec: u64,
+    phase: BuildPhase,
+    validated: &ValidatedRequest,
+    config: &Config,
+    run_as: &RunAs,
+    cwd: &Path,
+    build_id: &str,
+    request_id: &str,
+    env: &[(String, String)],
+    sender: &Sender<ResponseEvent>,
+    cancellation: &CancellationFlag,
+    output_bytes: &Arc<AtomicU64>,
+    output_exceeded: &Arc<AtomicBool>,
+) -> Result<PhaseResult, BuildError> {
+    if cancellation.is_cancelled() {
+        return Err(BuildError::new("stream_closed", "client disconnected").in_phase(phase));
+    }
+    send_response(
+        sender,
+        ResponseEvent::Build {
+            id: build_id.to_string(),
+            status: "phase_started".to_string(),
+            phase: Some(phase),
+            duration_ms: None,
+            exit_code: None,
+            timed_out: None,
+        },
+    )
+    .map_err(|_| BuildError::new("stream_closed", "client disconnected").in_phase(phase))?;
+
+    let start = Instant::now();
+    let mut command = match execution {
         TaskExecution::Script(script) => {
             let mut command = Command::new(SCRIPT_SHELL);
             command.arg("-eu").arg("-c").arg(script);
@@ -215,7 +355,7 @@ fn run_build_in_workspace(
         }
     };
     command
-        .current_dir(&cwd)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -223,28 +363,28 @@ fn run_build_in_workspace(
     for (key, value) in env {
         command.env(key, value);
     }
-    configure_command(&mut command, run_as)?;
+    configure_command(&mut command, run_as).map_err(|err| err.in_phase(phase))?;
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| BuildError::new("spawn_failed", format!("failed to spawn task: {err}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| BuildError::new("io", "failed to capture stdout from task"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| BuildError::new("io", "failed to capture stderr from task"))?;
-    let output_bytes = Arc::new(AtomicU64::new(0));
-    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let mut child = command.spawn().map_err(|err| {
+        BuildError::new(
+            "spawn_failed",
+            format!("failed to spawn {} phase: {err}", phase.as_str()),
+        )
+        .in_phase(phase)
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        BuildError::new("io", "failed to capture stdout from task").in_phase(phase)
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        BuildError::new("io", "failed to capture stderr from task").in_phase(phase)
+    })?;
     let stdout_handle = spawn_output_thread(
         stdout,
         sender.clone(),
         StreamKind::Stdout,
         config.build.max_output_bytes,
-        Arc::clone(&output_bytes),
-        Arc::clone(&output_exceeded),
+        Arc::clone(output_bytes),
+        Arc::clone(output_exceeded),
         cancellation.clone(),
     );
     let stderr_handle = spawn_output_thread(
@@ -252,14 +392,13 @@ fn run_build_in_workspace(
         sender.clone(),
         StreamKind::Stderr,
         config.build.max_output_bytes,
-        Arc::clone(&output_bytes),
-        Arc::clone(&output_exceeded),
+        Arc::clone(output_bytes),
+        Arc::clone(output_exceeded),
         cancellation.clone(),
     );
 
-    let start = Instant::now();
-    let outcome = wait_with_timeout(&mut child, validated.task.timeout_sec, cancellation)
-        .map_err(|err| BuildError::new("wait_failed", err.to_string()))?;
+    let outcome = wait_with_timeout(&mut child, timeout_sec, cancellation)
+        .map_err(|err| BuildError::new("wait_failed", err.to_string()).in_phase(phase))?;
     join_output_thread(stdout_handle);
     join_output_thread(stderr_handle);
 
@@ -270,49 +409,93 @@ fn run_build_in_workspace(
                 "task output exceeds build.max_output_bytes ({} bytes)",
                 config.build.max_output_bytes
             ),
-        ));
+        )
+        .in_phase(phase));
     }
 
-    let (exit_code, timed_out) = match outcome {
-        WaitOutcome::Exited { code, timed_out } => (code, timed_out),
+    let (exit_code, timed_out, duration) = match outcome {
+        WaitOutcome::Exited {
+            code,
+            timed_out,
+            duration,
+        } => (code, timed_out, duration),
         WaitOutcome::Cancelled => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
             warn!(
-                "task cancelled build_id={} request_id={} duration_sec={} cwd={}",
+                "task phase cancelled build_id={} request_id={} phase={} duration_ms={} cwd={}",
                 build_id,
                 request_id,
-                start.elapsed().as_secs(),
+                phase.as_str(),
+                duration_ms,
                 cwd.display()
             );
-            return Err(BuildError::new("stream_closed", "client disconnected"));
+            return Err(BuildError::new("stream_closed", "client disconnected").in_phase(phase));
         }
     };
+    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
 
     if timed_out {
         warn!(
-            "task timed out build_id={} request_id={} duration_sec={} cwd={}",
+            "task phase timed out build_id={} request_id={} phase={} duration_ms={} cwd={}",
             build_id,
             request_id,
-            start.elapsed().as_secs(),
+            phase.as_str(),
+            duration_ms,
             cwd.display()
         );
     } else if exit_code == 0 {
         info!(
-            "task completed build_id={} task={} exit_code=0 duration_sec={}",
+            "task phase completed build_id={} task={} phase={} exit_code=0 duration_ms={}",
             build_id,
             validated.task_id,
-            start.elapsed().as_secs()
+            phase.as_str(),
+            duration_ms
         );
     } else {
         error!(
-            "task completed build_id={} task={} exit_code={} duration_sec={}",
+            "task phase completed build_id={} task={} phase={} exit_code={} duration_ms={}",
             build_id,
             validated.task_id,
+            phase.as_str(),
             exit_code,
-            start.elapsed().as_secs()
+            duration_ms
         );
     }
 
-    // The terminated task no longer owns the fresh workspace. Collect its
+    send_response(
+        sender,
+        ResponseEvent::Build {
+            id: build_id.to_string(),
+            status: "phase_finished".to_string(),
+            phase: Some(phase),
+            duration_ms: Some(duration_ms),
+            exit_code: Some(exit_code),
+            timed_out: Some(timed_out),
+        },
+    )
+    .map_err(|_| BuildError::new("stream_closed", "client disconnected").in_phase(phase))?;
+
+    Ok(PhaseResult {
+        phase,
+        duration_ms,
+        exit_code,
+        timed_out,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_build(
+    validated: &ValidatedRequest,
+    config: &Config,
+    workspace_root: &Path,
+    build_id: &str,
+    sender: &Sender<ResponseEvent>,
+    exit_code: i32,
+    timed_out: bool,
+    failed_phase: Option<BuildPhase>,
+    phases: Vec<PhaseResult>,
+) -> Result<(), BuildError> {
+    // The terminated phase no longer owns the fresh workspace. Collect the
     // configured outputs for success, ordinary failure, and timeout alike;
     // the exit event below always preserves the original task status.
     let artifacts = match collect_artifacts_zip(
@@ -330,6 +513,7 @@ fn run_build_in_workspace(
                     code: build_err.code.to_string(),
                     message: Some(build_err.message.clone()),
                     pattern: build_err.pattern.clone(),
+                    phase: None,
                 },
             )
             .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -344,6 +528,8 @@ fn run_build_in_workspace(
                     timed_out,
                     artifacts: None,
                     artifact_restrictions: None,
+                    failed_phase,
+                    phases,
                 },
             )
             .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -358,6 +544,8 @@ fn run_build_in_workspace(
             timed_out,
             artifacts: artifacts.archive,
             artifact_restrictions: artifacts.restrictions,
+            failed_phase,
+            phases,
         },
     )
     .map_err(|_| BuildError::new("stream_closed", "client disconnected"))?;
@@ -1079,7 +1267,11 @@ fn stream_output(
 }
 
 enum WaitOutcome {
-    Exited { code: i32, timed_out: bool },
+    Exited {
+        code: i32,
+        timed_out: bool,
+        duration: Duration,
+    },
     Cancelled,
 }
 
@@ -1098,11 +1290,13 @@ fn wait_with_timeout(
 
     loop {
         if let Some(status) = child.try_wait()? {
+            let duration = start.elapsed();
             let code = exit_code(status);
             terminate_remaining_group(child.id() as i32)?;
             return Ok(WaitOutcome::Exited {
                 code,
                 timed_out: false,
+                duration,
             });
         }
 
@@ -1118,10 +1312,12 @@ fn wait_with_timeout(
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    let duration = start.elapsed();
     let code = terminate_process(child, TerminationReason::Timeout)?;
     Ok(WaitOutcome::Exited {
         code,
         timed_out: true,
+        duration,
     })
 }
 
@@ -1279,7 +1475,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "6"
+schema_version = "7"
 tasks = {}
 [service.http]
 enabled = true
@@ -1688,8 +1884,9 @@ required = false
             outcome,
             WaitOutcome::Exited {
                 timed_out: true,
+                duration,
                 ..
-            }
+            } if duration < TIMEOUT_KILL_GRACE
         ));
         assert!(!process_group_exists(timeout_pgid).unwrap());
 

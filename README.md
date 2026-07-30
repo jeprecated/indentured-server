@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `6`; request protocol versions are separate. Schema 5 configurations fail closed and must explicitly migrate the version; existing absolute-executable/fixed-argument task bodies remain supported.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `7`; request protocol versions are separate. Schema 6 configurations fail closed and must explicitly migrate the version; existing one-phase task bodies remain supported after changing only their schema version.
 
 ```toml
-schema_version = "6"
+schema_version = "7"
 
 [service]
 max_concurrent_builds = 1
@@ -123,6 +123,10 @@ cwd = "."
 timeout_sec = 600
 workspace = "fresh"
 
+[tasks.build.setup]
+script = "printf 'preparing environment\\n'"
+timeout_sec = 300
+
 [tasks.build.environment]
 PATH = "/usr/bin:/bin"
 LANG = "C.UTF-8"
@@ -157,14 +161,17 @@ console = false
 Task validation occurs at daemon startup:
 
 - task names must match `[A-Za-z0-9_-]+` and are bounded to 64 bytes;
-- each task defines exactly one of a server-owned `script` or an absolute `executable`; executable mode retains optional fixed `args` compatibility;
+- each task defines exactly one server-owned run `script` or absolute run `executable`; executable mode retains optional fixed `args` compatibility;
+- a task may also define one optional server-owned `setup` command using the same script/executable shape;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
 - scripts run exactly as `/bin/sh -eu -c SCRIPT`; `/bin/sh` and configured executables must be accessible executable regular files;
 - script tasks require an explicit nonempty `PATH` whose colon-separated components are all absolute and nonempty;
 - `cwd` and artifact patterns must be relative and contain no parent traversal;
-- task timeouts must be nonzero and no larger than `build.max_timeout_sec`;
+- setup and run timeouts must be nonzero and their sum must not exceed `build.max_timeout_sec`;
 - arguments and environment entries must be NUL-free;
 - the only workspace policy is the required value `fresh`.
+
+Setup and run execute sequentially in the same fresh workspace, with the same `cwd`, task identity, and configured environment. Filesystem changes survive into run, but shell exports do not because each phase is a separate process. Setup's process group is terminated before run starts, so background helpers cannot cross the phase boundary. A setup failure or timeout skips run; the setup result remains the task result, and configured artifacts are still collected. The output-byte limit and disconnect cancellation cover both phases together.
 
 The task environment is fixed by configuration. The daemon clears its inherited environment, applies task values, and supplies `HOME`, `USER`, and `LOGNAME` from the configured execution identity only when the task does not set them. Configure `PATH` only with root-controlled or immutable Nix-store directories; validation proves only that components are absolute, not their ownership or immutability.
 
@@ -189,7 +196,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "6"
+schema_version = "7"
 
 [tasks.ci]
 script = '''
@@ -236,7 +243,7 @@ The CLI has no command arguments, remote cwd/environment/timeout/artifact flags,
 
 Connection precedence is CLI, `INDENTURED_SERVER_ENDPOINT`/`INDENTURED_SERVER_TOKEN_FILE`, then client config. Only credential **paths** are accepted (`--token-file`, the environment variable, or `connection.token_file`); raw-token CLI/environment/TOML surfaces are rejected. A configured credential must remain outside both submitted source and the entire configured result-root base, including canonical symlink aliases. `connection.enabled = false` or `INDENTURED_SERVER_ENABLED=false` returns exit code 222 without running a local command. When an unreachable endpoint has `local_fallback = true`, the client also returns 222; no wrapper shim is shipped.
 
-Every invocation creates a unique mode-0700 result directory under `$XDG_STATE_HOME/indentured/runs/<run-id>/` or `$HOME/.local/state/indentured/runs/<run-id>/`; an explicit `--result-root` must be absolute and must not overlap the submitted source in either direction. The resolved path is printed immediately. `stdout.log`, `stderr.log`, `source-manifest.json`, and atomically updated `provenance.json` are retained even on failure or interruption. Artifacts are collected and downloaded after successful, ordinary nonzero, and timed-out remote tasks into a private staging tree and atomically published only as `<run>/artifacts/`; they never overwrite source or run evidence. Failure keeps the task's exit code, while timeout keeps `timed_out: true` and the client exits 124. SIGINT is controlled from source preparation onward: active Jujutsu process groups are killed/reaped, temporary workspace cleanup is attempted for a bounded interval, or the live request stream is dropped so the server cancels the remote process group. Evidence records `interrupted` and the client exits 130.
+Every invocation creates a unique mode-0700 result directory under `$XDG_STATE_HOME/indentured/runs/<run-id>/` or `$HOME/.local/state/indentured/runs/<run-id>/`; an explicit `--result-root` must be absolute and must not overlap the submitted source in either direction. The resolved path is printed immediately. `stdout.log`, `stderr.log`, `source-manifest.json`, and atomically updated `provenance.json` are retained even on failure or interruption. Provenance schema 2 records setup/run durations, exit codes, timeout flags, and the failed phase when the server reports them. Artifacts are collected and downloaded after successful, ordinary nonzero, and timed-out remote tasks into a private staging tree and atomically published only as `<run>/artifacts/`; they never overwrite source or run evidence. Failure keeps the task's exit code, while timeout keeps `timed_out: true` and the client exits 124. SIGINT is controlled from source preparation onward: active Jujutsu process groups are killed/reaped, temporary workspace cleanup is attempted for a bounded interval, or the live request stream is dropped so the server cancels the remote process group. Evidence records `interrupted` and the client exits 130.
 
 ## Request protocol v1
 
@@ -262,14 +269,20 @@ Responses use `application/x-ndjson`:
 
 ```json
 {"type":"build","id":"bld_123","status":"started"}
+{"type":"build","id":"bld_123","status":"phase_started","phase":"setup"}
+{"type":"build","id":"bld_123","status":"phase_finished","phase":"setup","duration_ms":207341,"exit_code":0,"timed_out":false}
+{"type":"build","id":"bld_123","status":"phase_started","phase":"run"}
 {"type":"stdout","data":"compiling...\n"}
 {"type":"stderr","data":"warning...\n"}
-{"type":"exit","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":1234}}
+{"type":"build","id":"bld_123","status":"phase_finished","phase":"run","duration_ms":812345,"exit_code":0,"timed_out":false}
+{"type":"exit","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_123/artifacts.zip","size":1234},"phases":[{"phase":"setup","duration_ms":207341,"exit_code":0,"timed_out":false},{"phase":"run","duration_ms":812345,"exit_code":0,"timed_out":false}]}
 ```
+
+The CLI still performs one build request: setup and run share its workspace, admission permit, cancellation flag, and response stream. Phase metadata is additive to the existing `build`, `error`, and `exit` event types, so clients that ignore unknown fields retain wire compatibility. Tasks without `setup` emit only the run phase. The final `phases` list contains phases that produced process outcomes; process-level errors such as spawn, wait, or output-limit failures can set `failed_phase` without adding a matching completed phase result.
 
 Artifacts are available at `GET /v1/builds/{build_id}/artifacts.zip`. There are no client workspace endpoints in protocol v1.
 
-Disconnecting the response stream cancels the running process group. Timeout, disconnect, or combined stdout/stderr exceeding `build.max_output_bytes` sends SIGTERM to the configured process group, waits a bounded five-second grace, then sends SIGKILL if any group member remains. A configured timeout returns exit code 124 with `timed_out: true`; output exhaustion returns a stable `output_limit` error. Process groups are cleanup, not a sandbox: uploaded code may attempt `setsid` or exploit the host.
+Disconnecting the response stream cancels the active phase's process group. Setup and run have separate deadlines; a setup failure or timeout prevents run. Timeout, disconnect, or combined stdout/stderr exceeding `build.max_output_bytes` sends SIGTERM to the configured process group, waits a bounded five-second grace, then sends SIGKILL if any group member remains. A configured timeout makes the client exit 124 with `timed_out: true` and records the failed phase; output exhaustion returns a stable `output_limit` error. Process groups are cleanup, not a sandbox: uploaded code may attempt `setsid` or exploit the host.
 
 Source ZIPs are bounded during upload and extraction by a server-owned upload deadline, compressed bytes, declared/actual uncompressed bytes, file/symlink count, and path depth. The single `sources.upload_timeout_sec` deadline covers source-field and multipart-trailer consumption; timeout returns `408` with `source_upload_timeout`, removes the partial file, and releases admission. Traversal, non-ASCII/normalization ambiguity, duplicates, case collisions, file/directory collisions, unsafe symlinks, and special files are rejected before extraction. Safe relative symlinks are created only after complete archive preflight and may not escape the fresh workspace. Artifacts use the server task allowlist and global restrictions, reject symlinks and every explicit Unix special-file mode, and enforce transfer, uncompressed, file-count, and depth limits before or during archive creation. Client preflight accepts only explicit Unix regular-file/directory kinds; missing or zero mode-kind fields remain compatible with portable non-Unix ZIP producers and are interpreted from directory spelling.
 

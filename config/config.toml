@@ -1,4 +1,4 @@
-schema_version = "6"
+schema_version = "7"
 
 [service]
 # Immediate admission control; excess authenticated requests receive HTTP 503.
@@ -42,6 +42,11 @@ make -j4 all
 cwd = "."
 timeout_sec = 600
 workspace = "fresh"
+
+# Optional preparation command; filesystem changes remain for the run command.
+[tasks.build.setup]
+script = "printf 'preparing environment\\n'"
+timeout_sec = 300
 
 [tasks.build.environment]
 PATH = "/usr/bin:/bin"

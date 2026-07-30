@@ -66,7 +66,7 @@ fn render_server_config(root: &Path, port: u16) -> PathBuf {
     fs::write(
         &config,
         format!(
-            r#"schema_version = "6"
+            r#"schema_version = "7"
 [service]
 max_concurrent_builds = 1
 [service.socket]
@@ -88,6 +88,8 @@ max_timeout_sec = 15
 max_output_bytes = 1048576
 [tasks.package_probe]
 script = '''
+IFS= read -r prepared < .setup-complete
+test "$prepared" = prepared
 IFS= read -r input < input.txt
 printf '{stdout_marker}\n'
 printf '{stderr_marker}\n' >&2
@@ -99,6 +101,9 @@ exit 7
 cwd = "."
 timeout_sec = 10
 workspace = "fresh"
+[tasks.package_probe.setup]
+script = "printf 'prepared\\n' > .setup-complete"
+timeout_sec = 5
 [tasks.package_probe.environment]
 PATH = "/usr/bin:/bin"
 LANG = "C"
@@ -350,9 +355,15 @@ fn packaged_local_flow() {
         .any(|entry| entry["path"] == "input.txt"));
     let provenance: serde_json::Value =
         serde_json::from_slice(&fs::read(run.join("provenance.json")).unwrap()).unwrap();
+    assert_eq!(provenance["schema_version"], 2);
     assert_eq!(provenance["remote_exit_code"], 7);
     assert_eq!(provenance["timed_out"], false);
     assert_eq!(provenance["status"], "failed");
+    assert_eq!(provenance["failed_phase"], "run");
+    assert_eq!(provenance["phases"][0]["phase"], "setup");
+    assert_eq!(provenance["phases"][0]["exit_code"], 0);
+    assert_eq!(provenance["phases"][1]["phase"], "run");
+    assert_eq!(provenance["phases"][1]["exit_code"], 7);
     assert_eq!(
         fs::read_to_string(run.join("artifacts/out/result.txt")).unwrap(),
         "server-policy:uploaded-source\n"

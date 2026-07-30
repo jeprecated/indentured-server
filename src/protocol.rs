@@ -91,6 +91,30 @@ pub struct ArtifactArchive {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildPhase {
+    Setup,
+    Run,
+}
+
+impl BuildPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Run => "run",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseResult {
+    pub phase: BuildPhase,
+    pub duration_ms: u64,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRestrictions {
     pub omitted_count: usize,
@@ -103,6 +127,14 @@ pub enum ResponseEvent {
     Build {
         id: String,
         status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<BuildPhase>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timed_out: Option<bool>,
     },
     Stdout {
         data: String,
@@ -116,6 +148,8 @@ pub enum ResponseEvent {
         message: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<BuildPhase>,
     },
     Exit {
         code: i32,
@@ -124,6 +158,10 @@ pub enum ResponseEvent {
         artifacts: Option<ArtifactArchive>,
         #[serde(skip_serializing_if = "Option::is_none")]
         artifact_restrictions: Option<ArtifactRestrictions>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failed_phase: Option<BuildPhase>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phases: Vec<PhaseResult>,
     },
 }
 
@@ -226,5 +264,32 @@ mod tests {
         };
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(json, "{\"type\":\"stdout\",\"data\":\"hello\"}");
+    }
+
+    #[test]
+    fn phase_fields_are_additive_to_existing_response_events() {
+        let old_exit: ResponseEvent =
+            serde_json::from_str(r#"{"type":"exit","code":0,"timed_out":false}"#).unwrap();
+        assert!(matches!(
+            old_exit,
+            ResponseEvent::Exit {
+                failed_phase: None,
+                phases,
+                ..
+            } if phases.is_empty()
+        ));
+
+        let event = ResponseEvent::Build {
+            id: "bld_123".to_string(),
+            status: "phase_finished".to_string(),
+            phase: Some(BuildPhase::Setup),
+            duration_ms: Some(42),
+            exit_code: Some(0),
+            timed_out: Some(false),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "build");
+        assert_eq!(value["phase"], "setup");
+        assert_eq!(value["duration_ms"], 42);
     }
 }

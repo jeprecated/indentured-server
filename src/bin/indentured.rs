@@ -23,8 +23,8 @@ use indentured_server::client_source::{
     SourceIdentity, SourceManifest,
 };
 use indentured_server::protocol::{
-    ArtifactArchive, ArtifactRestrictions, Request, ResponseEvent, SourceFormat, SourceMetadata,
-    REQUEST_SCHEMA_VERSION,
+    ArtifactArchive, ArtifactRestrictions, BuildPhase, PhaseResult, Request, ResponseEvent,
+    SourceFormat, SourceMetadata, REQUEST_SCHEMA_VERSION,
 };
 use indentured_server::validation::validate_relative_pattern;
 
@@ -659,6 +659,8 @@ struct RunProvenance {
     remote_build_id: Option<String>,
     remote_exit_code: Option<i32>,
     timed_out: Option<bool>,
+    failed_phase: Option<BuildPhase>,
+    phases: Vec<PhaseResult>,
     artifact_restrictions: Option<ArtifactRestrictions>,
     errors: Vec<String>,
 }
@@ -691,7 +693,7 @@ impl RunEvidence {
                 .open(directory.join(name))?;
         }
         let provenance = RunProvenance {
-            schema_version: 1,
+            schema_version: 2,
             run_id,
             status: "preparing".to_string(),
             source: None,
@@ -702,6 +704,8 @@ impl RunEvidence {
             remote_build_id: None,
             remote_exit_code: None,
             timed_out: None,
+            failed_phase: None,
+            phases: Vec::new(),
             artifact_restrictions: None,
             errors: Vec::new(),
         };
@@ -754,11 +758,19 @@ impl RunEvidence {
     fn error(&mut self, message: impl Into<String>) -> io::Result<()> {
         if self.provenance.errors.len() < 32 {
             let mut message = message.into();
-            message.truncate(4096);
+            truncate_utf8(&mut message, 4096);
             self.provenance.errors.push(message);
         }
         self.write_provenance()
     }
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 fn now_string() -> String {
@@ -1165,6 +1177,8 @@ async fn run_command(
     evidence.provenance.remote_build_id = build.build_id.clone();
     evidence.provenance.remote_exit_code = Some(build.exit_code);
     evidence.provenance.timed_out = Some(build.timed_out);
+    evidence.provenance.failed_phase = build.failed_phase;
+    evidence.provenance.phases = build.phases.clone();
     evidence.provenance.artifact_restrictions = build.artifact_restrictions.clone();
     if let Some(restrictions) = &build.artifact_restrictions {
         let _ = write_artifact_restrictions_notice(restrictions);
@@ -1426,6 +1440,8 @@ struct BuildResult {
     timed_out: bool,
     artifacts: Option<ArtifactArchive>,
     artifact_restrictions: Option<ArtifactRestrictions>,
+    failed_phase: Option<BuildPhase>,
+    phases: Vec<PhaseResult>,
 }
 
 async fn run_build(
@@ -1548,15 +1564,48 @@ async fn read_responses(
                     eprintln!("{message}");
                 }
                 ResponseEvent::Error { .. } => {}
-                ResponseEvent::Build { id, .. } => {
+                ResponseEvent::Build {
+                    id,
+                    status,
+                    phase,
+                    duration_ms,
+                    exit_code,
+                    timed_out,
+                } => {
                     validate_build_id(&id).map_err(|err| BuildError::Other(err.to_string()))?;
                     build_id = Some(id);
+                    if let Some(phase) = phase {
+                        match status.as_str() {
+                            "phase_started" => {
+                                eprintln!("{OUTPUT_PREFIX} {} phase started", phase.as_str());
+                            }
+                            "phase_finished" => {
+                                if let (Some(duration_ms), Some(exit_code), Some(timed_out)) =
+                                    (duration_ms, exit_code, timed_out)
+                                {
+                                    eprintln!(
+                                        "{OUTPUT_PREFIX} {} phase finished in {:.3}s (exit_code={exit_code}, timed_out={timed_out})",
+                                        phase.as_str(),
+                                        duration_ms as f64 / 1000.0
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "{OUTPUT_PREFIX} {} phase finished without complete timing metadata",
+                                        phase.as_str()
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 ResponseEvent::Exit {
                     code,
                     timed_out,
                     artifacts,
                     artifact_restrictions,
+                    failed_phase,
+                    phases,
                 } => {
                     result = Some(BuildResult {
                         build_id: build_id.clone(),
@@ -1564,6 +1613,8 @@ async fn read_responses(
                         timed_out,
                         artifacts,
                         artifact_restrictions,
+                        failed_phase,
+                        phases,
                     });
                 }
             }
@@ -1978,6 +2029,15 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions as FileOptions;
     use zip::ZipWriter;
+
+    #[test]
+    fn provenance_error_truncation_preserves_utf8() {
+        let mut message = "a".repeat(4095);
+        message.push('é');
+        truncate_utf8(&mut message, 4096);
+        assert_eq!(message.len(), 4095);
+        assert!(message.is_char_boundary(message.len()));
+    }
 
     #[test]
     fn cli_accepts_only_task_request_identity_and_source_selection() {

@@ -11,7 +11,7 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "6";
+pub const CONFIG_SCHEMA_VERSION: &str = "7";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
 const DEFAULT_SOURCE_TRANSFER_BYTES: u64 = 134_217_728;
@@ -276,7 +276,11 @@ impl Config {
         let mut has_script_task = false;
         for (name, task) in &self.tasks {
             task.validate(name, self.build.max_timeout_sec)?;
-            has_script_task |= task.script.is_some();
+            has_script_task |= task.script.is_some()
+                || task
+                    .setup
+                    .as_ref()
+                    .is_some_and(|setup| setup.script.is_some());
         }
         if has_script_task {
             validate_executable_file(Path::new(SCRIPT_SHELL), "script shell")?;
@@ -557,11 +561,25 @@ pub struct TaskConfig {
     pub executable: Option<PathBuf>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub setup: Option<TaskSetupConfig>,
     pub cwd: String,
     pub timeout_sec: u64,
     pub environment: HashMap<String, String>,
     pub artifacts: ArtifactSpec,
     pub workspace: WorkspacePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSetupConfig {
+    #[serde(default)]
+    pub script: Option<ScriptText>,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_sec: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,16 +593,15 @@ pub(crate) enum TaskExecution<'a> {
     Executable { path: &'a Path, args: &'a [String] },
 }
 
+impl TaskSetupConfig {
+    pub(crate) fn execution(&self) -> TaskExecution<'_> {
+        execution(&self.script, &self.executable, &self.args)
+    }
+}
+
 impl TaskConfig {
     pub(crate) fn execution(&self) -> TaskExecution<'_> {
-        match (&self.script, &self.executable) {
-            (Some(script), None) if self.args.is_empty() => TaskExecution::Script(script.as_str()),
-            (None, Some(path)) => TaskExecution::Executable {
-                path,
-                args: &self.args,
-            },
-            _ => unreachable!("task execution shape must be validated at startup"),
-        }
+        execution(&self.script, &self.executable, &self.args)
     }
 
     fn validate(&self, name: &str, max_timeout_sec: u64) -> Result<(), ConfigError> {
@@ -593,41 +610,68 @@ impl TaskConfig {
                 "task name {name:?} must match [A-Za-z0-9_-]+ and be at most 64 bytes"
             )));
         }
-        match (&self.script, &self.executable) {
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::Invalid(format!(
-                    "tasks.{name} must define exactly one of script or executable"
-                )));
-            }
-            (None, None) => {
-                return Err(ConfigError::Invalid(format!(
-                    "tasks.{name} must define exactly one of script or executable"
-                )));
-            }
-            (Some(script), None) => {
-                if !self.args.is_empty() {
-                    return Err(ConfigError::Invalid(format!(
-                        "tasks.{name}.args must be empty when script is set"
-                    )));
-                }
-                validate_script(script, name, &self.environment)?;
-            }
-            (None, Some(executable)) => {
-                validate_executable_file(executable, &format!("tasks.{name}.executable"))?
-            }
-        }
+        validate_execution(
+            &self.script,
+            &self.executable,
+            &self.args,
+            &format!("tasks.{name}"),
+            &self.environment,
+        )?;
         validate_relative_path(&self.cwd, &format!("tasks.{name}.cwd"))
             .map_err(|err| ConfigError::Invalid(err.to_string()))?;
-        if self.timeout_sec == 0 || self.timeout_sec > max_timeout_sec {
+        if self.timeout_sec == 0 {
             return Err(ConfigError::Invalid(format!(
-                "tasks.{name}.timeout_sec must be between 1 and build.max_timeout_sec ({max_timeout_sec})"
+                "tasks.{name}.timeout_sec must be greater than zero"
             )));
+        }
+        let total_timeout = if let Some(setup) = &self.setup {
+            validate_execution(
+                &setup.script,
+                &setup.executable,
+                &setup.args,
+                &format!("tasks.{name}.setup"),
+                &self.environment,
+            )?;
+            if setup.timeout_sec == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "tasks.{name}.setup.timeout_sec must be greater than zero"
+                )));
+            }
+            setup
+                .timeout_sec
+                .checked_add(self.timeout_sec)
+                .ok_or_else(|| {
+                    ConfigError::Invalid(format!("tasks.{name} phase timeouts overflow"))
+                })?
+        } else {
+            self.timeout_sec
+        };
+        if total_timeout > max_timeout_sec {
+            let message = if self.setup.is_some() {
+                format!(
+                    "tasks.{name} setup and run timeouts must total no more than build.max_timeout_sec ({max_timeout_sec})"
+                )
+            } else {
+                format!(
+                    "tasks.{name}.timeout_sec must be between 1 and build.max_timeout_sec ({max_timeout_sec})"
+                )
+            };
+            return Err(ConfigError::Invalid(message));
         }
         for arg in &self.args {
             if arg.contains('\0') {
                 return Err(ConfigError::Invalid(format!(
                     "tasks.{name}.args must not contain NUL"
                 )));
+            }
+        }
+        if let Some(setup) = &self.setup {
+            for arg in &setup.args {
+                if arg.contains('\0') {
+                    return Err(ConfigError::Invalid(format!(
+                        "tasks.{name}.setup.args must not contain NUL"
+                    )));
+                }
             }
         }
         for (key, value) in &self.environment {
@@ -655,25 +699,66 @@ impl TaskConfig {
     }
 }
 
+fn execution<'a>(
+    script: &'a Option<ScriptText>,
+    executable: &'a Option<PathBuf>,
+    args: &'a [String],
+) -> TaskExecution<'a> {
+    match (script, executable) {
+        (Some(script), None) if args.is_empty() => TaskExecution::Script(script.as_str()),
+        (None, Some(path)) => TaskExecution::Executable { path, args },
+        _ => unreachable!("task execution shape must be validated at startup"),
+    }
+}
+
+fn validate_execution(
+    script: &Option<ScriptText>,
+    executable: &Option<PathBuf>,
+    args: &[String],
+    field: &str,
+    environment: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    match (script, executable) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(ConfigError::Invalid(format!(
+                "{field} must define exactly one of script or executable"
+            )));
+        }
+        (Some(script), None) => {
+            if !args.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "{field}.args must be empty when script is set"
+                )));
+            }
+            validate_script(script, field, environment)?;
+        }
+        (None, Some(executable)) => {
+            validate_executable_file(executable, &format!("{field}.executable"))?
+        }
+    }
+    Ok(())
+}
+
 fn validate_script(
     script: &ScriptText,
-    name: &str,
+    field: &str,
     environment: &HashMap<String, String>,
 ) -> Result<(), ConfigError> {
     let value = script.as_str();
     if value.is_empty() || value.len() > MAX_TASK_SCRIPT_BYTES || value.trim().is_empty() {
         return Err(ConfigError::Invalid(format!(
-            "tasks.{name}.script must contain 1 to {MAX_TASK_SCRIPT_BYTES} bytes of non-whitespace text"
+            "{field}.script must contain 1 to {MAX_TASK_SCRIPT_BYTES} bytes of non-whitespace text"
         )));
     }
     if value.contains('\0') {
         return Err(ConfigError::Invalid(format!(
-            "tasks.{name}.script must not contain NUL"
+            "{field}.script must not contain NUL"
         )));
     }
+    let environment_field = field.strip_suffix(".setup").unwrap_or(field);
     let path = environment.get("PATH").ok_or_else(|| {
         ConfigError::Invalid(format!(
-            "tasks.{name}.environment.PATH is required for script tasks"
+            "{environment_field}.environment.PATH is required for script tasks"
         ))
     })?;
     if path.is_empty()
@@ -682,7 +767,7 @@ fn validate_script(
             .any(|component| component.is_empty() || !Path::new(component).is_absolute())
     {
         return Err(ConfigError::Invalid(format!(
-            "tasks.{name}.environment.PATH must contain only nonempty absolute components"
+            "{environment_field}.environment.PATH must contain only nonempty absolute components"
         )));
     }
     Ok(())
@@ -980,6 +1065,7 @@ mod tests {
             script: None,
             executable: Some(executable),
             args: vec!["fixed".to_string()],
+            setup: None,
             cwd: ".".to_string(),
             timeout_sec: 30,
             environment: HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
@@ -1023,7 +1109,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "6"
+schema_version = "7"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1034,7 +1120,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "6"
+schema_version = "7"
 tasks = {}
 [service.http]
 enabled = true
@@ -1120,6 +1206,31 @@ tokens = ["secret"]
     }
 
     #[test]
+    fn setup_and_run_timeouts_share_the_server_maximum() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = valid_config(temp.path());
+        config.build.max_timeout_sec = 40;
+        config.tasks.get_mut("build").unwrap().setup = Some(TaskSetupConfig {
+            script: Some(ScriptText::new("printf setup")),
+            executable: None,
+            args: Vec::new(),
+            timeout_sec: 10,
+        });
+        config.validate().expect("10 + 30 fits the maximum");
+
+        config
+            .tasks
+            .get_mut("build")
+            .unwrap()
+            .setup
+            .as_mut()
+            .unwrap()
+            .timeout_sec = 11;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("must total no more"));
+    }
+
+    #[test]
     fn rejects_invalid_upload_deadlines_and_legacy_tls_ca_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         for value in [0, MAX_SOURCE_UPLOAD_TIMEOUT_SEC + 1] {
@@ -1133,7 +1244,7 @@ tokens = ["secret"]
         }
 
         let legacy = r#"
-schema_version = "6"
+schema_version = "7"
 tasks = {}
 [service.http]
 enabled = true
@@ -1170,6 +1281,7 @@ ca_path = "/etc/indentured-server/client-ca.pem"
             script: Some(ScriptText::new(value)),
             executable: None,
             args: Vec::new(),
+            setup: None,
             cwd: ".".to_string(),
             timeout_sec: 30,
             environment: HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
@@ -1179,10 +1291,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_six_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_seven_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "6"
+            r#"schema_version = "7"
 [service.http]
 enabled = true
 [build]
@@ -1200,6 +1312,9 @@ PATH = "/usr/bin:/bin"
 [tasks.script.artifacts]
 include = []
 exclude = []
+[tasks.script.setup]
+script = "printf setup"
+timeout_sec = 10
 [tasks.compat]
 executable = "{}"
 args = ["fixed"]
@@ -1221,6 +1336,10 @@ storage_root = "/tmp/artifacts"
             TaskExecution::Script(script) if script.contains("printf 'two")
         ));
         assert!(matches!(
+            config.tasks["script"].setup.as_ref().unwrap().execution(),
+            TaskExecution::Script("printf setup")
+        ));
+        assert!(matches!(
             config.tasks["compat"].execution(),
             TaskExecution::Executable { .. }
         ));
@@ -1230,7 +1349,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["5", "7"] {
+        for version in ["6", "8"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config
