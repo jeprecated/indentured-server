@@ -6,5 +6,6 @@ pub mod config;
 pub mod http;
 pub mod logging;
 pub mod protocol;
+mod sessions;
 pub mod user;
 pub mod validation;

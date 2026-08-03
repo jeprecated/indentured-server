@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -19,7 +22,9 @@ use uuid::Uuid;
 use crate::artifacts::{collect_artifacts_zip, ArtifactError};
 use crate::config::{Config, TaskConfig, TaskExecution, SCRIPT_SHELL};
 use crate::protocol::{
-    ArtifactArchive, BuildPhase, PhaseResult, Request, ResponseEvent, REQUEST_SCHEMA_VERSION,
+    ArtifactArchive, BuildPhase, PhaseResult, Request, ResponseEvent, SessionActionEvent,
+    SessionActionStatus, SessionActionStreamItem, SessionStartEvent, SessionStartStatus,
+    SessionTeardownResult, REQUEST_SCHEMA_VERSION,
 };
 use crate::user::{lookup_group_gid, lookup_user, lookup_user_by_name, UserInfo};
 use crate::validation::{validate_cwd, validate_relative_path, ValidationError};
@@ -34,17 +39,117 @@ const OUTPUT_CHUNK_SIZE: usize = 4096;
 const OUTPUT_FORWARD_GRACE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const OUTPUT_FORWARD_GRACE: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const BRIDGE_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Default)]
-pub struct CancellationFlag(Arc<AtomicBool>);
+pub struct CancellationFlag {
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    initialization_hook: Arc<Mutex<Option<InitializationCheckpointHook>>>,
+    #[cfg(test)]
+    force_post_spawn_setup_failure: Arc<AtomicBool>,
+    #[cfg(test)]
+    spawned_pid: Arc<AtomicU64>,
+    #[cfg(test)]
+    stdin_would_block: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitializationCheckpoint {
+    Extraction,
+    Ownership,
+    Setup,
+    Run,
+}
+
+#[cfg(test)]
+struct InitializationCheckpointHook {
+    checkpoint: InitializationCheckpoint,
+    arrived: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
 
 impl CancellationFlag {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn initialization_checkpoint(&self, checkpoint: InitializationCheckpoint) {
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut installed = self.initialization_hook.lock().unwrap();
+                if installed
+                    .as_ref()
+                    .is_some_and(|hook| hook.checkpoint == checkpoint)
+                {
+                    installed.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = hook {
+                hook.arrived.wait();
+                hook.release.wait();
+            }
+        }
+        #[cfg(not(test))]
+        let _ = checkpoint;
+    }
+
+    #[cfg(test)]
+    fn should_force_post_spawn_setup_failure(&self) -> bool {
+        self.force_post_spawn_setup_failure
+            .swap(false, Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_post_spawn_setup_failure(&self) {
+        self.force_post_spawn_setup_failure
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn record_spawned_pid(&self, pid: u32) {
+        self.spawned_pid.store(u64::from(pid), Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn spawned_pid(&self) -> Option<i32> {
+        i32::try_from(self.spawned_pid.load(Ordering::SeqCst))
+            .ok()
+            .filter(|pid| *pid != 0)
+    }
+
+    #[cfg(test)]
+    fn record_stdin_would_block(&self) {
+        self.stdin_would_block.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn stdin_would_block(&self) -> bool {
+        self.stdin_would_block.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_initialization_checkpoint_hook(
+        &self,
+        checkpoint: InitializationCheckpoint,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self.initialization_hook.lock().unwrap() = Some(InitializationCheckpointHook {
+            checkpoint,
+            arrived,
+            release,
+        });
     }
 }
 
@@ -226,19 +331,65 @@ fn run_build_in_workspace(
     sender: &Sender<ResponseEvent>,
     cancellation: &CancellationFlag,
 ) -> Result<(), BuildError> {
+    let outcome = run_task_phases(
+        validated,
+        config,
+        run_as,
+        workspace_root,
+        build_id,
+        sender,
+        cancellation,
+    )?;
+    finish_build(
+        validated,
+        config,
+        workspace_root,
+        build_id,
+        sender,
+        outcome.exit_code,
+        outcome.timed_out,
+        outcome.failed_phase,
+        outcome.phases,
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionInitializationOutcome {
+    pub phases: Vec<PhaseResult>,
+    pub exit_code: i32,
+    pub timed_out: bool,
+    pub failed_phase: Option<BuildPhase>,
+}
+
+struct TaskPhasesOutcome {
+    phases: Vec<PhaseResult>,
+    exit_code: i32,
+    timed_out: bool,
+    failed_phase: Option<BuildPhase>,
+}
+
+fn run_task_phases(
+    validated: &ValidatedRequest,
+    config: &Config,
+    run_as: &RunAs,
+    workspace_root: &Path,
+    build_id: &str,
+    sender: &Sender<ResponseEvent>,
+    cancellation: &CancellationFlag,
+) -> Result<TaskPhasesOutcome, BuildError> {
     let cwd = resolve_cwd(workspace_root, Some(&validated.task.cwd))?;
     let request_id = validated.request_id.as_deref().unwrap_or("-");
     info!(
         "build started build_id={} request_id={} task={}",
         build_id, request_id, validated.task_id
     );
-
     let env = build_env(&validated.task, &run_as.user);
     let output_bytes = Arc::new(AtomicU64::new(0));
     let output_exceeded = Arc::new(AtomicBool::new(false));
     let mut phases = Vec::with_capacity(2);
 
     if let Some(setup) = &validated.task.setup {
+        cancellation.initialization_checkpoint(InitializationCheckpoint::Setup);
         let result = run_phase(
             setup.execution(),
             setup.timeout_sec,
@@ -254,26 +405,23 @@ fn run_build_in_workspace(
             cancellation,
             &output_bytes,
             &output_exceeded,
+            None,
         )?;
         let failed = result.exit_code != 0 || result.timed_out;
         let exit_code = result.exit_code;
         let timed_out = result.timed_out;
         phases.push(result);
         if failed {
-            return finish_build(
-                validated,
-                config,
-                workspace_root,
-                build_id,
-                sender,
+            return Ok(TaskPhasesOutcome {
+                phases,
                 exit_code,
                 timed_out,
-                Some(BuildPhase::Setup),
-                phases,
-            );
+                failed_phase: Some(BuildPhase::Setup),
+            });
         }
     }
 
+    cancellation.initialization_checkpoint(InitializationCheckpoint::Run);
     let result = run_phase(
         validated.task.execution(),
         validated.task.timeout_sec,
@@ -289,23 +437,526 @@ fn run_build_in_workspace(
         cancellation,
         &output_bytes,
         &output_exceeded,
+        None,
     )
     .map_err(|err| err.with_phases(phases.clone()))?;
     let failed_phase = (result.exit_code != 0 || result.timed_out).then_some(BuildPhase::Run);
     let exit_code = result.exit_code;
     let timed_out = result.timed_out;
     phases.push(result);
-    finish_build(
-        validated,
-        config,
-        workspace_root,
-        build_id,
-        sender,
+    Ok(TaskPhasesOutcome {
+        phases,
         exit_code,
         timed_out,
         failed_phase,
-        phases,
-    )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn initialize_session(
+    validated: &ValidatedRequest,
+    config: &Config,
+    source_archive: &Path,
+    workspace: &Path,
+    session_id: &str,
+    sender: &Sender<SessionStartEvent>,
+    cancellation: &CancellationFlag,
+    deadline: Instant,
+) -> Result<SessionInitializationOutcome, BuildError> {
+    send_session_response(
+        sender,
+        SessionStartEvent::Session {
+            id: session_id.to_string(),
+            status: SessionStartStatus::Started,
+            phase: None,
+            duration_ms: None,
+            exit_code: None,
+            timed_out: None,
+        },
+        cancellation,
+    )?;
+    check_initialization_cancel(cancellation, deadline, false)?;
+    let run_as = resolve_run_as(config)?;
+    validate_run_as_uid(&run_as, unsafe { libc::geteuid() })?;
+    check_initialization_cancel(cancellation, deadline, false)?;
+    std::fs::create_dir(workspace).map_err(|err| {
+        BuildError::new(
+            "workspace_create_failed",
+            format!("failed to create fresh session workspace: {err}"),
+        )
+    })?;
+    cancellation.initialization_checkpoint(InitializationCheckpoint::Extraction);
+    check_initialization_cancel(cancellation, deadline, false)?;
+    extract_source_archive_cancellable(
+        source_archive,
+        workspace,
+        config.sources.max_uncompressed_bytes,
+        config.sources.max_files,
+        config.sources.max_depth,
+        cancellation,
+        deadline,
+    )?;
+    cancellation.initialization_checkpoint(InitializationCheckpoint::Ownership);
+    check_initialization_cancel(cancellation, deadline, false)?;
+    prepare_workspace_ownership_cancellable(workspace, &run_as, cancellation, deadline)?;
+    check_initialization_cancel(cancellation, deadline, false)?;
+
+    let (phase_sender, phase_receiver) = tokio::sync::mpsc::channel(128);
+    let bridge_stop = Arc::new(AtomicBool::new(false));
+    let bridge = spawn_session_event_bridge(
+        phase_receiver,
+        sender.clone(),
+        cancellation.clone(),
+        Arc::clone(&bridge_stop),
+    );
+    let outcome = run_task_phases(
+        validated,
+        config,
+        &run_as,
+        workspace,
+        session_id,
+        &phase_sender,
+        cancellation,
+    );
+    bridge_stop.store(true, Ordering::SeqCst);
+    drop(phase_sender);
+    join_bounded_thread(bridge, "session event bridge");
+    let outcome = outcome?;
+    Ok(SessionInitializationOutcome {
+        phases: outcome.phases,
+        exit_code: outcome.exit_code,
+        timed_out: outcome.timed_out,
+        failed_phase: outcome.failed_phase,
+    })
+}
+
+fn spawn_session_event_bridge(
+    mut receiver: tokio::sync::mpsc::Receiver<ResponseEvent>,
+    sender: Sender<SessionStartEvent>,
+    cancellation: CancellationFlag,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                let mapped = match event {
+                    ResponseEvent::Build {
+                        id,
+                        status,
+                        phase,
+                        duration_ms,
+                        exit_code,
+                        timed_out,
+                    } => {
+                        let status = match status.as_str() {
+                            "phase_started" => SessionStartStatus::PhaseStarted,
+                            "phase_finished" => SessionStartStatus::PhaseFinished,
+                            _ => continue,
+                        };
+                        SessionStartEvent::Session {
+                            id,
+                            status,
+                            phase,
+                            duration_ms,
+                            exit_code,
+                            timed_out,
+                        }
+                    }
+                    ResponseEvent::Stdout { data } => SessionStartEvent::Stdout { data },
+                    ResponseEvent::Stderr { data } => SessionStartEvent::Stderr { data },
+                    ResponseEvent::Error {
+                        code,
+                        message,
+                        phase,
+                        ..
+                    } => SessionStartEvent::Error {
+                        code,
+                        message,
+                        phase,
+                    },
+                    ResponseEvent::Exit { .. } => continue,
+                };
+                if send_session_response(&sender, mapped, &cancellation).is_err() {
+                    cancellation.cancel();
+                    return;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if stop.load(Ordering::SeqCst) || cancellation.is_cancelled() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+        }
+    })
+}
+
+fn drain_response_events(
+    mut receiver: tokio::sync::mpsc::Receiver<ResponseEvent>,
+    stop: &AtomicBool,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+fn join_bounded_thread(handle: thread::JoinHandle<()>, label: &str) {
+    let deadline = Instant::now() + BRIDGE_SHUTDOWN_GRACE;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        warn!("{label} did not stop within bounded shutdown grace; detaching it");
+    }
+}
+
+struct StdinWriter {
+    handle: thread::JoinHandle<()>,
+    result: std::sync::mpsc::Receiver<io::Result<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+fn spawn_stdin_writer(
+    mut stdin: std::process::ChildStdin,
+    input: Vec<u8>,
+    cancellation: CancellationFlag,
+) -> Result<StdinWriter, BuildError> {
+    #[cfg(test)]
+    if cancellation.should_force_post_spawn_setup_failure() {
+        return Err(BuildError::new(
+            "stdin_write_failed",
+            "forced post-spawn stdin setup failure",
+        ));
+    }
+    let fd = stdin.as_raw_fd();
+    #[cfg(all(test, target_os = "linux"))]
+    unsafe {
+        libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096);
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(BuildError::new(
+            "stdin_write_failed",
+            format!(
+                "failed to make task stdin nonblocking: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let (result_sender, result) = std::sync::mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut written = 0usize;
+        let outcome = loop {
+            if thread_stop.load(Ordering::SeqCst) || cancellation.is_cancelled() {
+                break Ok(());
+            }
+            match stdin.write(&input[written..]) {
+                Ok(0) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "task stdin closed",
+                    ))
+                }
+                Ok(bytes) => {
+                    written += bytes;
+                    if written == input.len() {
+                        break Ok(());
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => break Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    #[cfg(test)]
+                    cancellation.record_stdin_would_block();
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        let _ = result_sender.send(outcome);
+    });
+    Ok(StdinWriter {
+        handle,
+        result,
+        stop,
+    })
+}
+
+fn finish_stdin_writer(writer: StdinWriter) -> io::Result<()> {
+    writer.stop.store(true, Ordering::SeqCst);
+    let result = writer
+        .result
+        .recv_timeout(OUTPUT_FORWARD_GRACE)
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stdin writer did not stop",
+            ))
+        });
+    join_bounded_thread(writer.handle, "task stdin writer");
+    result
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionActionRunOutcome {
+    pub code: i32,
+    pub timed_out: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_session_action(
+    task_id: &str,
+    task: &TaskConfig,
+    config: &Config,
+    workspace: &Path,
+    session_id: &str,
+    action_id: &str,
+    action_name: &str,
+    input: &[u8],
+    sender: &Sender<SessionActionStreamItem>,
+    cancellation: &CancellationFlag,
+) -> Result<SessionActionRunOutcome, BuildError> {
+    let action = task
+        .session
+        .as_ref()
+        .and_then(|session| session.actions.get(action_name))
+        .ok_or_else(|| BuildError::new("unknown_action", "configured session action missing"))?;
+    send_action_response(
+        sender,
+        SessionActionEvent::Action {
+            session_id: session_id.to_string(),
+            action_id: action_id.to_string(),
+            action: action_name.to_string(),
+            status: SessionActionStatus::Started,
+        },
+        cancellation,
+    )?;
+    let run_as = resolve_run_as(config)?;
+    validate_run_as_uid(&run_as, unsafe { libc::geteuid() })?;
+    let cwd = resolve_cwd(workspace, Some(&task.cwd))?;
+    let env = build_env(task, &run_as.user);
+    let validated = ValidatedRequest {
+        request_id: None,
+        task_id: task_id.to_string(),
+        task: task.clone(),
+    };
+    let output_bytes = Arc::new(AtomicU64::new(0));
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let (phase_sender, phase_receiver) = tokio::sync::mpsc::channel(128);
+    let bridge_stop = Arc::new(AtomicBool::new(false));
+    let bridge = spawn_action_event_bridge(
+        phase_receiver,
+        sender.clone(),
+        cancellation.clone(),
+        Arc::clone(&bridge_stop),
+    );
+    let result = run_phase(
+        action.execution(),
+        action.timeout_sec,
+        BuildPhase::Run,
+        &validated,
+        config,
+        &run_as,
+        &cwd,
+        action_id,
+        "-",
+        &env,
+        &phase_sender,
+        cancellation,
+        &output_bytes,
+        &output_exceeded,
+        Some(input),
+    );
+    bridge_stop.store(true, Ordering::SeqCst);
+    drop(phase_sender);
+    join_bounded_thread(bridge, "session action event bridge");
+    let result = result?;
+    Ok(SessionActionRunOutcome {
+        code: result.exit_code,
+        timed_out: result.timed_out,
+    })
+}
+
+fn spawn_action_event_bridge(
+    mut receiver: tokio::sync::mpsc::Receiver<ResponseEvent>,
+    sender: Sender<SessionActionStreamItem>,
+    cancellation: CancellationFlag,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        match receiver.try_recv() {
+            Ok(ResponseEvent::Stdout { data }) => {
+                if send_action_response(&sender, SessionActionEvent::Stdout { data }, &cancellation)
+                    .is_err()
+                {
+                    cancellation.cancel();
+                    return;
+                }
+            }
+            Ok(ResponseEvent::Stderr { data }) => {
+                if send_action_response(&sender, SessionActionEvent::Stderr { data }, &cancellation)
+                    .is_err()
+                {
+                    cancellation.cancel();
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if stop.load(Ordering::SeqCst) || cancellation.is_cancelled() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+        }
+    })
+}
+
+pub(crate) fn send_action_response(
+    sender: &Sender<SessionActionStreamItem>,
+    event: SessionActionEvent,
+    cancellation: &CancellationFlag,
+) -> Result<(), BuildError> {
+    let deadline = Instant::now() + OUTPUT_FORWARD_GRACE;
+    let mut pending = SessionActionStreamItem {
+        event,
+        final_ack: None,
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(BuildError::new("stream_closed", "session action cancelled"));
+        }
+        match sender.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Closed(_)) => {
+                cancellation.cancel();
+                return Err(BuildError::new("stream_closed", "client disconnected"));
+            }
+            Err(TrySendError::Full(event)) => {
+                pending = event;
+                if Instant::now() >= deadline {
+                    cancellation.cancel();
+                    return Err(BuildError::new(
+                        "stream_closed",
+                        "client is not reading output",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+pub(crate) fn run_session_teardown(
+    task_id: &str,
+    task: &TaskConfig,
+    config: &Config,
+    workspace: &Path,
+    session_id: &str,
+) -> SessionTeardownResult {
+    let started = Instant::now();
+    let result = (|| -> Result<PhaseResult, BuildError> {
+        let session = task.session.as_ref().ok_or_else(|| {
+            BuildError::new("session_config_missing", "session configuration missing")
+        })?;
+        let run_as = resolve_run_as(config)?;
+        validate_run_as_uid(&run_as, unsafe { libc::geteuid() })?;
+        let cwd = resolve_cwd(workspace, Some(&task.cwd))?;
+        let env = build_env(task, &run_as.user);
+        let validated = ValidatedRequest {
+            request_id: None,
+            task_id: task_id.to_string(),
+            task: task.clone(),
+        };
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        let output_exceeded = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationFlag::default();
+        let (sender, receiver) = tokio::sync::mpsc::channel(128);
+        let drain_stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&drain_stop);
+        let drain = thread::spawn(move || drain_response_events(receiver, &thread_stop));
+        let result = run_phase(
+            session.teardown.execution(),
+            session.teardown.timeout_sec,
+            BuildPhase::Run,
+            &validated,
+            config,
+            &run_as,
+            &cwd,
+            session_id,
+            "-",
+            &env,
+            &sender,
+            &cancellation,
+            &output_bytes,
+            &output_exceeded,
+            None,
+        );
+        drain_stop.store(true, Ordering::SeqCst);
+        drop(sender);
+        join_bounded_thread(drain, "teardown event drain");
+        result
+    })();
+    match result {
+        Ok(result) => SessionTeardownResult {
+            duration_ms: result.duration_ms,
+            exit_code: Some(result.exit_code),
+            timed_out: result.timed_out,
+            error_code: None,
+        },
+        Err(err) => SessionTeardownResult {
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            exit_code: None,
+            timed_out: false,
+            error_code: Some(err.code.to_string()),
+        },
+    }
+}
+
+fn send_session_response(
+    sender: &Sender<SessionStartEvent>,
+    event: SessionStartEvent,
+    cancellation: &CancellationFlag,
+) -> Result<(), BuildError> {
+    let deadline = Instant::now() + OUTPUT_FORWARD_GRACE;
+    let mut pending = event;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(BuildError::new("stream_closed", "client disconnected"));
+        }
+        match sender.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Closed(_)) => {
+                cancellation.cancel();
+                return Err(BuildError::new("stream_closed", "client disconnected"));
+            }
+            Err(TrySendError::Full(event)) => {
+                pending = event;
+                if Instant::now() >= deadline {
+                    cancellation.cancel();
+                    return Err(BuildError::new(
+                        "stream_closed",
+                        "client is not reading output",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,6 +975,7 @@ fn run_phase(
     cancellation: &CancellationFlag,
     output_bytes: &Arc<AtomicU64>,
     output_exceeded: &Arc<AtomicBool>,
+    stdin: Option<&[u8]>,
 ) -> Result<PhaseResult, BuildError> {
     if cancellation.is_cancelled() {
         return Err(BuildError::new("stream_closed", "client disconnected").in_phase(phase));
@@ -356,7 +1008,11 @@ fn run_phase(
     };
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
@@ -372,12 +1028,38 @@ fn run_phase(
         )
         .in_phase(phase)
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        BuildError::new("io", "failed to capture stdout from task").in_phase(phase)
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        BuildError::new("io", "failed to capture stderr from task").in_phase(phase)
-    })?;
+    #[cfg(test)]
+    cancellation.record_spawned_pid(child.id());
+    let io_setup = (|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            BuildError::new("io", "failed to capture stdout from task").in_phase(phase)
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            BuildError::new("io", "failed to capture stderr from task").in_phase(phase)
+        })?;
+        let stdin_writer = match stdin {
+            Some(input) => {
+                let child_stdin = child.stdin.take().ok_or_else(|| {
+                    BuildError::new("io", "failed to open task stdin").in_phase(phase)
+                })?;
+                Some(
+                    spawn_stdin_writer(child_stdin, input.to_vec(), cancellation.clone())
+                        .map_err(|err| err.in_phase(phase))?,
+                )
+            }
+            None => None,
+        };
+        Ok::<_, BuildError>((stdin_writer, stdout, stderr))
+    })();
+    let (stdin_writer, stdout, stderr) = match io_setup {
+        Ok(io) => io,
+        Err(mut err) => {
+            if let Err(cleanup) = terminate_process(&mut child, TerminationReason::Cancelled) {
+                err.message = format!("{}; process cleanup failed: {cleanup}", err.message);
+            }
+            return Err(err);
+        }
+    };
     let stdout_handle = spawn_output_thread(
         stdout,
         sender.clone(),
@@ -401,6 +1083,15 @@ fn run_phase(
         .map_err(|err| BuildError::new("wait_failed", err.to_string()).in_phase(phase))?;
     join_output_thread(stdout_handle);
     join_output_thread(stderr_handle);
+    if let Some(writer) = stdin_writer {
+        finish_stdin_writer(writer).map_err(|err| {
+            BuildError::new(
+                "stdin_write_failed",
+                format!("failed to write task stdin: {err}"),
+            )
+            .in_phase(phase)
+        })?;
+    }
 
     if output_exceeded.load(Ordering::SeqCst) {
         return Err(BuildError::new(
@@ -580,11 +1271,61 @@ fn map_artifact_error(err: ArtifactError) -> BuildError {
     }
 }
 
+fn check_initialization_cancel(
+    cancellation: &CancellationFlag,
+    deadline: Instant,
+    filesystem_checkpoint: bool,
+) -> Result<(), BuildError> {
+    let _ = filesystem_checkpoint;
+    if cancellation.is_cancelled() {
+        return Err(BuildError::new(
+            "stream_closed",
+            "session initialization was cancelled",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(BuildError::new(
+            "session_lifetime",
+            "session maximum lifetime expired during initialization",
+        ));
+    }
+    Ok(())
+}
+
+fn check_optional_initialization_cancel(
+    guard: Option<(&CancellationFlag, Instant)>,
+    filesystem_checkpoint: bool,
+) -> Result<(), BuildError> {
+    if let Some((cancellation, deadline)) = guard {
+        check_initialization_cancel(cancellation, deadline, filesystem_checkpoint)?;
+    }
+    Ok(())
+}
+
 fn prepare_workspace_ownership(workspace: &Path, run_as: &RunAs) -> Result<(), BuildError> {
+    prepare_workspace_ownership_inner(workspace, run_as, None)
+}
+
+fn prepare_workspace_ownership_cancellable(
+    workspace: &Path,
+    run_as: &RunAs,
+    cancellation: &CancellationFlag,
+    deadline: Instant,
+) -> Result<(), BuildError> {
+    prepare_workspace_ownership_inner(workspace, run_as, Some((cancellation, deadline)))
+}
+
+fn prepare_workspace_ownership_inner(
+    workspace: &Path,
+    run_as: &RunAs,
+    guard: Option<(&CancellationFlag, Instant)>,
+) -> Result<(), BuildError> {
+    check_optional_initialization_cancel(guard, false)?;
     if !run_as.set_ids {
         return Ok(());
     }
     for entry in walkdir::WalkDir::new(workspace).follow_links(false) {
+        check_optional_initialization_cancel(guard, true)?;
         let entry = entry.map_err(|err| {
             BuildError::new(
                 "workspace_ownership",
@@ -620,9 +1361,54 @@ fn extract_source_archive(
     max_files: usize,
     max_depth: usize,
 ) -> Result<(), BuildError> {
+    extract_source_archive_inner(
+        source_archive,
+        dest,
+        max_uncompressed_bytes,
+        max_files,
+        max_depth,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_source_archive_cancellable(
+    source_archive: &Path,
+    dest: &Path,
+    max_uncompressed_bytes: u64,
+    max_files: usize,
+    max_depth: usize,
+    cancellation: &CancellationFlag,
+    deadline: Instant,
+) -> Result<(), BuildError> {
+    extract_source_archive_inner(
+        source_archive,
+        dest,
+        max_uncompressed_bytes,
+        max_files,
+        max_depth,
+        Some((cancellation, deadline)),
+    )
+}
+
+fn extract_source_archive_inner(
+    source_archive: &Path,
+    dest: &Path,
+    max_uncompressed_bytes: u64,
+    max_files: usize,
+    max_depth: usize,
+    guard: Option<(&CancellationFlag, Instant)>,
+) -> Result<(), BuildError> {
     use std::os::unix::fs::PermissionsExt;
 
-    preflight_source_archive(source_archive, max_uncompressed_bytes, max_files, max_depth)?;
+    check_optional_initialization_cancel(guard, false)?;
+    preflight_source_archive(
+        source_archive,
+        max_uncompressed_bytes,
+        max_files,
+        max_depth,
+        guard,
+    )?;
     let file = std::fs::File::open(source_archive).map_err(|err| {
         BuildError::new(
             "source_archive",
@@ -639,6 +1425,7 @@ fn extract_source_archive(
     let mut buffer = vec![0u8; 8192];
 
     for index in 0..archive.len() {
+        check_optional_initialization_cancel(guard, true)?;
         let mut entry = archive.by_index(index).map_err(|err| {
             BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
         })?;
@@ -692,6 +1479,7 @@ fn extract_source_archive(
                 BuildError::new("source_archive", format!("create file failed: {err}"))
             })?;
         loop {
+            check_optional_initialization_cancel(guard, true)?;
             let bytes = entry.read(&mut buffer).map_err(|err| {
                 BuildError::new("source_archive", format!("read zip entry failed: {err}"))
             })?;
@@ -724,6 +1512,7 @@ fn preflight_source_archive(
     max_uncompressed_bytes: u64,
     max_files: usize,
     max_depth: usize,
+    guard: Option<(&CancellationFlag, Instant)>,
 ) -> Result<(), BuildError> {
     let file = std::fs::File::open(source_archive).map_err(|err| {
         BuildError::new(
@@ -747,6 +1536,7 @@ fn preflight_source_archive(
     let mut entry_count = 0usize;
 
     for index in 0..archive.len() {
+        check_optional_initialization_cancel(guard, true)?;
         let entry = archive.by_index(index).map_err(|err| {
             BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
         })?;
@@ -1475,7 +2265,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "7"
+schema_version = "8"
 tasks = {}
 [service.http]
 enabled = true
@@ -1669,6 +2459,193 @@ required = false
         assert!(exceeded.load(Ordering::SeqCst));
         assert!(cancellation.is_cancelled());
         assert_eq!(bytes.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn forced_post_spawn_stdin_setup_failure_reaps_the_action_process_group() {
+        use crate::config::{
+            ArtifactSpec, ArtifactsConfig, BuildConfig, LoggingConfig, ServiceConfig,
+            SessionActionConfig, SessionTeardownConfig, SourcesConfig, TaskSessionConfig,
+            WorkspacePolicy, CONFIG_SCHEMA_VERSION,
+        };
+        use std::collections::HashMap;
+
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("action.sh");
+        std::fs::write(&script, "#!/bin/sh\ntrap '' TERM\nwhile :; do :; done\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let action = SessionActionConfig {
+            script: None,
+            executable: Some(script.clone()),
+            args: vec![],
+            timeout_sec: 30,
+            artifacts: ArtifactSpec::default(),
+        };
+        let task = TaskConfig {
+            script: None,
+            executable: Some(script.clone()),
+            args: vec![],
+            setup: None,
+            session: Some(TaskSessionConfig {
+                idle_timeout_sec: 1,
+                max_lifetime_sec: 60,
+                teardown: SessionTeardownConfig {
+                    script: None,
+                    executable: Some(script.clone()),
+                    args: vec![],
+                    timeout_sec: 1,
+                },
+                actions: HashMap::from([("forced".to_string(), action)]),
+            }),
+            cwd: ".".to_string(),
+            timeout_sec: 30,
+            environment: HashMap::new(),
+            artifacts: ArtifactSpec::default(),
+            workspace: WorkspacePolicy::Fresh,
+        };
+        let config = Config {
+            schema_version: CONFIG_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig {
+                workspace_root: temp.path().join("workspaces"),
+                max_timeout_sec: 60,
+                max_output_bytes: 1024,
+                run_as_user: None,
+                run_as_group: None,
+            },
+            tasks: HashMap::from([("managed".to_string(), task.clone())]),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig {
+                storage_root: temp.path().join("artifacts"),
+                ..ArtifactsConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+        let cancellation = CancellationFlag::default();
+        cancellation.force_post_spawn_setup_failure();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let error = run_session_action(
+            "managed",
+            &task,
+            &config,
+            temp.path(),
+            "ses_forced",
+            "act_forced",
+            "forced",
+            br#"{}"#,
+            &sender,
+            &cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "stdin_write_failed");
+        let pid = cancellation.spawned_pid().expect("spawned action pid");
+        assert!(!process_group_exists(pid).unwrap());
+
+        let mut blocking_task = task;
+        blocking_task
+            .session
+            .as_mut()
+            .unwrap()
+            .actions
+            .get_mut("forced")
+            .unwrap()
+            .timeout_sec = 1;
+        let cancellation = CancellationFlag::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let outcome = run_session_action(
+            "managed",
+            &blocking_task,
+            &config,
+            temp.path(),
+            "ses_blocked_stdin",
+            "act_blocked_stdin",
+            "forced",
+            &vec![b'x'; crate::protocol::MAX_SESSION_ACTION_BODY_BYTES],
+            &sender,
+            &cancellation,
+        )
+        .unwrap();
+        assert!(outcome.timed_out, "unexpected action outcome: {outcome:?}");
+        assert!(cancellation.stdin_would_block());
+        assert!(!process_group_exists(cancellation.spawned_pid().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn held_pipe_sender_clone_cannot_block_cancelled_session_bridge() {
+        let (held_reader, held_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (phase_sender, phase_receiver) = tokio::sync::mpsc::channel(1);
+        let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = CancellationFlag::default();
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        let output_exceeded = Arc::new(AtomicBool::new(false));
+        let reader = spawn_output_thread(
+            held_reader,
+            phase_sender.clone(),
+            StreamKind::Stdout,
+            1024,
+            output_bytes,
+            output_exceeded,
+            cancellation.clone(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = spawn_session_event_bridge(
+            phase_receiver,
+            event_sender,
+            cancellation.clone(),
+            Arc::clone(&stop),
+        );
+
+        // Model a descendant outside the killed process group retaining the
+        // write end. The reader cannot observe cancellation until that fd closes.
+        cancellation.cancel();
+        join_output_thread(reader);
+        stop.store(true, Ordering::SeqCst);
+        drop(phase_sender);
+        let deadline = Instant::now() + BRIDGE_SHUTDOWN_GRACE;
+        while !bridge.is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            bridge.is_finished(),
+            "held descendant pipe retained the session bridge"
+        );
+        bridge.join().unwrap();
+        drop(held_writer);
+    }
+
+    #[test]
+    fn held_pipe_sender_clone_cannot_block_bounded_teardown_drain() {
+        let (held_reader, held_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (phase_sender, phase_receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = CancellationFlag::default();
+        let reader = spawn_output_thread(
+            held_reader,
+            phase_sender.clone(),
+            StreamKind::Stdout,
+            1024,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            cancellation,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let drain = thread::spawn(move || drain_response_events(phase_receiver, &thread_stop));
+
+        // This models teardown's phase reader being unable to reach EOF because
+        // a descendant retained the write end after its parent exited.
+        join_output_thread(reader);
+        stop.store(true, Ordering::SeqCst);
+        drop(phase_sender);
+        let deadline = Instant::now() + BRIDGE_SHUTDOWN_GRACE;
+        while !drain.is_finished() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            drain.is_finished(),
+            "held descendant pipe retained the teardown drain"
+        );
+        drain.join().unwrap();
+        drop(held_writer);
     }
 
     #[test]

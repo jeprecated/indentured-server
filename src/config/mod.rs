@@ -11,8 +11,9 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "7";
+pub const CONFIG_SCHEMA_VERSION: &str = "8";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
+pub(crate) const MAX_SESSION_LIFETIME_SEC: u64 = u32::MAX as u64;
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
 const DEFAULT_SOURCE_TRANSFER_BYTES: u64 = 134_217_728;
 const DEFAULT_SOURCE_UNCOMPRESSED_BYTES: u64 = DEFAULT_SOURCE_TRANSFER_BYTES * 10;
@@ -276,11 +277,7 @@ impl Config {
         let mut has_script_task = false;
         for (name, task) in &self.tasks {
             task.validate(name, self.build.max_timeout_sec)?;
-            has_script_task |= task.script.is_some()
-                || task
-                    .setup
-                    .as_ref()
-                    .is_some_and(|setup| setup.script.is_some());
+            has_script_task |= task.uses_script();
         }
         if has_script_task {
             validate_executable_file(Path::new(SCRIPT_SHELL), "script shell")?;
@@ -563,6 +560,8 @@ pub struct TaskConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub setup: Option<TaskSetupConfig>,
+    #[serde(default)]
+    pub session: Option<TaskSessionConfig>,
     pub cwd: String,
     pub timeout_sec: u64,
     pub environment: HashMap<String, String>,
@@ -582,6 +581,41 @@ pub struct TaskSetupConfig {
     pub timeout_sec: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSessionConfig {
+    pub idle_timeout_sec: u64,
+    pub max_lifetime_sec: u64,
+    pub teardown: SessionTeardownConfig,
+    pub actions: HashMap<String, SessionActionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTeardownConfig {
+    #[serde(default)]
+    pub script: Option<ScriptText>,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionActionConfig {
+    #[serde(default)]
+    pub script: Option<ScriptText>,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_sec: u64,
+    #[serde(default)]
+    pub artifacts: ArtifactSpec,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspacePolicy {
@@ -599,9 +633,36 @@ impl TaskSetupConfig {
     }
 }
 
+impl SessionTeardownConfig {
+    pub(crate) fn execution(&self) -> TaskExecution<'_> {
+        execution(&self.script, &self.executable, &self.args)
+    }
+}
+
+impl SessionActionConfig {
+    pub(crate) fn execution(&self) -> TaskExecution<'_> {
+        execution(&self.script, &self.executable, &self.args)
+    }
+}
+
 impl TaskConfig {
     pub(crate) fn execution(&self) -> TaskExecution<'_> {
         execution(&self.script, &self.executable, &self.args)
+    }
+
+    fn uses_script(&self) -> bool {
+        self.script.is_some()
+            || self
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.script.is_some())
+            || self.session.as_ref().is_some_and(|session| {
+                session.teardown.script.is_some()
+                    || session
+                        .actions
+                        .values()
+                        .any(|action| action.script.is_some())
+            })
     }
 
     fn validate(&self, name: &str, max_timeout_sec: u64) -> Result<(), ConfigError> {
@@ -617,6 +678,7 @@ impl TaskConfig {
             &format!("tasks.{name}"),
             &self.environment,
         )?;
+        validate_args(&self.args, &format!("tasks.{name}.args"))?;
         validate_relative_path(&self.cwd, &format!("tasks.{name}.cwd"))
             .map_err(|err| ConfigError::Invalid(err.to_string()))?;
         if self.timeout_sec == 0 {
@@ -632,6 +694,7 @@ impl TaskConfig {
                 &format!("tasks.{name}.setup"),
                 &self.environment,
             )?;
+            validate_args(&setup.args, &format!("tasks.{name}.setup.args"))?;
             if setup.timeout_sec == 0 {
                 return Err(ConfigError::Invalid(format!(
                     "tasks.{name}.setup.timeout_sec must be greater than zero"
@@ -658,21 +721,8 @@ impl TaskConfig {
             };
             return Err(ConfigError::Invalid(message));
         }
-        for arg in &self.args {
-            if arg.contains('\0') {
-                return Err(ConfigError::Invalid(format!(
-                    "tasks.{name}.args must not contain NUL"
-                )));
-            }
-        }
-        if let Some(setup) = &self.setup {
-            for arg in &setup.args {
-                if arg.contains('\0') {
-                    return Err(ConfigError::Invalid(format!(
-                        "tasks.{name}.setup.args must not contain NUL"
-                    )));
-                }
-            }
+        if let Some(session) = &self.session {
+            session.validate(name, &self.environment, max_timeout_sec)?;
         }
         for (key, value) in &self.environment {
             if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
@@ -681,19 +731,72 @@ impl TaskConfig {
                 )));
             }
         }
-        for (field, patterns) in [
-            ("include", &self.artifacts.include),
-            ("exclude", &self.artifacts.exclude),
-        ] {
-            for pattern in patterns {
-                validate_relative_pattern(pattern, &format!("tasks.{name}.artifacts.{field}"))
-                    .map_err(|err| ConfigError::Invalid(err.to_string()))?;
-                glob::Pattern::new(pattern).map_err(|err| {
-                    ConfigError::Invalid(format!(
-                        "invalid glob in tasks.{name}.artifacts.{field} {pattern:?}: {err}"
-                    ))
-                })?;
+        validate_artifact_spec(&self.artifacts, &format!("tasks.{name}.artifacts"))?;
+        Ok(())
+    }
+}
+
+impl TaskSessionConfig {
+    fn validate(
+        &self,
+        task_name: &str,
+        environment: &HashMap<String, String>,
+        max_timeout_sec: u64,
+    ) -> Result<(), ConfigError> {
+        let field = format!("tasks.{task_name}.session");
+        if self.idle_timeout_sec == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.idle_timeout_sec must be greater than zero"
+            )));
+        }
+        if self.max_lifetime_sec == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.max_lifetime_sec must be greater than zero"
+            )));
+        }
+        if self.max_lifetime_sec > MAX_SESSION_LIFETIME_SEC {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.max_lifetime_sec must be no greater than {MAX_SESSION_LIFETIME_SEC}"
+            )));
+        }
+        if self.idle_timeout_sec >= self.max_lifetime_sec {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.idle_timeout_sec must be less than {field}.max_lifetime_sec"
+            )));
+        }
+
+        validate_session_execution(
+            &self.teardown.script,
+            &self.teardown.executable,
+            &self.teardown.args,
+            self.teardown.timeout_sec,
+            &format!("{field}.teardown"),
+            environment,
+            max_timeout_sec,
+        )?;
+
+        if self.actions.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.actions must include at least one named action"
+            )));
+        }
+        for (action_name, action) in &self.actions {
+            if !valid_task_id(action_name) {
+                return Err(ConfigError::Invalid(format!(
+                    "action name {action_name:?} in {field}.actions must match [A-Za-z0-9_-]+ and be at most 64 bytes"
+                )));
             }
+            let action_field = format!("{field}.actions.{action_name}");
+            validate_session_execution(
+                &action.script,
+                &action.executable,
+                &action.args,
+                action.timeout_sec,
+                &action_field,
+                environment,
+                max_timeout_sec,
+            )?;
+            validate_artifact_spec(&action.artifacts, &format!("{action_field}.artifacts"))?;
         }
         Ok(())
     }
@@ -709,6 +812,47 @@ fn execution<'a>(
         (None, Some(path)) => TaskExecution::Executable { path, args },
         _ => unreachable!("task execution shape must be validated at startup"),
     }
+}
+
+fn validate_session_execution(
+    script: &Option<ScriptText>,
+    executable: &Option<PathBuf>,
+    args: &[String],
+    timeout_sec: u64,
+    field: &str,
+    environment: &HashMap<String, String>,
+    max_timeout_sec: u64,
+) -> Result<(), ConfigError> {
+    validate_execution(script, executable, args, field, environment)?;
+    validate_args(args, &format!("{field}.args"))?;
+    if timeout_sec == 0 || timeout_sec > max_timeout_sec {
+        return Err(ConfigError::Invalid(format!(
+            "{field}.timeout_sec must be between 1 and build.max_timeout_sec ({max_timeout_sec})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_args(args: &[String], field: &str) -> Result<(), ConfigError> {
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_spec(spec: &ArtifactSpec, field: &str) -> Result<(), ConfigError> {
+    for (name, patterns) in [("include", &spec.include), ("exclude", &spec.exclude)] {
+        for pattern in patterns {
+            validate_relative_pattern(pattern, &format!("{field}.{name}"))
+                .map_err(|err| ConfigError::Invalid(err.to_string()))?;
+            glob::Pattern::new(pattern).map_err(|err| {
+                ConfigError::Invalid(format!("invalid glob in {field}.{name} {pattern:?}: {err}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_execution(
@@ -755,7 +899,10 @@ fn validate_script(
             "{field}.script must not contain NUL"
         )));
     }
-    let environment_field = field.strip_suffix(".setup").unwrap_or(field);
+    let environment_field = field.split_once(".session").map_or_else(
+        || field.strip_suffix(".setup").unwrap_or(field),
+        |(task, _)| task,
+    );
     let path = environment.get("PATH").ok_or_else(|| {
         ConfigError::Invalid(format!(
             "{environment_field}.environment.PATH is required for script tasks"
@@ -1066,6 +1213,7 @@ mod tests {
             executable: Some(executable),
             args: vec!["fixed".to_string()],
             setup: None,
+            session: None,
             cwd: ".".to_string(),
             timeout_sec: 30,
             environment: HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
@@ -1074,6 +1222,32 @@ mod tests {
                 exclude: Vec::new(),
             },
             workspace: WorkspacePolicy::Fresh,
+        }
+    }
+
+    fn session(executable: PathBuf) -> TaskSessionConfig {
+        TaskSessionConfig {
+            idle_timeout_sec: 60,
+            max_lifetime_sec: 600,
+            teardown: SessionTeardownConfig {
+                script: None,
+                executable: Some(executable.clone()),
+                args: vec!["teardown".to_string()],
+                timeout_sec: 30,
+            },
+            actions: HashMap::from([(
+                "observe".to_string(),
+                SessionActionConfig {
+                    script: None,
+                    executable: Some(executable),
+                    args: vec!["observe".to_string()],
+                    timeout_sec: 30,
+                    artifacts: ArtifactSpec {
+                        include: vec!["screenshots/**".to_string()],
+                        exclude: Vec::new(),
+                    },
+                },
+            )]),
         }
     }
 
@@ -1109,7 +1283,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "7"
+schema_version = "8"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1120,7 +1294,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "7"
+schema_version = "8"
 tasks = {}
 [service.http]
 enabled = true
@@ -1231,6 +1405,114 @@ tokens = ["secret"]
     }
 
     #[test]
+    fn validates_managed_session_commands_deadlines_names_and_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = valid_config(temp.path());
+        let executable = std::env::current_exe().expect("current executable");
+        config.tasks.get_mut("build").unwrap().session = Some(session(executable));
+        config.validate().expect("valid session config");
+
+        type SessionMutation = Box<dyn Fn(&mut TaskSessionConfig, u64)>;
+        let cases: Vec<SessionMutation> = vec![
+            Box::new(|session, _| session.idle_timeout_sec = 0),
+            Box::new(|session, _| session.max_lifetime_sec = 0),
+            Box::new(|session, _| session.idle_timeout_sec = session.max_lifetime_sec),
+            Box::new(|session, max| session.teardown.timeout_sec = max + 1),
+            Box::new(|session, _| {
+                session.actions.get_mut("observe").unwrap().timeout_sec = 0;
+            }),
+            Box::new(|session, max| {
+                session.actions.get_mut("observe").unwrap().timeout_sec = max + 1
+            }),
+            Box::new(|session, _| {
+                session
+                    .actions
+                    .get_mut("observe")
+                    .unwrap()
+                    .artifacts
+                    .include = vec!["../outside".to_string()];
+            }),
+            Box::new(|session, _| {
+                let action = session.actions.remove("observe").unwrap();
+                session.actions.insert("bad action".to_string(), action);
+            }),
+            Box::new(|session, _| session.actions.clear()),
+        ];
+        for mutate in cases {
+            let mut invalid = config.clone();
+            let max_timeout = invalid.build.max_timeout_sec;
+            mutate(
+                invalid
+                    .tasks
+                    .get_mut("build")
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap(),
+                max_timeout,
+            );
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn managed_session_lifetime_has_a_representable_instant_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = std::env::current_exe().expect("current executable");
+        let mut config = valid_config(temp.path());
+        let mut boundary = session(executable);
+        boundary.idle_timeout_sec = MAX_SESSION_LIFETIME_SEC - 1;
+        boundary.max_lifetime_sec = MAX_SESSION_LIFETIME_SEC;
+        config.tasks.get_mut("build").unwrap().session = Some(boundary);
+        config.validate().expect("maximum representable lifetime");
+
+        config
+            .tasks
+            .get_mut("build")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap()
+            .max_lifetime_sec = MAX_SESSION_LIFETIME_SEC + 1;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_lifetime_sec must be no greater"));
+    }
+
+    #[test]
+    fn session_configuration_rejects_unknown_fields() {
+        let executable = std::env::current_exe().unwrap();
+        let raw = format!(
+            r#"idle_timeout_sec = 60
+max_lifetime_sec = 600
+unknown_authority = true
+[teardown]
+executable = "{}"
+timeout_sec = 30
+[actions.observe]
+executable = "{}"
+timeout_sec = 30
+"#,
+            executable.display(),
+            executable.display()
+        );
+        assert!(toml::from_str::<TaskSessionConfig>(&raw).is_err());
+    }
+
+    #[test]
+    fn schema_seven_without_sessions_migrates_by_version_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut legacy = valid_config(temp.path());
+        legacy.schema_version = "7".to_string();
+        assert!(legacy.validate().is_err());
+        let legacy_toml = toml::to_string(&legacy).unwrap();
+        let migrated_toml =
+            legacy_toml.replacen("schema_version = \"7\"", "schema_version = \"8\"", 1);
+        let migrated: Config = toml::from_str(&migrated_toml).unwrap();
+        migrated.validate().expect("version-only migration");
+        assert!(migrated.tasks.values().all(|task| task.session.is_none()));
+    }
+
+    #[test]
     fn rejects_invalid_upload_deadlines_and_legacy_tls_ca_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         for value in [0, MAX_SOURCE_UPLOAD_TIMEOUT_SEC + 1] {
@@ -1244,7 +1526,7 @@ tokens = ["secret"]
         }
 
         let legacy = r#"
-schema_version = "7"
+schema_version = "8"
 tasks = {}
 [service.http]
 enabled = true
@@ -1282,6 +1564,7 @@ ca_path = "/etc/indentured-server/client-ca.pem"
             executable: None,
             args: Vec::new(),
             setup: None,
+            session: None,
             cwd: ".".to_string(),
             timeout_sec: 30,
             environment: HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
@@ -1291,10 +1574,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_seven_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_eight_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "7"
+            r#"schema_version = "8"
 [service.http]
 enabled = true
 [build]
@@ -1349,7 +1632,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["6", "8"] {
+        for version in ["7", "9"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config

@@ -31,5 +31,66 @@ test ! -e "$client_out/bin/indentured-server"
 
 export INDENTURED_TEST_SERVER_BIN="$server_out/bin/indentured-server"
 export INDENTURED_TEST_CLIENT_BIN="$client_out/bin/indentured"
+INDENTURED_TEST_ID_COMMAND=$(command -v id)
+case "$INDENTURED_TEST_ID_COMMAND" in
+  /*) ;;
+  *)
+    echo "id must resolve to an absolute executable path" >&2
+    exit 2
+    ;;
+esac
+export INDENTURED_TEST_ID_COMMAND
 
-cargo test --locked --offline --test packaged_local_integration packaged_local_flow -- --exact --ignored --nocapture
+if [ "$(id -u)" -eq 0 ]; then
+  if [ -z "${INDENTURED_TEST_TASK_USER:-}" ]; then
+    INDENTURED_TEST_TASK_USER=nobody
+  fi
+  if [ -z "${INDENTURED_TEST_TASK_GROUP:-}" ]; then
+    INDENTURED_TEST_TASK_GROUP=$(id -gn "$INDENTURED_TEST_TASK_USER")
+  fi
+  export INDENTURED_TEST_TASK_USER INDENTURED_TEST_TASK_GROUP
+  test "$(id -u "$INDENTURED_TEST_TASK_USER")" -ne 0 || {
+    echo "packaged session task identity must be non-root" >&2
+    exit 2
+  }
+  if [ "$(uname -s)" != Linux ] || ! command -v unshare >/dev/null 2>&1; then
+    echo "packaged lifecycle validation requires Linux PID-namespace isolation; refusing to run descendants unsupervised" >&2
+    exit 2
+  fi
+  exec unshare --pid --fork --kill-child=KILL --mount-proc \
+    env INDENTURED_TEST_TASK_USER="$INDENTURED_TEST_TASK_USER" \
+    INDENTURED_TEST_TASK_GROUP="$INDENTURED_TEST_TASK_GROUP" \
+    INDENTURED_TEST_ID_COMMAND="$INDENTURED_TEST_ID_COMMAND" \
+    INDENTURED_TEST_SERVER_BIN="$INDENTURED_TEST_SERVER_BIN" \
+    INDENTURED_TEST_CLIENT_BIN="$INDENTURED_TEST_CLIENT_BIN" \
+    cargo test --locked --offline --test packaged_local_integration -- --ignored --nocapture --test-threads=1
+fi
+
+if [ "$(uname -s)" != Linux ] || ! command -v unshare >/dev/null 2>&1; then
+  echo "managed-session packaged validation needs a root daemon and distinct task user; rerun this task through an isolated root test environment" >&2
+  exit 2
+fi
+
+user=$(id -un)
+group=$(id -gn)
+uid=$(id -u)
+subuid=$(awk -F: -v user="$user" '$1 == user { print $2; exit }' /etc/subuid)
+subgid=$(awk -F: -v user="$user" '$1 == user { print $2; exit }' /etc/subgid)
+subgid_count=$(awk -F: -v user="$user" '$1 == user { print $3; exit }' /etc/subgid)
+test -n "$subuid" && test -n "$subgid" && test -n "$subgid_count" || {
+  echo "managed-session packaged validation needs subordinate UID/GID mappings for $user" >&2
+  exit 2
+}
+
+# The cargo test process is PID 1 in a private PID namespace. If it exits or
+# panics, the kernel and --kill-child kill only that namespace's descendants;
+# no repository-wide or name-based kill is used.
+exec unshare --user --map-root-user \
+  --map-users="$uid:$subuid:1" \
+  --map-groups="1:$subgid:$subgid_count" \
+  --pid --fork --kill-child=KILL --mount-proc \
+  env INDENTURED_TEST_TASK_USER="$user" INDENTURED_TEST_TASK_GROUP="$group" \
+  INDENTURED_TEST_ID_COMMAND="$INDENTURED_TEST_ID_COMMAND" \
+  INDENTURED_TEST_SERVER_BIN="$INDENTURED_TEST_SERVER_BIN" \
+  INDENTURED_TEST_CLIENT_BIN="$INDENTURED_TEST_CLIENT_BIN" \
+  cargo test --locked --offline --test packaged_local_integration -- --ignored --nocapture --test-threads=1

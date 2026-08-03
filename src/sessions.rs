@@ -1,0 +1,1752 @@
+use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc::Sender, Notify, OwnedSemaphorePermit};
+use tokio::task::AbortHandle;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+#[cfg(test)]
+use crate::artifacts::ArtifactSnapshotCheckpoint;
+use crate::artifacts::{collect_artifacts_zip, collect_artifacts_zip_controlled, ArtifactError};
+#[cfg(test)]
+use crate::build::InitializationCheckpoint;
+use crate::build::{
+    initialize_session, run_session_action, run_session_teardown, send_action_response,
+    CancellationFlag, ValidatedRequest,
+};
+use crate::config::{Config, TaskConfig, MAX_SESSION_LIFETIME_SEC};
+use crate::protocol::{
+    SessionActionEvent, SessionActionStatus, SessionActionStreamItem, SessionStartEvent,
+    SessionStopResponse, SessionTeardownResult,
+};
+
+const METADATA_VERSION: u8 = 1;
+const METADATA_DIRECTORY: &str = ".sessions";
+
+#[derive(Clone)]
+pub(crate) struct SessionManager {
+    inner: Arc<SessionManagerInner>,
+}
+
+struct SessionManagerInner {
+    config: Arc<Config>,
+    metadata_root: PathBuf,
+    sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+    #[cfg(test)]
+    hooks: Mutex<LifecycleHooks>,
+}
+
+pub(crate) struct SessionReservation {
+    entry: Arc<SessionEntry>,
+}
+
+pub(crate) struct SessionActionReservation {
+    entry: Arc<SessionEntry>,
+    action_id: String,
+    action_name: String,
+    cancellation: CancellationFlag,
+}
+
+impl SessionActionReservation {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.entry.id
+    }
+
+    pub(crate) fn action_id(&self) -> &str {
+        &self.action_id
+    }
+}
+
+impl SessionReservation {
+    pub(crate) fn id(&self) -> &str {
+        &self.entry.id
+    }
+
+    pub(crate) fn remaining_lifetime(&self) -> Duration {
+        self.entry
+            .deadline
+            .saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.entry.initialization_cancellation.is_cancelled() {
+                return;
+            }
+            let notified = self.entry.cancellation_notify.notified();
+            if self.entry.initialization_cancellation.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct SessionEntry {
+    id: String,
+    request_id: Option<String>,
+    task_id: String,
+    task: TaskConfig,
+    workspace: PathBuf,
+    deadline: Instant,
+    state: Mutex<SessionState>,
+    completion: Condvar,
+    initialization_cancellation: CancellationFlag,
+    cancellation_notify: Notify,
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    timers: Mutex<Vec<AbortHandle>>,
+}
+
+#[derive(Clone)]
+enum SessionState {
+    Initializing {
+        worker_started: bool,
+    },
+    Ready {
+        last_activity: Instant,
+    },
+    Action {
+        action_id: String,
+        cancellation: CancellationFlag,
+    },
+    Terminating(Termination),
+    Terminated(SessionStopResponse),
+}
+
+#[derive(Clone, Copy)]
+struct Termination {
+    explicit: bool,
+    owner: CleanupOwner,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupOwner {
+    Initializer,
+    Action,
+    Requester,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableSessionMetadata {
+    version: u8,
+    session_id: String,
+    task_id: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StopError {
+    #[error("session not found")]
+    NotFound,
+    #[error("session operation already in progress")]
+    Conflict,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ActionError {
+    #[error("session not found or expired")]
+    NotFound,
+    #[error("unknown configured action")]
+    UnknownAction,
+    #[error("session operation already in progress")]
+    Conflict,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LifecycleHooks {
+    initialization_checkpoint: Option<(InitializationCheckpoint, BarrierHook)>,
+    before_commit: Option<BarrierHook>,
+    commit_election: Option<BarrierHook>,
+    after_commit: Option<BarrierHook>,
+    explicit_cleanup: Option<BarrierHook>,
+    automatic_cleanup: Option<BarrierHook>,
+    artifact_snapshot: Option<(ArtifactSnapshotCheckpoint, BarrierHook)>,
+    final_enqueued: Option<BarrierHook>,
+    force_action_setup_failure: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BarrierHook {
+    arrived: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+impl SessionManager {
+    pub(crate) fn new(config: Arc<Config>) -> io::Result<Self> {
+        let manager = Self::new_disabled(config);
+        manager.reconcile_stale_sessions()?;
+        Ok(manager)
+    }
+
+    pub(crate) fn new_disabled(config: Arc<Config>) -> Self {
+        Self {
+            inner: Arc::new(SessionManagerInner {
+                metadata_root: config.build.workspace_root.join(METADATA_DIRECTORY),
+                config,
+                sessions: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                hooks: Mutex::new(LifecycleHooks::default()),
+            }),
+        }
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        validated: ValidatedRequest,
+        permit: OwnedSemaphorePermit,
+    ) -> SessionReservation {
+        let session_id = format!("ses_{}", Uuid::new_v4().simple());
+        let lifetime_sec = validated
+            .task
+            .session
+            .as_ref()
+            .expect("validated session task")
+            .max_lifetime_sec;
+        assert!(
+            lifetime_sec <= MAX_SESSION_LIFETIME_SEC,
+            "session task must pass configuration validation"
+        );
+        let lifetime = Duration::from_secs(lifetime_sec);
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(lifetime)
+            .expect("validated session lifetime must fit Instant");
+        let entry = Arc::new(SessionEntry {
+            workspace: self.session_workspace(&session_id),
+            id: session_id.clone(),
+            request_id: validated.request_id,
+            task_id: validated.task_id,
+            task: validated.task,
+            deadline,
+            state: Mutex::new(SessionState::Initializing {
+                worker_started: false,
+            }),
+            completion: Condvar::new(),
+            initialization_cancellation: CancellationFlag::default(),
+            cancellation_notify: Notify::new(),
+            permit: Mutex::new(Some(permit)),
+            timers: Mutex::new(Vec::new()),
+        });
+        #[cfg(test)]
+        if let Some((checkpoint, hook)) = self
+            .inner
+            .hooks
+            .lock()
+            .unwrap()
+            .initialization_checkpoint
+            .take()
+        {
+            entry
+                .initialization_cancellation
+                .install_initialization_checkpoint_hook(checkpoint, hook.arrived, hook.release);
+        }
+        self.inner
+            .sessions
+            .lock()
+            .expect("session registry lock")
+            .insert(session_id, Arc::clone(&entry));
+        self.spawn_lifetime_timer(&entry);
+        SessionReservation { entry }
+    }
+
+    pub(crate) fn begin_initialization(&self, reservation: &SessionReservation) -> bool {
+        let entry = &reservation.entry;
+        let mut state = entry.state.lock().expect("session state lock");
+        match &mut *state {
+            SessionState::Initializing { worker_started }
+                if !*worker_started
+                    && !entry.initialization_cancellation.is_cancelled()
+                    && Instant::now() < entry.deadline =>
+            {
+                *worker_started = true;
+                true
+            }
+            SessionState::Initializing { worker_started } if !*worker_started => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                self.cleanup_entry(entry, false);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn cancel_upload(&self, reservation: &SessionReservation) {
+        let entry = &reservation.entry;
+        let mut state = entry.state.lock().expect("session state lock");
+        if matches!(
+            *state,
+            SessionState::Initializing {
+                worker_started: false
+            }
+        ) {
+            entry.initialization_cancellation.cancel();
+            entry.cancellation_notify.notify_waiters();
+            *state = SessionState::Terminating(Termination {
+                explicit: false,
+                owner: CleanupOwner::Requester,
+            });
+            entry.completion.notify_all();
+            drop(state);
+            self.cleanup_entry(entry, false);
+        }
+    }
+
+    pub(crate) fn initialize(
+        &self,
+        reservation: SessionReservation,
+        source_archive: tempfile::TempPath,
+        sender: Sender<SessionStartEvent>,
+    ) {
+        let entry = reservation.entry;
+        let validated = ValidatedRequest {
+            request_id: entry.request_id.clone(),
+            task_id: entry.task_id.clone(),
+            task: entry.task.clone(),
+        };
+        let initialization = initialize_session(
+            &validated,
+            &self.inner.config,
+            &source_archive,
+            &entry.workspace,
+            &entry.id,
+            &sender,
+            &entry.initialization_cancellation,
+            entry.deadline,
+        );
+
+        let outcome = match initialization {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                send_best_effort(
+                    &sender,
+                    SessionStartEvent::Error {
+                        code: err.code.to_string(),
+                        message: Some(err.message),
+                        phase: err.phase,
+                    },
+                );
+                send_best_effort(
+                    &sender,
+                    SessionStartEvent::Exit {
+                        code: 1,
+                        timed_out: false,
+                        failed_phase: err.phase,
+                        phases: err.phases,
+                    },
+                );
+                self.initializer_cleanup(&entry, false);
+                return;
+            }
+        };
+
+        if outcome.exit_code != 0 || outcome.timed_out {
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Exit {
+                    code: outcome.exit_code,
+                    timed_out: outcome.timed_out,
+                    failed_phase: outcome.failed_phase,
+                    phases: outcome.phases,
+                },
+            );
+            self.initializer_cleanup(&entry, false);
+            return;
+        }
+
+        #[cfg(test)]
+        self.wait_at_hook(HookKind::BeforeCommit);
+
+        {
+            let mut state = entry.state.lock().expect("session state lock");
+            if !matches!(*state, SessionState::Initializing { .. })
+                || entry.initialization_cancellation.is_cancelled()
+                || Instant::now() >= entry.deadline
+            {
+                if matches!(*state, SessionState::Initializing { .. }) {
+                    *state = SessionState::Terminating(Termination {
+                        explicit: false,
+                        owner: CleanupOwner::Initializer,
+                    });
+                }
+                drop(state);
+                self.initializer_cleanup(&entry, false);
+                return;
+            }
+        }
+
+        let metadata = DurableSessionMetadata {
+            version: METADATA_VERSION,
+            session_id: entry.id.clone(),
+            task_id: entry.task_id.clone(),
+        };
+        if let Err(err) = self.write_metadata(&metadata) {
+            error!(
+                "failed to commit session metadata session_id={}: {err}",
+                entry.id
+            );
+            let mut state = entry.state.lock().expect("session state lock");
+            if matches!(*state, SessionState::Initializing { .. }) {
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Initializer,
+                });
+            }
+            drop(state);
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Error {
+                    code: "session_commit_failed".to_string(),
+                    message: Some("failed to commit session metadata".to_string()),
+                    phase: None,
+                },
+            );
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Exit {
+                    code: 1,
+                    timed_out: false,
+                    failed_phase: None,
+                    phases: outcome.phases,
+                },
+            );
+            self.initializer_cleanup(&entry, false);
+            return;
+        }
+
+        #[cfg(test)]
+        self.wait_at_hook(HookKind::CommitElection);
+
+        // Durable metadata exists, but Initializing -> Ready and every
+        // termination trigger contend on this one state lock. Whichever changes
+        // Initializing first owns the outcome; there is no separately observable
+        // commit flag.
+        let mut state = entry.state.lock().expect("session state lock");
+        if matches!(*state, SessionState::Initializing { .. })
+            && !entry.initialization_cancellation.is_cancelled()
+            && Instant::now() < entry.deadline
+        {
+            *state = SessionState::Ready {
+                last_activity: Instant::now(),
+            };
+            self.spawn_idle_timer(&entry);
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Ready {
+                    session_id: entry.id.clone(),
+                    phases: outcome.phases,
+                },
+            );
+            drop(state);
+            info!("managed session ready session_id={}", entry.id);
+
+            #[cfg(test)]
+            self.wait_at_hook(HookKind::AfterCommit);
+            return;
+        }
+        if matches!(*state, SessionState::Initializing { .. }) {
+            *state = SessionState::Terminating(Termination {
+                explicit: false,
+                owner: CleanupOwner::Initializer,
+            });
+        }
+        drop(state);
+        self.remove_metadata(&entry.id);
+        send_best_effort(
+            &sender,
+            SessionStartEvent::Exit {
+                code: 1,
+                timed_out: Instant::now() >= entry.deadline,
+                failed_phase: None,
+                phases: outcome.phases,
+            },
+        );
+        self.initializer_cleanup(&entry, false);
+    }
+
+    pub(crate) fn disconnect(&self, session_id: &str) {
+        let Some(entry) = self.lookup(session_id) else {
+            return;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Initializing {
+                worker_started: true,
+            } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Initializer,
+                });
+                entry.completion.notify_all();
+            }
+            SessionState::Initializing {
+                worker_started: false,
+            } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                self.cleanup_entry(&entry, false);
+            }
+            SessionState::Ready { .. }
+            | SessionState::Action { .. }
+            | SessionState::Terminating(_)
+            | SessionState::Terminated(_) => {}
+        }
+    }
+
+    pub(crate) fn start_action(
+        &self,
+        session_id: &str,
+        action_name: &str,
+    ) -> Result<SessionActionReservation, ActionError> {
+        let entry = self.lookup(session_id).ok_or(ActionError::NotFound)?;
+        if !entry
+            .task
+            .session
+            .as_ref()
+            .is_some_and(|session| session.actions.contains_key(action_name))
+        {
+            return Err(ActionError::UnknownAction);
+        }
+        let cancellation = CancellationFlag::default();
+        #[cfg(test)]
+        {
+            let mut hooks = self.inner.hooks.lock().unwrap();
+            if hooks.force_action_setup_failure {
+                hooks.force_action_setup_failure = false;
+                cancellation.force_post_spawn_setup_failure();
+            }
+        }
+        let action_id = format!("act_{}", Uuid::new_v4().simple());
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Ready { .. } if Instant::now() < entry.deadline => {
+                *state = SessionState::Action {
+                    action_id: action_id.clone(),
+                    cancellation: cancellation.clone(),
+                };
+                entry.completion.notify_all();
+                drop(state);
+                Ok(SessionActionReservation {
+                    entry,
+                    action_id,
+                    action_name: action_name.to_string(),
+                    cancellation,
+                })
+            }
+            SessionState::Ready { .. }
+            | SessionState::Terminating(_)
+            | SessionState::Terminated(_) => Err(ActionError::NotFound),
+            SessionState::Initializing { .. } | SessionState::Action { .. } => {
+                Err(ActionError::Conflict)
+            }
+        }
+    }
+
+    pub(crate) fn execute_action(
+        &self,
+        reservation: SessionActionReservation,
+        input: Vec<u8>,
+        sender: Sender<SessionActionStreamItem>,
+    ) {
+        let entry = reservation.entry;
+        let action_id = reservation.action_id;
+        let action_name = reservation.action_name;
+        let cancellation = reservation.cancellation;
+        let outcome = run_session_action(
+            &entry.task_id,
+            &entry.task,
+            &self.inner.config,
+            &entry.workspace,
+            &entry.id,
+            &action_id,
+            &action_name,
+            &input,
+            &sender,
+            &cancellation,
+        );
+
+        let outcome = match outcome {
+            Ok(outcome) if !outcome.timed_out => outcome,
+            Ok(outcome) => {
+                send_action_best_effort(
+                    &sender,
+                    SessionActionEvent::Exit {
+                        session_id: entry.id.clone(),
+                        action_id: action_id.clone(),
+                        action: action_name.clone(),
+                        code: outcome.code,
+                        timed_out: true,
+                        artifacts: None,
+                        artifact_restrictions: None,
+                    },
+                );
+                self.finish_action(&entry, &action_id, false);
+                return;
+            }
+            Err(err) => {
+                if err.code != "stream_closed" {
+                    send_action_best_effort(
+                        &sender,
+                        SessionActionEvent::Error {
+                            code: err.code.to_string(),
+                            message: Some(err.message),
+                        },
+                    );
+                    send_action_best_effort(
+                        &sender,
+                        SessionActionEvent::Exit {
+                            session_id: entry.id.clone(),
+                            action_id: action_id.clone(),
+                            action: action_name.clone(),
+                            code: 1,
+                            timed_out: false,
+                            artifacts: None,
+                            artifact_restrictions: None,
+                        },
+                    );
+                }
+                self.finish_action(&entry, &action_id, false);
+                return;
+            }
+        };
+
+        if send_action_response(
+            &sender,
+            SessionActionEvent::Action {
+                session_id: entry.id.clone(),
+                action_id: action_id.clone(),
+                action: action_name.clone(),
+                status: SessionActionStatus::Snapshotting,
+            },
+            &cancellation,
+        )
+        .is_err()
+        {
+            self.finish_action(&entry, &action_id, false);
+            return;
+        }
+
+        let archive_id = format!("bld_{}", Uuid::new_v4().simple());
+        let action = entry
+            .task
+            .session
+            .as_ref()
+            .and_then(|session| session.actions.get(&action_name))
+            .expect("reserved configured action");
+        let checkpoint = |checkpoint| {
+            #[cfg(test)]
+            self.wait_at_hook(HookKind::ArtifactSnapshot(checkpoint));
+            #[cfg(not(test))]
+            let _ = checkpoint;
+        };
+        let collection = collect_artifacts_zip_controlled(
+            &entry.workspace,
+            &action.artifacts,
+            &self.inner.config.artifacts,
+            &archive_id,
+            &|| cancellation.is_cancelled(),
+            &checkpoint,
+        );
+        let collection = match collection {
+            Ok(collection) => collection,
+            Err(err) => {
+                let _ =
+                    fs::remove_dir_all(self.inner.config.artifacts.storage_root.join(&archive_id));
+                if !matches!(err, ArtifactError::Cancelled) && !cancellation.is_cancelled() {
+                    send_action_best_effort(
+                        &sender,
+                        SessionActionEvent::Error {
+                            code: "artifact_collection_failed".to_string(),
+                            message: Some(err.to_string()),
+                        },
+                    );
+                    send_action_best_effort(
+                        &sender,
+                        SessionActionEvent::Exit {
+                            session_id: entry.id.clone(),
+                            action_id: action_id.clone(),
+                            action: action_name.clone(),
+                            code: if outcome.code == 0 { 1 } else { outcome.code },
+                            timed_out: false,
+                            artifacts: None,
+                            artifact_restrictions: None,
+                        },
+                    );
+                }
+                self.finish_action(&entry, &action_id, false);
+                return;
+            }
+        };
+
+        let archive_root = self.inner.config.artifacts.storage_root.join(&archive_id);
+        if !self.action_can_publish(&entry, &action_id) {
+            let _ = fs::remove_dir_all(&archive_root);
+            self.finish_action(&entry, &action_id, false);
+            return;
+        }
+        let final_event = SessionActionEvent::Exit {
+            session_id: entry.id.clone(),
+            action_id: action_id.clone(),
+            action: action_name,
+            code: outcome.code,
+            timed_out: false,
+            artifacts: collection.archive,
+            artifact_restrictions: collection.restrictions,
+        };
+        if !self.deliver_final_action_event(&entry, &action_id, &sender, final_event, &cancellation)
+        {
+            let _ = fs::remove_dir_all(&archive_root);
+            self.finish_action(&entry, &action_id, false);
+        }
+    }
+
+    fn action_can_publish(&self, entry: &Arc<SessionEntry>, action_id: &str) -> bool {
+        let state = entry.state.lock().expect("session state lock");
+        matches!(
+            &*state,
+            SessionState::Action {
+                action_id: active,
+                cancellation,
+                ..
+            } if active == action_id
+                && !cancellation.is_cancelled()
+                && Instant::now() < entry.deadline
+        )
+    }
+
+    fn deliver_final_action_event(
+        &self,
+        entry: &Arc<SessionEntry>,
+        action_id: &str,
+        sender: &Sender<SessionActionStreamItem>,
+        event: SessionActionEvent,
+        cancellation: &CancellationFlag,
+    ) -> bool {
+        let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(1);
+        let mut pending = SessionActionStreamItem {
+            event,
+            final_ack: Some(ack_sender),
+        };
+        let enqueue_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if cancellation.is_cancelled() || !self.action_can_publish(entry, action_id) {
+                return false;
+            }
+            match sender.try_send(pending) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                    pending = item;
+                    if Instant::now() >= enqueue_deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        #[cfg(test)]
+        self.wait_at_hook(HookKind::FinalEnqueued);
+        let acknowledgement_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            match ack_receiver.try_recv() {
+                Ok(accepted) => return accepted,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= acknowledgement_deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn finish_action(&self, entry: &Arc<SessionEntry>, action_id: &str, reusable: bool) {
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Action {
+                action_id: active, ..
+            } if active == action_id && reusable => {
+                *state = SessionState::Ready {
+                    last_activity: Instant::now(),
+                };
+                entry.completion.notify_all();
+                drop(state);
+                self.spawn_idle_timer(entry);
+            }
+            SessionState::Action {
+                action_id: active, ..
+            } if active == action_id => {
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                self.cleanup_entry(entry, false);
+            }
+            SessionState::Terminating(termination) if termination.owner == CleanupOwner::Action => {
+                let explicit = termination.explicit;
+                drop(state);
+                self.cleanup_entry(entry, explicit);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn acknowledge_action_delivery(&self, session_id: &str, action_id: &str) -> bool {
+        let Some(entry) = self.lookup(session_id) else {
+            return false;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Action {
+                action_id: active,
+                cancellation,
+            } if active == action_id
+                && !cancellation.is_cancelled()
+                && Instant::now() < entry.deadline =>
+            {
+                *state = SessionState::Ready {
+                    last_activity: Instant::now(),
+                };
+                entry.completion.notify_all();
+                drop(state);
+                self.spawn_idle_timer(&entry);
+                true
+            }
+            SessionState::Action {
+                action_id: active,
+                cancellation,
+            } if active == action_id => {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn disconnect_action(&self, session_id: &str, action_id: &str) {
+        let Some(entry) = self.lookup(session_id) else {
+            return;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        if let SessionState::Action {
+            action_id: active,
+            cancellation,
+        } = &*state
+        {
+            if active == action_id {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+            }
+        }
+    }
+
+    pub(crate) fn stop(&self, session_id: &str) -> Result<SessionStopResponse, StopError> {
+        let entry = self.lookup(session_id).ok_or(StopError::NotFound)?;
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Initializing {
+                worker_started: true,
+            } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: true,
+                    owner: CleanupOwner::Initializer,
+                });
+                entry.completion.notify_all();
+                loop {
+                    state = entry.completion.wait(state).expect("session state lock");
+                    if let SessionState::Terminated(response) = &*state {
+                        return Ok(response.clone());
+                    }
+                }
+            }
+            SessionState::Action { cancellation, .. } => {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: true,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+                loop {
+                    state = entry.completion.wait(state).expect("session state lock");
+                    if let SessionState::Terminated(response) = &*state {
+                        return Ok(response.clone());
+                    }
+                }
+            }
+            SessionState::Initializing {
+                worker_started: false,
+            }
+            | SessionState::Ready { .. } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: true,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                #[cfg(test)]
+                self.wait_at_hook(HookKind::ExplicitCleanup);
+                Ok(self.cleanup_entry(&entry, true))
+            }
+            SessionState::Terminating(_) => Err(StopError::Conflict),
+            SessionState::Terminated(_) => Err(StopError::Conflict),
+        }
+    }
+
+    fn initializer_cleanup(&self, entry: &Arc<SessionEntry>, default_explicit: bool) {
+        let explicit = {
+            let mut state = entry.state.lock().expect("session state lock");
+            match &*state {
+                SessionState::Initializing { .. } => {
+                    *state = SessionState::Terminating(Termination {
+                        explicit: default_explicit,
+                        owner: CleanupOwner::Initializer,
+                    });
+                    default_explicit
+                }
+                SessionState::Terminating(termination)
+                    if termination.owner == CleanupOwner::Initializer =>
+                {
+                    termination.explicit
+                }
+                SessionState::Terminating(_)
+                | SessionState::Ready { .. }
+                | SessionState::Action { .. } => return,
+                SessionState::Terminated(_) => return,
+            }
+        };
+        self.cleanup_entry(entry, explicit);
+    }
+
+    fn cleanup_entry(&self, entry: &Arc<SessionEntry>, explicit: bool) -> SessionStopResponse {
+        self.abort_timers(entry);
+        let mut teardown = if entry.workspace.is_dir() {
+            run_session_teardown(
+                &entry.task_id,
+                &entry.task,
+                &self.inner.config,
+                &entry.workspace,
+                &entry.id,
+            )
+        } else {
+            SessionTeardownResult {
+                duration_ms: 0,
+                exit_code: None,
+                timed_out: false,
+                error_code: Some("workspace_missing".to_string()),
+            }
+        };
+        let (artifacts, artifact_restrictions) = if explicit && entry.workspace.is_dir() {
+            let archive_id = format!("bld_{}", Uuid::new_v4().simple());
+            match collect_artifacts_zip(
+                &entry.workspace,
+                &entry.task.artifacts,
+                &self.inner.config.artifacts,
+                &archive_id,
+            ) {
+                Ok(collection) => (collection.archive, collection.restrictions),
+                Err(err) => {
+                    warn!(
+                        "final session artifact collection failed session_id={}: {err}",
+                        entry.id
+                    );
+                    if teardown.error_code.is_none() {
+                        teardown.error_code = Some("artifact_collection_failed".to_string());
+                    }
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let response = SessionStopResponse {
+            session_id: entry.id.clone(),
+            teardown,
+            artifacts,
+            artifact_restrictions,
+        };
+
+        self.remove_session_files(&entry.id, &entry.workspace);
+        self.inner
+            .sessions
+            .lock()
+            .expect("session registry lock")
+            .remove(&entry.id);
+        entry.permit.lock().expect("session permit lock").take();
+        let mut state = entry.state.lock().expect("session state lock");
+        *state = SessionState::Terminated(response.clone());
+        entry.completion.notify_all();
+        drop(state);
+        info!(
+            "managed session removed session_id={} explicit={explicit}",
+            entry.id
+        );
+        response
+    }
+
+    fn spawn_lifetime_timer(&self, entry: &Arc<SessionEntry>) {
+        let manager = self.clone();
+        let id = entry.id.clone();
+        let deadline = entry.deadline;
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            let manager_for_cleanup = manager.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                manager_for_cleanup.expire_lifetime(&id);
+            })
+            .await;
+        });
+        entry
+            .timers
+            .lock()
+            .expect("session timer lock")
+            .push(handle.abort_handle());
+    }
+
+    fn spawn_idle_timer(&self, entry: &Arc<SessionEntry>) {
+        let idle = Duration::from_secs(
+            entry
+                .task
+                .session
+                .as_ref()
+                .expect("validated session task")
+                .idle_timeout_sec,
+        );
+        let manager = self.clone();
+        let id = entry.id.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Some(remaining) = manager.idle_remaining(&id, idle) else {
+                    return;
+                };
+                if remaining.is_zero() {
+                    let manager_for_cleanup = manager.clone();
+                    let cleanup_id = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        manager_for_cleanup.expire_idle(&cleanup_id, idle);
+                    })
+                    .await;
+                    return;
+                }
+                tokio::time::sleep(remaining).await;
+            }
+        });
+        entry
+            .timers
+            .lock()
+            .expect("session timer lock")
+            .push(handle.abort_handle());
+    }
+
+    fn expire_lifetime(&self, session_id: &str) {
+        let Some(entry) = self.lookup(session_id) else {
+            return;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Initializing {
+                worker_started: true,
+            } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Initializer,
+                });
+                entry.completion.notify_all();
+            }
+            SessionState::Action { cancellation, .. } => {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+            }
+            SessionState::Initializing {
+                worker_started: false,
+            }
+            | SessionState::Ready { .. } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                #[cfg(test)]
+                self.wait_at_hook(HookKind::AutomaticCleanup);
+                self.cleanup_entry(&entry, false);
+            }
+            SessionState::Terminating(_) | SessionState::Terminated(_) => {}
+        }
+    }
+
+    fn expire_idle(&self, session_id: &str, idle: Duration) {
+        let Some(entry) = self.lookup(session_id) else {
+            return;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        if let SessionState::Ready { last_activity } = &*state {
+            if last_activity.elapsed() >= idle {
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                drop(state);
+                #[cfg(test)]
+                self.wait_at_hook(HookKind::AutomaticCleanup);
+                self.cleanup_entry(&entry, false);
+            }
+        }
+    }
+
+    fn idle_remaining(&self, session_id: &str, idle: Duration) -> Option<Duration> {
+        let entry = self.lookup(session_id)?;
+        let state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Ready { last_activity } => {
+                Some(idle.saturating_sub(last_activity.elapsed()))
+            }
+            _ => None,
+        }
+    }
+
+    fn abort_timers(&self, entry: &SessionEntry) {
+        for timer in entry.timers.lock().expect("session timer lock").drain(..) {
+            timer.abort();
+        }
+    }
+
+    fn lookup(&self, session_id: &str) -> Option<Arc<SessionEntry>> {
+        self.inner
+            .sessions
+            .lock()
+            .expect("session registry lock")
+            .get(session_id)
+            .cloned()
+    }
+
+    fn reconcile_stale_sessions(&self) -> io::Result<()> {
+        match fs::symlink_metadata(&self.inner.metadata_root) {
+            Ok(_) => {
+                validate_protected_directory(&self.inner.metadata_root)?;
+                for entry in fs::read_dir(&self.inner.metadata_root)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let Some(session_id) = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .filter(|_| {
+                            path.extension().and_then(|value| value.to_str()) == Some("json")
+                        })
+                        .map(str::to_string)
+                    else {
+                        warn!("removing unrecognized stale session metadata {path:?}");
+                        remove_path(&path);
+                        continue;
+                    };
+                    let workspace = self.session_workspace(&session_id);
+                    let metadata = read_metadata(&path).ok().filter(|metadata| {
+                        metadata.version == METADATA_VERSION && metadata.session_id == session_id
+                    });
+                    if let Some(metadata) = metadata {
+                        if let Some(task) = self
+                            .inner
+                            .config
+                            .tasks
+                            .get(&metadata.task_id)
+                            .filter(|task| task.session.is_some())
+                        {
+                            if workspace.is_dir() {
+                                let _ = run_session_teardown(
+                                    &metadata.task_id,
+                                    task,
+                                    &self.inner.config,
+                                    &workspace,
+                                    &session_id,
+                                );
+                            }
+                        } else {
+                            warn!(
+                            "stale session configuration unavailable; performing root cleanup session_id={session_id}"
+                        );
+                        }
+                    } else {
+                        warn!("invalid stale session metadata; performing root cleanup session_id={session_id}");
+                    }
+                    self.remove_session_files(&session_id, &workspace);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+
+        if self.inner.config.build.workspace_root.exists() {
+            for entry in fs::read_dir(&self.inner.config.build.workspace_root)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("session-ses_"))
+                {
+                    warn!(
+                        "removing orphaned uncommitted session workspace {:?}",
+                        entry.path()
+                    );
+                    remove_path(&entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_metadata(&self, metadata: &DurableSessionMetadata) -> io::Result<()> {
+        prepare_protected_directory(&self.inner.metadata_root)?;
+        let final_path = self.metadata_path(&metadata.session_id);
+        let temp_path = self
+            .inner
+            .metadata_root
+            .join(format!(".{}.tmp", metadata.session_id));
+        let result = (|| {
+            let bytes = serde_json::to_vec(metadata).map_err(io::Error::other)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &final_path)?;
+            OpenOptions::new()
+                .read(true)
+                .open(&self.inner.metadata_root)?
+                .sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            match fs::remove_file(&temp_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!("failed to remove session metadata temp file {temp_path:?}: {err}")
+                }
+            }
+        }
+        result
+    }
+
+    fn remove_metadata(&self, session_id: &str) {
+        let metadata = self.metadata_path(session_id);
+        if let Err(err) = fs::remove_file(&metadata) {
+            if err.kind() != io::ErrorKind::NotFound {
+                warn!("failed to remove session metadata {metadata:?}: {err}");
+            }
+        }
+    }
+
+    fn remove_session_files(&self, session_id: &str, workspace: &Path) {
+        remove_path(workspace);
+        self.remove_metadata(session_id);
+    }
+
+    fn session_workspace(&self, session_id: &str) -> PathBuf {
+        self.inner
+            .config
+            .build
+            .workspace_root
+            .join(format!("session-{session_id}"))
+    }
+
+    fn metadata_path(&self, session_id: &str) -> PathBuf {
+        self.inner.metadata_root.join(format!("{session_id}.json"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.inner.sessions.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metadata_root(&self) -> &Path {
+        &self.inner.metadata_root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_terminating_for_test(&self, session_id: &str) {
+        let entry = self.lookup(session_id).expect("test session");
+        let mut state = entry.state.lock().unwrap();
+        while !matches!(
+            *state,
+            SessionState::Terminating(_) | SessionState::Terminated(_)
+        ) {
+            state = entry.completion.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_terminated_for_test(&self, session_id: &str) -> SessionStopResponse {
+        let entry = self.lookup(session_id).expect("test session");
+        let mut state = entry.state.lock().unwrap();
+        loop {
+            if let SessionState::Terminated(response) = &*state {
+                return response.clone();
+            }
+            state = entry.completion.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_lifetime_for_test(&self, session_id: &str) {
+        self.expire_lifetime(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_idle_for_test(&self, session_id: &str) {
+        self.expire_idle(session_id, Duration::ZERO);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timer_handles_for_test(&self, session_id: &str) -> Vec<AbortHandle> {
+        self.lookup(session_id)
+            .expect("test session")
+            .timers
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_initialization_checkpoint_hook(
+        &self,
+        checkpoint: InitializationCheckpoint,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().initialization_checkpoint =
+            Some((checkpoint, BarrierHook { arrived, release }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_before_commit_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().before_commit = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_commit_election_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().commit_election = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_after_commit_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().after_commit = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_explicit_cleanup_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().explicit_cleanup = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_automatic_cleanup_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().automatic_cleanup = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_action_snapshot_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.install_artifact_checkpoint_hook(
+            ArtifactSnapshotCheckpoint::Traversal,
+            arrived,
+            release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_artifact_checkpoint_hook(
+        &self,
+        checkpoint: ArtifactSnapshotCheckpoint,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().artifact_snapshot =
+            Some((checkpoint, BarrierHook { arrived, release }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_final_enqueued_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().final_enqueued = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_action_setup_failure(&self) {
+        self.inner.hooks.lock().unwrap().force_action_setup_failure = true;
+    }
+
+    #[cfg(test)]
+    fn wait_at_hook(&self, kind: HookKind) {
+        let hook = {
+            let mut hooks = self.inner.hooks.lock().unwrap();
+            match kind {
+                HookKind::BeforeCommit => hooks.before_commit.take(),
+                HookKind::CommitElection => hooks.commit_election.take(),
+                HookKind::AfterCommit => hooks.after_commit.take(),
+                HookKind::ExplicitCleanup => hooks.explicit_cleanup.take(),
+                HookKind::AutomaticCleanup => hooks.automatic_cleanup.take(),
+                HookKind::ArtifactSnapshot(checkpoint) => {
+                    if hooks
+                        .artifact_snapshot
+                        .as_ref()
+                        .is_some_and(|(installed, _)| *installed == checkpoint)
+                    {
+                        hooks.artifact_snapshot.take().map(|(_, hook)| hook)
+                    } else {
+                        None
+                    }
+                }
+                HookKind::FinalEnqueued => hooks.final_enqueued.take(),
+            }
+        };
+        if let Some(hook) = hook {
+            hook.arrived.wait();
+            hook.release.wait();
+        }
+    }
+}
+
+fn send_best_effort(sender: &Sender<SessionStartEvent>, event: SessionStartEvent) {
+    if let Err(err) = sender.try_send(event) {
+        warn!("dropping undeliverable session event: {err}");
+    }
+}
+
+fn send_action_best_effort(sender: &Sender<SessionActionStreamItem>, event: SessionActionEvent) {
+    if let Err(err) = sender.try_send(SessionActionStreamItem {
+        event,
+        final_ack: None,
+    }) {
+        warn!("dropping undeliverable session action event: {err}");
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum HookKind {
+    BeforeCommit,
+    CommitElection,
+    AfterCommit,
+    ExplicitCleanup,
+    AutomaticCleanup,
+    ArtifactSnapshot(ArtifactSnapshotCheckpoint),
+    FinalEnqueued,
+}
+
+fn prepare_protected_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    validate_protected_directory(path)
+}
+
+fn validate_protected_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session metadata root must be a daemon-owned mode-0700 real directory",
+        ));
+    }
+    Ok(())
+}
+
+fn read_metadata(path: &Path) -> io::Result<DurableSessionMetadata> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unprotected session metadata",
+        ));
+    }
+    serde_json::from_reader(file).map_err(io::Error::other)
+}
+
+fn remove_path(path: &Path) {
+    let result = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = result {
+        warn!("failed to remove stale session path {path:?}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        ArtifactSpec, ArtifactsConfig, BuildConfig, LoggingConfig, ServiceConfig,
+        SessionActionConfig, SessionTeardownConfig, SourcesConfig, TaskSessionConfig,
+        WorkspacePolicy, CONFIG_SCHEMA_VERSION,
+    };
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::tempdir;
+
+    fn test_config(root: &Path, executable: &Path) -> Config {
+        let task = TaskConfig {
+            script: None,
+            executable: Some(executable.to_path_buf()),
+            args: vec!["initialize".to_string()],
+            setup: None,
+            session: Some(TaskSessionConfig {
+                idle_timeout_sec: 1,
+                max_lifetime_sec: 2,
+                teardown: SessionTeardownConfig {
+                    script: None,
+                    executable: Some(executable.to_path_buf()),
+                    args: vec!["teardown".to_string()],
+                    timeout_sec: 1,
+                },
+                actions: HashMap::from([(
+                    "observe".to_string(),
+                    SessionActionConfig {
+                        script: None,
+                        executable: Some(executable.to_path_buf()),
+                        args: vec!["observe".to_string()],
+                        timeout_sec: 1,
+                        artifacts: ArtifactSpec::default(),
+                    },
+                )]),
+            }),
+            cwd: ".".to_string(),
+            timeout_sec: 1,
+            environment: HashMap::new(),
+            artifacts: ArtifactSpec::default(),
+            workspace: WorkspacePolicy::Fresh,
+        };
+        Config {
+            schema_version: CONFIG_SCHEMA_VERSION.to_string(),
+            service: ServiceConfig::default(),
+            build: BuildConfig {
+                workspace_root: root.join("workspaces"),
+                max_timeout_sec: 10,
+                max_output_bytes: 1024 * 1024,
+                run_as_user: None,
+                run_as_group: None,
+            },
+            tasks: HashMap::from([("managed".to_string(), task)]),
+            sources: SourcesConfig::default(),
+            artifacts: ArtifactsConfig {
+                storage_root: root.join("artifacts"),
+                ..ArtifactsConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_tears_down_known_sessions_and_root_cleans_drift() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("task.sh");
+        let teardown_log = temp.path().join("teardown.log");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n[ \"${{1:-}}\" = teardown ] && echo teardown >> '{}'\n",
+                teardown_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Arc::new(test_config(temp.path(), &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new(Arc::clone(&config)).unwrap();
+        prepare_protected_directory(manager.metadata_root()).unwrap();
+
+        for (id, task) in [("ses_known", "managed"), ("ses_drift", "removed")] {
+            let workspace = manager.session_workspace(id);
+            fs::create_dir(&workspace).unwrap();
+            fs::write(workspace.join("state"), "x").unwrap();
+            manager
+                .write_metadata(&DurableSessionMetadata {
+                    version: METADATA_VERSION,
+                    session_id: id.to_string(),
+                    task_id: task.to_string(),
+                })
+                .unwrap();
+        }
+        let orphan = manager.session_workspace("ses_orphan");
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join("partial"), "x").unwrap();
+        drop(manager);
+
+        let reconciled = SessionManager::new(config).unwrap();
+        assert_eq!(reconciled.active_count(), 0);
+        assert!(!reconciled.session_workspace("ses_known").exists());
+        assert!(!reconciled.session_workspace("ses_drift").exists());
+        assert!(!reconciled.session_workspace("ses_orphan").exists());
+        assert_eq!(fs::read_to_string(teardown_log).unwrap().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn maximum_validated_lifetime_reservation_does_not_overflow_instant() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = test_config(temp.path(), &executable);
+        config.service.http.enabled = true;
+        let session = config
+            .tasks
+            .get_mut("managed")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap();
+        session.idle_timeout_sec = MAX_SESSION_LIFETIME_SEC - 1;
+        session.max_lifetime_sec = MAX_SESSION_LIFETIME_SEC;
+        config.validate().expect("maximum session lifetime");
+        let config = Arc::new(config);
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new(Arc::clone(&config)).unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let task = config.tasks.get("managed").unwrap().clone();
+        let reservation = manager.reserve(
+            ValidatedRequest {
+                request_id: None,
+                task_id: "managed".to_string(),
+                task,
+            },
+            permit,
+        );
+        assert!(reservation.remaining_lifetime() > Duration::from_secs(1));
+        manager.cancel_upload(&reservation);
+    }
+
+    #[test]
+    fn protected_metadata_rejects_permissive_directory_actual_and_dangling_symlinks() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("task.sh");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let permissive = temp.path().join("permissive");
+        let config = Arc::new(test_config(&permissive, &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let metadata_root = config.build.workspace_root.join(METADATA_DIRECTORY);
+        fs::create_dir(&metadata_root).unwrap();
+        fs::set_permissions(&metadata_root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(SessionManager::new(config).is_err());
+
+        let linked = temp.path().join("linked");
+        let config = Arc::new(test_config(&linked, &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let target = linked.join("metadata-target");
+        fs::create_dir_all(&target).unwrap();
+        symlink(
+            &target,
+            config.build.workspace_root.join(METADATA_DIRECTORY),
+        )
+        .unwrap();
+        assert!(SessionManager::new(config).is_err());
+
+        let dangling = temp.path().join("dangling");
+        let config = Arc::new(test_config(&dangling, &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        symlink(
+            dangling.join("missing-target"),
+            config.build.workspace_root.join(METADATA_DIRECTORY),
+        )
+        .unwrap();
+        assert!(SessionManager::new(config).is_err());
+    }
+}

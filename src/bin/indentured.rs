@@ -2,10 +2,14 @@ use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::future::{pending, poll_fn, Future};
 use std::io::{self, BufWriter, Read as _, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::process::ExitCode;
+use std::task::Poll;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand};
@@ -15,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::io::ReaderStream;
 
 use indentured_server::bearer_token::{BearerToken, MAX_BEARER_TOKEN_FILE_BYTES};
@@ -23,8 +28,11 @@ use indentured_server::client_source::{
     SourceIdentity, SourceManifest,
 };
 use indentured_server::protocol::{
-    ArtifactArchive, ArtifactRestrictions, BuildPhase, PhaseResult, Request, ResponseEvent,
-    SourceFormat, SourceMetadata, REQUEST_SCHEMA_VERSION,
+    valid_action_id, valid_session_id, valid_task_id, ArtifactArchive, ArtifactRestrictions,
+    BuildPhase, PhaseResult, Request, ResponseEvent, SessionActionEvent, SessionActionRequest,
+    SessionActionStatus, SessionStartEvent, SessionStartRequest, SessionStartStatus,
+    SessionStopResponse, SessionTeardownResult, SourceFormat, SourceMetadata,
+    MAX_SESSION_ACTION_BODY_BYTES, REQUEST_SCHEMA_VERSION, SESSION_REQUEST_SCHEMA_VERSION,
 };
 use indentured_server::validation::validate_relative_pattern;
 
@@ -40,6 +48,87 @@ const SOURCES_ENV: &str = "INDENTURED_SERVER_SOURCES";
 const SOURCES_EXCLUDE_ENV: &str = "INDENTURED_SERVER_SOURCES_EXCLUDE";
 const STDOUT_MAX_LINES_ENV: &str = "INDENTURED_SERVER_STDOUT_MAX_LINES";
 const STDERR_MAX_LINES_ENV: &str = "INDENTURED_SERVER_STDERR_MAX_LINES";
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InterruptState {
+    Pending,
+    Triggered,
+    Completed,
+    Unavailable,
+}
+
+struct InterruptControl {
+    state: InterruptState,
+    signal: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
+}
+
+impl InterruptControl {
+    async fn install() -> Self {
+        let mut control = Self {
+            state: InterruptState::Pending,
+            signal: Box::pin(tokio::signal::ctrl_c()),
+        };
+        // Poll in the controlling task now, rather than relying on a spawned
+        // listener to be scheduled later, so the OS handler is installed
+        // before any session preparation starts.
+        let _ = control.poll_pending().await;
+        control
+    }
+
+    async fn poll_pending(&mut self) -> bool {
+        if self.state == InterruptState::Triggered {
+            return true;
+        }
+        if self.state != InterruptState::Pending {
+            return false;
+        }
+        let signal = &mut self.signal;
+        let observed = poll_fn(|cx| match signal.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await;
+        if let Some(result) = observed {
+            self.state = if result.is_ok() {
+                InterruptState::Triggered
+            } else {
+                InterruptState::Unavailable
+            };
+        }
+        self.state == InterruptState::Triggered
+    }
+
+    async fn claim_completion(&mut self) -> bool {
+        if self.poll_pending().await {
+            return false;
+        }
+        if matches!(
+            self.state,
+            InterruptState::Pending | InterruptState::Unavailable
+        ) {
+            self.state = InterruptState::Completed;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn interrupted(&mut self) {
+        if self.state == InterruptState::Triggered {
+            return;
+        }
+        if self.state != InterruptState::Pending {
+            pending::<()>().await;
+        }
+        self.state = if self.signal.as_mut().await.is_ok() {
+            InterruptState::Triggered
+        } else {
+            InterruptState::Unavailable
+        };
+        if self.state != InterruptState::Triggered {
+            pending::<()>().await;
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Client for the indentured-server daemon")]
@@ -61,6 +150,71 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run(RunArgs),
+    Session(SessionArgs),
+}
+
+#[derive(Clone, Debug, Parser)]
+struct SessionArgs {
+    #[command(subcommand)]
+    command: SessionCommands,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum SessionCommands {
+    Start(SessionStartArgs),
+    Action(SessionActionArgs),
+    Stop(SessionStopArgs),
+}
+
+#[derive(Clone, Debug, Parser)]
+struct SessionStartArgs {
+    #[arg(long = "source", action = ArgAction::Append)]
+    source: Vec<String>,
+
+    #[arg(long = "source-exclude", action = ArgAction::Append)]
+    source_exclude: Vec<String>,
+
+    #[arg(long)]
+    request_id: Option<String>,
+
+    #[arg(
+        long,
+        help = "Absolute directory under which a unique session result is created"
+    )]
+    result_root: Option<PathBuf>,
+
+    #[arg(required = true)]
+    task: String,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct SessionActionArgs {
+    #[arg(required = true)]
+    session: String,
+
+    #[arg(required = true)]
+    action: String,
+
+    #[arg(long, required = true, value_name = "FILE_OR_DASH")]
+    input: String,
+
+    #[arg(
+        long,
+        help = "Absolute directory under which a unique action result is created"
+    )]
+    result_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct SessionStopArgs {
+    #[arg(required = true)]
+    session: String,
+
+    #[arg(
+        long,
+        help = "Absolute directory under which a unique stop result is created"
+    )]
+    result_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -143,13 +297,16 @@ enum Endpoint {
 #[derive(Debug)]
 enum BuildError {
     ConnectionFailed(String),
+    TimedOut(String),
     Other(String),
 }
 
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildError::ConnectionFailed(msg) | BuildError::Other(msg) => write!(f, "{msg}"),
+            BuildError::ConnectionFailed(msg)
+            | BuildError::TimedOut(msg)
+            | BuildError::Other(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -285,17 +442,30 @@ impl OutputLimiter {
         self.stdout.write_chunk(data, &mut stdout)
     }
 
+    fn write_stdout_as_diagnostic(&mut self, data: &str) -> io::Result<()> {
+        let mut stderr = io::stderr();
+        self.stdout.write_chunk(data, &mut stderr)
+    }
+
     fn write_stderr(&mut self, data: &str) -> io::Result<()> {
         let mut stderr = io::stderr();
         self.stderr.write_chunk(data, &mut stderr)
     }
 
     fn finish(&mut self) -> io::Result<()> {
+        self.finish_routed(false)
+    }
+
+    fn finish_routed(&mut self, stdout_to_stderr: bool) -> io::Result<()> {
         self.stdout.finish();
         self.stderr.finish();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        self.stdout.write_summary(&mut stdout, "stdout")?;
+        if stdout_to_stderr {
+            self.stdout.write_summary(&mut stderr, "stdout")?;
+        } else {
+            self.stdout.write_summary(&mut stdout, "stdout")?;
+        }
         self.stderr.write_summary(&mut stderr, "stderr")?;
         stdout.flush()?;
         stderr.flush()?;
@@ -570,6 +740,15 @@ impl LogCaptureState {
         event: BufferedStreamEvent,
         output: &mut OutputLimiter,
     ) -> io::Result<()> {
+        self.process_event_routed(event, output, false)
+    }
+
+    fn process_event_routed(
+        &mut self,
+        event: BufferedStreamEvent,
+        output: &mut OutputLimiter,
+        stdout_to_stderr: bool,
+    ) -> io::Result<()> {
         if let Some(sink) = self.sink.as_mut() {
             let log_result = match &event {
                 BufferedStreamEvent::Stdout(data) => sink.write_stdout(data),
@@ -583,7 +762,14 @@ impl LogCaptureState {
             }
         }
 
-        write_event_to_terminal(event, output)
+        if stdout_to_stderr {
+            match event {
+                BufferedStreamEvent::Stdout(data) => output.write_stdout_as_diagnostic(&data),
+                BufferedStreamEvent::Stderr(data) => output.write_stderr(&data),
+            }
+        } else {
+            write_event_to_terminal(event, output)
+        }
     }
 
     fn completion_paths(&self) -> Option<&StreamLogPaths> {
@@ -765,6 +951,173 @@ impl RunEvidence {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct SessionProvenance {
+    schema_version: u32,
+    invocation_id: String,
+    operation: String,
+    status: String,
+    result_path: PathBuf,
+    started_at: String,
+    finished_at: Option<String>,
+    session_id: Option<String>,
+    action: Option<String>,
+    action_id: Option<String>,
+    source: Option<SourceIdentity>,
+    remote_exit_code: Option<i32>,
+    timed_out: Option<bool>,
+    phases: Vec<PhaseResult>,
+    teardown: Option<SessionTeardownResult>,
+    artifact_restrictions: Option<ArtifactRestrictions>,
+    cleanup_status: Option<String>,
+    errors: Vec<String>,
+}
+
+struct SessionEvidence {
+    base: PathBuf,
+    directory: PathBuf,
+    provenance: SessionProvenance,
+    persistence_failure: Option<String>,
+}
+
+impl SessionEvidence {
+    fn create(
+        operation: &str,
+        session_id: Option<&str>,
+        action: Option<&str>,
+        explicit_root: Option<&Path>,
+        source_root: Option<&Path>,
+    ) -> io::Result<Self> {
+        let requested_base = resolve_result_root(explicit_root)?;
+        if let Some(source_root) = source_root {
+            let intended_base = canonicalize_intended(&requested_base)?;
+            reject_overlap(source_root, &intended_base)?;
+        }
+        fs::create_dir_all(&requested_base)?;
+        let base = fs::canonicalize(&requested_base)?;
+        if let Some(source_root) = source_root {
+            reject_overlap(source_root, &base)?;
+        }
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        let directory = base.join(&invocation_id);
+        fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(&directory)?;
+        for name in ["stdout.log", "stderr.log"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join(name))?;
+        }
+        let provenance = SessionProvenance {
+            schema_version: 1,
+            invocation_id,
+            operation: operation.to_string(),
+            status: "preparing".to_string(),
+            result_path: directory.clone(),
+            started_at: now_string(),
+            finished_at: None,
+            session_id: session_id.map(ToString::to_string),
+            action: action.map(ToString::to_string),
+            action_id: None,
+            source: None,
+            remote_exit_code: None,
+            timed_out: None,
+            phases: Vec::new(),
+            teardown: None,
+            artifact_restrictions: None,
+            cleanup_status: None,
+            errors: Vec::new(),
+        };
+        let evidence = Self {
+            base,
+            directory,
+            provenance,
+            persistence_failure: None,
+        };
+        evidence.write_provenance()?;
+        eprintln!("{OUTPUT_PREFIX} results: {}", evidence.directory.display());
+        Ok(evidence)
+    }
+
+    fn write_manifest(&self, manifest: &SourceManifest) -> io::Result<()> {
+        let data = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
+        if data.len() > 16 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source manifest exceeds 16 MiB",
+            ));
+        }
+        write_new_private(&self.directory.join("source-manifest.json"), &data)
+    }
+
+    fn write_provenance(&self) -> io::Result<()> {
+        let data = serde_json::to_vec_pretty(&self.provenance).map_err(io::Error::other)?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".provenance-")
+            .tempfile_in(&self.directory)?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        temp.write_all(&data)?;
+        temp.as_file().sync_all()?;
+        temp.persist(self.directory.join("provenance.json"))
+            .map_err(|err| err.error)?;
+        Ok(())
+    }
+
+    fn record_persistence(&mut self, result: io::Result<()>) -> io::Result<()> {
+        if let Err(err) = result {
+            let message = format!("provenance persistence failed: {err}");
+            self.persistence_failure.get_or_insert(message);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn set_status(&mut self, status: &str) -> io::Result<()> {
+        self.provenance.status = status.to_string();
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+
+    fn set_session_id(&mut self, session_id: &str) -> io::Result<()> {
+        self.provenance.session_id = Some(session_id.to_string());
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+
+    fn set_action_id(&mut self, action_id: &str) -> io::Result<()> {
+        self.provenance.action_id = Some(action_id.to_string());
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+
+    fn set_cleanup_status(&mut self, status: String) -> io::Result<()> {
+        self.provenance.cleanup_status = Some(status);
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+
+    fn finish(&mut self, status: &str) -> io::Result<()> {
+        self.provenance.status = status.to_string();
+        self.provenance.finished_at = Some(now_string());
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+
+    fn error(&mut self, message: impl Into<String>) -> io::Result<()> {
+        if self.provenance.errors.len() < 32 {
+            let mut message = message.into();
+            truncate_utf8(&mut message, 4096);
+            self.provenance.errors.push(message);
+        }
+        let result = self.write_provenance();
+        self.record_persistence(result)
+    }
+}
+
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
     let mut end = value.len().min(max_bytes);
     while !value.is_char_boundary(end) {
@@ -880,6 +1233,18 @@ fn reject_credential_overlap(
     Ok(())
 }
 
+fn reject_credential_result_overlap(credential: &Path, result_base: &Path) -> io::Result<()> {
+    let credential = fs::canonicalize(credential)?;
+    let result_base = fs::canonicalize(result_base)?;
+    if credential.starts_with(&result_base) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential file must be outside the configured result-root base",
+        ));
+    }
+    Ok(())
+}
+
 fn write_new_private(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -888,6 +1253,67 @@ fn write_new_private(path: &Path, data: &[u8]) -> io::Result<()> {
         .open(path)?;
     file.write_all(data)?;
     file.sync_all()
+}
+
+struct PreparedSession {
+    evidence: SessionEvidence,
+    source_root: Option<PathBuf>,
+}
+
+struct SessionCommandContext {
+    interrupt: InterruptControl,
+    endpoint_arg: Option<String>,
+    token_file_arg: Option<PathBuf>,
+    invocation_dir: PathBuf,
+    filesystem_root: PathBuf,
+    client_config: ClientConfig,
+    config_loaded: bool,
+}
+
+fn prepare_session_evidence(
+    command: &SessionCommands,
+    invocation_dir: &Path,
+    filesystem_root: &Path,
+) -> io::Result<PreparedSession> {
+    match command {
+        SessionCommands::Start(args) => {
+            let source_root = match find_jj_root(invocation_dir)? {
+                Some(root) => root,
+                None => fs::canonicalize(filesystem_root)?,
+            };
+            let evidence = SessionEvidence::create(
+                "start",
+                None,
+                None,
+                args.result_root.as_deref(),
+                Some(&source_root),
+            )?;
+            Ok(PreparedSession {
+                evidence,
+                source_root: Some(source_root),
+            })
+        }
+        SessionCommands::Action(args) => Ok(PreparedSession {
+            evidence: SessionEvidence::create(
+                "action",
+                Some(&args.session),
+                Some(&args.action),
+                args.result_root.as_deref(),
+                None,
+            )?,
+            source_root: None,
+        }),
+        SessionCommands::Stop(args) => Ok(PreparedSession {
+            evidence: SessionEvidence::create(
+                "stop",
+                Some(&args.session),
+                None,
+                args.result_root.as_deref(),
+                None,
+            )?,
+            source_root: None,
+        }),
+    }
 }
 
 #[tokio::main]
@@ -902,6 +1328,11 @@ async fn main() -> ExitCode {
         }
     };
 
+    let mut session_interrupt = match &cli.command {
+        Commands::Session(_) => Some(InterruptControl::install().await),
+        Commands::Run(_) => None,
+    };
+
     let config_path = find_client_config_path(&run_dir);
     let repo_root = config_path
         .as_ref()
@@ -909,18 +1340,142 @@ async fn main() -> ExitCode {
         .and_then(|path| path.parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| run_dir.clone());
-    let client_config = match load_client_config(config_path.as_deref()) {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::from(1);
+    let mut prepared_session = match &cli.command {
+        Commands::Session(args) => {
+            let command = args.command.clone();
+            let invocation_dir = run_dir.clone();
+            let filesystem_root = repo_root.clone();
+            let mut preparation = tokio::task::spawn_blocking(move || {
+                prepare_session_evidence(&command, &invocation_dir, &filesystem_root)
+            });
+            let (interrupted, preparation_result) = tokio::select! {
+                biased;
+                _ = session_interrupt.as_mut().expect("session interrupt installed").interrupted() => (true, preparation.await),
+                result = &mut preparation => (false, result),
+            };
+            let prepared = match preparation_result {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(err)) => {
+                    eprintln!("failed to create session evidence: {err}");
+                    return ExitCode::from(1);
+                }
+                Err(err) => {
+                    eprintln!("session evidence worker failed: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+            if interrupted {
+                let mut prepared = prepared;
+                return finish_early_interrupted(
+                    &mut prepared.evidence,
+                    "interrupted during session preparation",
+                );
+            }
+            Some(prepared)
+        }
+        Commands::Run(_) => None,
+    };
+    let client_config = if prepared_session.is_some() {
+        let loading_path = config_path.clone();
+        let mut loading =
+            tokio::task::spawn_blocking(move || load_client_config(loading_path.as_deref()));
+        let (interrupted, loading_result) = tokio::select! {
+            biased;
+            _ = session_interrupt.as_mut().expect("session interrupt installed").interrupted() => (true, loading.await),
+            result = &mut loading => (false, result),
+        };
+        let loaded = match loading_result {
+            Ok(result) => result,
+            Err(err) => {
+                return finish_session_failure_elected(
+                    prepared_session
+                        .take()
+                        .expect("session evidence prepared")
+                        .evidence,
+                    format!("client configuration worker failed: {err}"),
+                    false,
+                    session_interrupt
+                        .as_mut()
+                        .expect("session interrupt installed"),
+                )
+                .await;
+            }
+        };
+        if interrupted {
+            return finish_early_interrupted(
+                &mut prepared_session
+                    .as_mut()
+                    .expect("session evidence prepared")
+                    .evidence,
+                "interrupted while loading client configuration",
+            );
+        }
+        match loaded {
+            Ok(config) => config,
+            Err(err) => {
+                return finish_session_failure_elected(
+                    prepared_session
+                        .take()
+                        .expect("session evidence prepared")
+                        .evidence,
+                    format!("failed to load client configuration: {err}"),
+                    false,
+                    session_interrupt
+                        .as_mut()
+                        .expect("session interrupt installed"),
+                )
+                .await;
+            }
+        }
+    } else {
+        match load_client_config(config_path.as_deref()) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
         }
     };
     let config_loaded = config_path.is_some();
+    if let Some(interrupt) = session_interrupt.as_mut() {
+        if interrupt.poll_pending().await {
+            return finish_early_interrupted(
+                &mut prepared_session
+                    .as_mut()
+                    .expect("session evidence prepared")
+                    .evidence,
+                "interrupted after client configuration",
+            );
+        }
+    }
 
     let connection = client_config.connection.as_ref();
     if !resolve_connection_enabled(connection) {
-        eprintln!("{OUTPUT_PREFIX} disabled (INDENTURED_SERVER_ENABLED/connection.enabled)");
+        if let Some(interrupt) = session_interrupt.as_mut() {
+            if interrupt.poll_pending().await {
+                return finish_early_interrupted(
+                    &mut prepared_session
+                        .as_mut()
+                        .expect("session evidence prepared")
+                        .evidence,
+                    "interrupted before session dispatch",
+                );
+            }
+        }
+        let message =
+            format!("{OUTPUT_PREFIX} disabled (INDENTURED_SERVER_ENABLED/connection.enabled)");
+        if let Some(prepared) = prepared_session.take() {
+            return finish_session_failure_elected(
+                prepared.evidence,
+                message,
+                true,
+                session_interrupt
+                    .as_mut()
+                    .expect("session interrupt installed"),
+            )
+            .await;
+        }
+        eprintln!("{message}");
         return ExitCode::from(CONNECTION_FALLBACK_EXIT_CODE);
     }
 
@@ -934,6 +1489,24 @@ async fn main() -> ExitCode {
                 repo_root,
                 client_config,
                 config_loaded,
+            )
+            .await
+        }
+        Commands::Session(args) => {
+            session_command(
+                args.command,
+                prepared_session.expect("session evidence prepared"),
+                SessionCommandContext {
+                    interrupt: session_interrupt
+                        .take()
+                        .expect("session interrupt installed"),
+                    endpoint_arg: cli.endpoint,
+                    token_file_arg: cli.token_file,
+                    invocation_dir: run_dir,
+                    filesystem_root: repo_root,
+                    client_config,
+                    config_loaded,
+                },
             )
             .await
         }
@@ -1170,6 +1743,7 @@ async fn run_command(
                 BuildError::ConnectionFailed(_) => ExitCode::from(connection_failure_exit_code(
                     connection.map(|c| c.local_fallback).unwrap_or(false),
                 )),
+                BuildError::TimedOut(_) => ExitCode::from(124),
                 BuildError::Other(_) => ExitCode::from(1),
             };
         }
@@ -1200,6 +1774,1092 @@ async fn run_command(
     to_exit_code(build.exit_code, build.timed_out)
 }
 
+async fn session_command(
+    command: SessionCommands,
+    prepared: PreparedSession,
+    context: SessionCommandContext,
+) -> ExitCode {
+    let PreparedSession {
+        evidence,
+        source_root,
+    } = prepared;
+    match command {
+        SessionCommands::Start(args) => {
+            session_start_command(
+                args,
+                evidence,
+                source_root.expect("start source root prepared"),
+                context,
+            )
+            .await
+        }
+        SessionCommands::Action(args) => session_action_command(args, evidence, context).await,
+        SessionCommands::Stop(args) => session_stop_command(args, evidence, context).await,
+    }
+}
+
+async fn session_start_command(
+    args: SessionStartArgs,
+    mut evidence: SessionEvidence,
+    source_root: PathBuf,
+    context: SessionCommandContext,
+) -> ExitCode {
+    let SessionCommandContext {
+        mut interrupt,
+        endpoint_arg,
+        token_file_arg,
+        invocation_dir,
+        filesystem_root,
+        client_config,
+        config_loaded,
+    } = context;
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted before source preparation");
+    }
+    let connection = client_config.connection.as_ref();
+    let source_patterns = match resolve_patterns(
+        &client_config.sources,
+        SOURCES_ENV,
+        &args.source,
+        SOURCES_EXCLUDE_ENV,
+        &args.source_exclude,
+    ) {
+        Ok(patterns) => patterns,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    if let Err(err) = validate_patterns(&source_patterns, "sources") {
+        return finish_session_failure(&mut evidence, err.to_string(), false);
+    }
+    if let Some(path) = selected_token_path(token_file_arg.clone(), connection) {
+        if path.exists() {
+            if let Err(err) = reject_credential_overlap(&path, &source_root, &evidence.base) {
+                return finish_session_failure(&mut evidence, err.to_string(), false);
+            }
+        }
+    }
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    let token = match resolve_token(token_file_arg, connection) {
+        Ok(token) => token,
+        Err(err) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("failed to load bearer credential: {err}"),
+                false,
+            )
+        }
+    };
+    let output_limits =
+        match resolve_output_limits(client_config.output.as_ref(), &evidence.directory) {
+            Ok(limits) => limits,
+            Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+        };
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted during source preparation");
+    }
+    let patterns = FilesystemPatterns {
+        include: source_patterns.include,
+        exclude: source_patterns.exclude,
+    };
+    let cancellation = SourceCancellation::new();
+    let packaging_cancellation = cancellation.clone();
+    let packaging_invocation = invocation_dir;
+    let packaging_root = filesystem_root;
+    let packaging_temp = evidence.directory.clone();
+    let mut packaging = tokio::task::spawn_blocking(move || {
+        package_source_cancellable(
+            &packaging_invocation,
+            &packaging_root,
+            &patterns,
+            &packaging_temp,
+            &packaging_cancellation,
+        )
+    });
+    let package = tokio::select! {
+        biased;
+        _ = interrupt.interrupted() => {
+            cancellation.cancel();
+            match tokio::time::timeout(Duration::from_secs(7), &mut packaging).await {
+                Ok(Ok(Err(err))) if err.kind() != io::ErrorKind::Interrupted || err.to_string().contains("cleanup") => {
+                    let _ = evidence.error(format!("source cleanup after interruption failed: {err}"));
+                }
+                Ok(Err(err)) => { let _ = evidence.error(format!("source cleanup worker failed after interruption: {err}")); }
+                Err(_) => { packaging.abort(); let _ = evidence.error("source cleanup did not finish within 7 seconds after interruption"); }
+                _ => {}
+            }
+            return finish_early_interrupted(
+                &mut evidence,
+                "interrupted during source preparation",
+            );
+        }
+        result = &mut packaging => match result {
+            Ok(Ok(package)) => package,
+            Ok(Err(err)) => return finish_session_failure(&mut evidence, format!("failed to package sources: {err}"), false),
+            Err(err) => return finish_session_failure(&mut evidence, format!("source packaging worker failed: {err}"), false),
+        },
+    };
+    evidence.provenance.source = Some(package.identity.clone());
+    if let Err(err) = evidence.write_manifest(&package.manifest) {
+        return finish_session_failure(
+            &mut evidence,
+            format!("failed to write source manifest: {err}"),
+            false,
+        );
+    }
+    let request = SessionStartRequest {
+        schema_version: SESSION_REQUEST_SCHEMA_VERSION.to_string(),
+        request_id: args
+            .request_id
+            .or_else(|| Some(evidence.provenance.invocation_id.clone())),
+        task: args.task,
+        source: SourceMetadata {
+            format: SourceFormat::Zip,
+        },
+    };
+    if let Err(err) = evidence.set_status("running") {
+        return provenance_failure(&mut evidence, err);
+    }
+    let (observed_sender, mut observed_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut observed_session_id = None;
+    let controlled = {
+        let remote = run_session_start(
+            &request,
+            &package.archive,
+            &endpoint,
+            token.as_deref(),
+            &output_limits,
+            observed_sender,
+        );
+        tokio::pin!(remote);
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = interrupt.interrupted() => Controlled::Interrupted,
+                Some(session_id) = observed_receiver.recv() => {
+                    if observed_session_id.is_none() {
+                        observed_session_id = Some(session_id.clone());
+                        match evidence.set_session_id(&session_id) {
+                            Ok(()) => continue,
+                            Err(err) => Controlled::Provenance(err),
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                result = &mut remote => Controlled::Completed(result),
+            };
+            break event;
+        }
+    };
+    let outcome = match controlled {
+        Controlled::Completed(outcome) => {
+            while let Ok(session_id) = observed_receiver.try_recv() {
+                if observed_session_id.is_none() {
+                    observed_session_id = Some(session_id.clone());
+                    if let Err(err) = evidence.set_session_id(&session_id) {
+                        let _ = record_best_effort_stop(
+                            &mut evidence,
+                            &session_id,
+                            &endpoint,
+                            token.as_deref(),
+                        )
+                        .await;
+                        return provenance_failure(&mut evidence, err);
+                    }
+                }
+            }
+            outcome
+        }
+        Controlled::Interrupted => {
+            while let Ok(session_id) = observed_receiver.try_recv() {
+                if observed_session_id.is_none() {
+                    observed_session_id = Some(session_id.clone());
+                    let _ = evidence.set_session_id(&session_id);
+                }
+            }
+            if let Some(session_id) = observed_session_id.as_deref() {
+                return finish_interrupted_session(
+                    &mut evidence,
+                    session_id,
+                    &endpoint,
+                    token.as_deref(),
+                    "interrupted during session initialization",
+                )
+                .await;
+            }
+            return finish_early_interrupted(
+                &mut evidence,
+                "interrupted; remote request disconnected",
+            );
+        }
+        Controlled::Provenance(err) => {
+            if let Some(session_id) = observed_session_id.as_deref() {
+                let _ =
+                    record_best_effort_stop(&mut evidence, session_id, &endpoint, token.as_deref())
+                        .await;
+            }
+            return provenance_failure(&mut evidence, err);
+        }
+    };
+    match outcome {
+        Ok(result) => {
+            evidence.provenance.remote_exit_code = Some(result.exit_code);
+            evidence.provenance.timed_out = Some(result.timed_out);
+            evidence.provenance.phases = result.phases;
+            for error in result.errors {
+                let _ = evidence.error(error);
+            }
+            if let Some(session_id) = result.session_id {
+                if observed_session_id.as_deref() != Some(session_id.as_str()) {
+                    let message = "Ready session identity was not durably observed".to_string();
+                    let _ = record_best_effort_stop(
+                        &mut evidence,
+                        &session_id,
+                        &endpoint,
+                        token.as_deref(),
+                    )
+                    .await;
+                    return finish_session_failure(&mut evidence, message, false);
+                }
+                if interrupt.poll_pending().await {
+                    return finish_interrupted_session(
+                        &mut evidence,
+                        &session_id,
+                        &endpoint,
+                        token.as_deref(),
+                        "interrupted before final Ready provenance",
+                    )
+                    .await;
+                }
+                match finish_evidence_controlled(evidence, "ready", &mut interrupt).await {
+                    ControlledEvidence::Interrupted(returned) => {
+                        evidence = returned;
+                        return finish_interrupted_session(
+                            &mut evidence,
+                            &session_id,
+                            &endpoint,
+                            token.as_deref(),
+                            "interrupted during final Ready provenance",
+                        )
+                        .await;
+                    }
+                    ControlledEvidence::Completed(returned, result) => {
+                        evidence = returned;
+                        if let Err(err) = result {
+                            let _ = record_best_effort_stop(
+                                &mut evidence,
+                                &session_id,
+                                &endpoint,
+                                token.as_deref(),
+                            )
+                            .await;
+                            return provenance_failure(&mut evidence, err);
+                        }
+                    }
+                }
+                if interrupt.poll_pending().await {
+                    return finish_interrupted_session(
+                        &mut evidence,
+                        &session_id,
+                        &endpoint,
+                        token.as_deref(),
+                        "interrupted before session ID output",
+                    )
+                    .await;
+                }
+                match emit_session_id_controlled(&session_id, &mut interrupt).await {
+                    ControlledIo::Interrupted => {
+                        return finish_interrupted_session(
+                            &mut evidence,
+                            &session_id,
+                            &endpoint,
+                            token.as_deref(),
+                            "interrupted during session ID output",
+                        )
+                        .await;
+                    }
+                    ControlledIo::Completed(Ok(())) => {}
+                    ControlledIo::Completed(Err(err)) => {
+                        let _ = record_best_effort_stop(
+                            &mut evidence,
+                            &session_id,
+                            &endpoint,
+                            token.as_deref(),
+                        )
+                        .await;
+                        return finish_session_failure(
+                            &mut evidence,
+                            format!("failed to emit session ID: {err}"),
+                            false,
+                        );
+                    }
+                }
+                evidence_exit(&evidence, 0)
+            } else {
+                if let Some(session_id) = observed_session_id.as_deref() {
+                    let _ = record_best_effort_stop(
+                        &mut evidence,
+                        session_id,
+                        &endpoint,
+                        token.as_deref(),
+                    )
+                    .await;
+                }
+                if let Err(err) = evidence.finish("failed") {
+                    return provenance_failure(&mut evidence, err);
+                }
+                evidence_exit(
+                    &evidence,
+                    normalize_requested_exit(result.exit_code, result.timed_out),
+                )
+            }
+        }
+        Err(err) => {
+            if let Some(session_id) = observed_session_id.as_deref() {
+                let _ =
+                    record_best_effort_stop(&mut evidence, session_id, &endpoint, token.as_deref())
+                        .await;
+            }
+            finish_remote_session_error(&mut evidence, err, connection)
+        }
+    }
+}
+
+async fn session_action_command(
+    args: SessionActionArgs,
+    mut evidence: SessionEvidence,
+    context: SessionCommandContext,
+) -> ExitCode {
+    let SessionCommandContext {
+        mut interrupt,
+        endpoint_arg,
+        token_file_arg,
+        client_config,
+        config_loaded,
+        ..
+    } = context;
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted before action preparation");
+    }
+    if !valid_session_id(&args.session) {
+        return finish_session_failure(&mut evidence, "invalid session ID".to_string(), false);
+    }
+    if !valid_task_id(&args.action) {
+        return finish_session_failure(&mut evidence, "invalid action name".to_string(), false);
+    }
+    let connection = client_config.connection.as_ref();
+    if let Some(path) = selected_token_path(token_file_arg.clone(), connection) {
+        if path.exists() {
+            if let Err(err) = reject_credential_result_overlap(&path, &evidence.base) {
+                return finish_session_failure(&mut evidence, err.to_string(), false);
+            }
+        }
+    }
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    let token = match resolve_token(token_file_arg, connection) {
+        Ok(token) => token,
+        Err(err) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("failed to load bearer credential: {err}"),
+                false,
+            )
+        }
+    };
+    let output_limits =
+        match resolve_output_limits(client_config.output.as_ref(), &evidence.directory) {
+            Ok(limits) => limits,
+            Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+        };
+    if let Err(err) = evidence.set_status("reading_input") {
+        return provenance_failure(&mut evidence, err);
+    }
+    let body = match read_action_input(&args.input, &mut interrupt).await {
+        Ok(Some(body)) => body,
+        Ok(None) => {
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted while reading action input",
+            )
+            .await
+        }
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    if let Err(err) = evidence.set_status("running") {
+        return provenance_failure(&mut evidence, err);
+    }
+    let (observed_sender, mut observed_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut observed_action_id = None;
+    let controlled = {
+        let remote = run_session_action(
+            &args.session,
+            &args.action,
+            body,
+            &endpoint,
+            token.as_deref(),
+            &output_limits,
+            observed_sender,
+        );
+        tokio::pin!(remote);
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = interrupt.interrupted() => Controlled::Interrupted,
+                Some(action_id) = observed_receiver.recv() => {
+                    if observed_action_id.is_none() {
+                        observed_action_id = Some(action_id.clone());
+                        match evidence.set_action_id(&action_id) {
+                            Ok(()) => continue,
+                            Err(err) => Controlled::Provenance(err),
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                result = &mut remote => Controlled::Completed(result),
+            };
+            break event;
+        }
+    };
+    let outcome = match controlled {
+        Controlled::Completed(outcome) => {
+            while let Ok(action_id) = observed_receiver.try_recv() {
+                if observed_action_id.is_none() {
+                    observed_action_id = Some(action_id.clone());
+                    if let Err(err) = evidence.set_action_id(&action_id) {
+                        let _ = record_best_effort_stop(
+                            &mut evidence,
+                            &args.session,
+                            &endpoint,
+                            token.as_deref(),
+                        )
+                        .await;
+                        return provenance_failure(&mut evidence, err);
+                    }
+                }
+            }
+            outcome
+        }
+        Controlled::Interrupted => {
+            while let Ok(action_id) = observed_receiver.try_recv() {
+                if observed_action_id.is_none() {
+                    observed_action_id = Some(action_id.clone());
+                    let _ = evidence.set_action_id(&action_id);
+                }
+            }
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted during action execution",
+            )
+            .await;
+        }
+        Controlled::Provenance(err) => {
+            let _ =
+                record_best_effort_stop(&mut evidence, &args.session, &endpoint, token.as_deref())
+                    .await;
+            return provenance_failure(&mut evidence, err);
+        }
+    };
+    let result = match outcome {
+        Ok(result) => result,
+        Err(err) => return finish_remote_session_error(&mut evidence, err, connection),
+    };
+    if observed_action_id.as_deref() != Some(result.action_id.as_str()) {
+        return finish_session_failure(
+            &mut evidence,
+            "action result identity was not durably observed".to_string(),
+            false,
+        );
+    }
+    evidence.provenance.remote_exit_code = Some(result.exit_code);
+    evidence.provenance.timed_out = Some(result.timed_out);
+    evidence.provenance.artifact_restrictions = result.artifact_restrictions.clone();
+    for error in &result.errors {
+        let _ = evidence.error(error.clone());
+    }
+    if let Some(restrictions) = &result.artifact_restrictions {
+        let _ = write_artifact_restrictions_notice(restrictions);
+    }
+    let artifact_error = if let Some(archive) = &result.artifacts {
+        let evidence_directory = evidence.directory.clone();
+        let downloaded = {
+            let download =
+                download_and_extract(archive, &endpoint, token.as_deref(), &evidence_directory);
+            tokio::pin!(download);
+            tokio::select! {
+                biased;
+                _ = interrupt.interrupted() => None,
+                result = &mut download => Some(result),
+            }
+        };
+        let Some(downloaded) = downloaded else {
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted while downloading action artifacts",
+            )
+            .await;
+        };
+        downloaded.err().map(|err| err.to_string())
+    } else {
+        None
+    };
+    let artifact_failed_success = artifact_error.is_some() && result.exit_code == 0;
+    if let Some(message) = artifact_error {
+        let _ = evidence.error(format!("artifact retrieval failed: {message}"));
+        eprintln!("failed to fetch action artifacts: {message}");
+    }
+    if interrupt.poll_pending().await {
+        return finish_interrupted_session(
+            &mut evidence,
+            &args.session,
+            &endpoint,
+            token.as_deref(),
+            "interrupted before final action provenance",
+        )
+        .await;
+    }
+    let status = if artifact_failed_success || result.exit_code != 0 || result.timed_out {
+        "failed"
+    } else {
+        "succeeded"
+    };
+    match finish_evidence_controlled(evidence, status, &mut interrupt).await {
+        ControlledEvidence::Interrupted(returned) => {
+            evidence = returned;
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted during final action provenance",
+            )
+            .await;
+        }
+        ControlledEvidence::Completed(returned, result) => {
+            evidence = returned;
+            if let Err(err) = result {
+                let _ = record_best_effort_stop(
+                    &mut evidence,
+                    &args.session,
+                    &endpoint,
+                    token.as_deref(),
+                )
+                .await;
+                return provenance_failure(&mut evidence, err);
+            }
+        }
+    }
+    if !interrupt.claim_completion().await {
+        return finish_interrupted_session(
+            &mut evidence,
+            &args.session,
+            &endpoint,
+            token.as_deref(),
+            "interrupted at action completion",
+        )
+        .await;
+    }
+    let requested = if artifact_failed_success {
+        1
+    } else {
+        normalize_requested_exit(result.exit_code, result.timed_out)
+    };
+    evidence_exit(&evidence, requested)
+}
+
+async fn session_stop_command(
+    args: SessionStopArgs,
+    mut evidence: SessionEvidence,
+    context: SessionCommandContext,
+) -> ExitCode {
+    let SessionCommandContext {
+        mut interrupt,
+        endpoint_arg,
+        token_file_arg,
+        client_config,
+        config_loaded,
+        ..
+    } = context;
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted before stop preparation");
+    }
+    if !valid_session_id(&args.session) {
+        return finish_session_failure(&mut evidence, "invalid session ID".to_string(), false);
+    }
+    let connection = client_config.connection.as_ref();
+    if let Some(path) = selected_token_path(token_file_arg.clone(), connection) {
+        if path.exists() {
+            if let Err(err) = reject_credential_result_overlap(&path, &evidence.base) {
+                return finish_session_failure(&mut evidence, err.to_string(), false);
+            }
+        }
+    }
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    let token = match resolve_token(token_file_arg, connection) {
+        Ok(token) => token,
+        Err(err) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("failed to load bearer credential: {err}"),
+                false,
+            )
+        }
+    };
+    if let Err(err) = evidence.set_status("running") {
+        return provenance_failure(&mut evidence, err);
+    }
+    let stopped = {
+        let request = request_session_stop(&args.session, &endpoint, token.as_deref());
+        tokio::pin!(request);
+        tokio::select! {
+            biased;
+            _ = interrupt.interrupted() => None,
+            response = &mut request => Some(response),
+        }
+    };
+    let Some(stopped) = stopped else {
+        return finish_interrupted_session(
+            &mut evidence,
+            &args.session,
+            &endpoint,
+            token.as_deref(),
+            "interrupted during session stop",
+        )
+        .await;
+    };
+    let response = match stopped {
+        Ok(response) => response,
+        Err(err) => return finish_remote_session_error(&mut evidence, err, connection),
+    };
+    if response.session_id != args.session {
+        return finish_session_failure(
+            &mut evidence,
+            "stop response had inconsistent session identity".to_string(),
+            false,
+        );
+    }
+    evidence.provenance.teardown = Some(response.teardown.clone());
+    evidence.provenance.artifact_restrictions = response.artifact_restrictions.clone();
+    if let Some(restrictions) = &response.artifact_restrictions {
+        let _ = write_artifact_restrictions_notice(restrictions);
+    }
+    let artifact_error = if let Some(archive) = &response.artifacts {
+        let evidence_directory = evidence.directory.clone();
+        let downloaded = {
+            let download =
+                download_and_extract(archive, &endpoint, token.as_deref(), &evidence_directory);
+            tokio::pin!(download);
+            tokio::select! {
+                biased;
+                _ = interrupt.interrupted() => None,
+                result = &mut download => Some(result),
+            }
+        };
+        let Some(downloaded) = downloaded else {
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted while downloading final artifacts",
+            )
+            .await;
+        };
+        downloaded.err().map(|err| err.to_string())
+    } else {
+        None
+    };
+    let code = response.teardown.exit_code.unwrap_or(1);
+    evidence.provenance.remote_exit_code = response.teardown.exit_code;
+    evidence.provenance.timed_out = Some(response.teardown.timed_out);
+    let artifact_failed_success = artifact_error.is_some()
+        && code == 0
+        && !response.teardown.timed_out
+        && response.teardown.error_code.is_none();
+    if let Some(message) = artifact_error {
+        let _ = evidence.error(format!("artifact retrieval failed: {message}"));
+        eprintln!("failed to fetch final artifacts: {message}");
+    }
+    if let Some(error_code) = &response.teardown.error_code {
+        let message = format!("teardown failed: {error_code}");
+        let _ = evidence.error(&message);
+        eprintln!("{message}");
+    }
+    eprintln!(
+        "{OUTPUT_PREFIX} teardown finished in {:.3}s (exit_code={}, timed_out={})",
+        response.teardown.duration_ms as f64 / 1000.0,
+        response
+            .teardown
+            .exit_code
+            .map_or_else(|| "none".to_string(), |code| code.to_string()),
+        response.teardown.timed_out
+    );
+    let succeeded = code == 0
+        && !response.teardown.timed_out
+        && response.teardown.error_code.is_none()
+        && !artifact_failed_success;
+    if interrupt.poll_pending().await {
+        return finish_interrupted_session(
+            &mut evidence,
+            &args.session,
+            &endpoint,
+            token.as_deref(),
+            "interrupted before final stop provenance",
+        )
+        .await;
+    }
+    let status = if succeeded { "succeeded" } else { "failed" };
+    match finish_evidence_controlled(evidence, status, &mut interrupt).await {
+        ControlledEvidence::Interrupted(returned) => {
+            evidence = returned;
+            return finish_interrupted_session(
+                &mut evidence,
+                &args.session,
+                &endpoint,
+                token.as_deref(),
+                "interrupted during final stop provenance",
+            )
+            .await;
+        }
+        ControlledEvidence::Completed(returned, result) => {
+            evidence = returned;
+            if let Err(err) = result {
+                return provenance_failure(&mut evidence, err);
+            }
+        }
+    }
+    if !interrupt.claim_completion().await {
+        return finish_interrupted_session(
+            &mut evidence,
+            &args.session,
+            &endpoint,
+            token.as_deref(),
+            "interrupted at stop completion",
+        )
+        .await;
+    }
+    let requested = if response.teardown.error_code.is_some() || artifact_failed_success {
+        1
+    } else {
+        normalize_requested_exit(code, response.teardown.timed_out)
+    };
+    evidence_exit(&evidence, requested)
+}
+
+async fn finish_session_failure_elected(
+    evidence: SessionEvidence,
+    message: String,
+    connection_failure: bool,
+    interrupt: &mut InterruptControl,
+) -> ExitCode {
+    let mut finalizing = tokio::task::spawn_blocking(move || {
+        let mut evidence = evidence;
+        let exit = finish_session_failure(&mut evidence, message, connection_failure);
+        (evidence, exit)
+    });
+    tokio::select! {
+        biased;
+        _ = interrupt.interrupted() => match finalizing.await {
+            Ok((mut evidence, _)) => finish_early_interrupted(
+                &mut evidence,
+                "interrupted while finalizing session failure",
+            ),
+            Err(err) => {
+                eprintln!("session failure provenance worker failed: {err}");
+                ExitCode::from(1)
+            }
+        },
+        result = &mut finalizing => match result {
+            Ok((_, exit)) => exit,
+            Err(err) => {
+                eprintln!("session failure provenance worker failed: {err}");
+                ExitCode::from(1)
+            }
+        },
+    }
+}
+
+fn finish_session_failure(
+    evidence: &mut SessionEvidence,
+    message: String,
+    connection_failure: bool,
+) -> ExitCode {
+    let _ = evidence.error(&message);
+    let _ = evidence.finish("failed");
+    eprintln!("{message}");
+    let code = if connection_failure {
+        CONNECTION_FALLBACK_EXIT_CODE
+    } else {
+        1
+    };
+    evidence_exit(evidence, code)
+}
+
+fn evidence_exit(evidence: &SessionEvidence, requested: u8) -> ExitCode {
+    if let Some(message) = &evidence.persistence_failure {
+        eprintln!("{OUTPUT_PREFIX} {message}");
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(requested)
+    }
+}
+
+fn provenance_failure(evidence: &mut SessionEvidence, err: io::Error) -> ExitCode {
+    evidence
+        .persistence_failure
+        .get_or_insert_with(|| format!("provenance persistence failed: {err}"));
+    evidence_exit(evidence, 1)
+}
+
+enum ControlledEvidence {
+    Completed(SessionEvidence, io::Result<()>),
+    Interrupted(SessionEvidence),
+}
+
+async fn finish_evidence_controlled(
+    evidence: SessionEvidence,
+    status: &str,
+    interrupt: &mut InterruptControl,
+) -> ControlledEvidence {
+    let status = status.to_string();
+    let mut writing = tokio::task::spawn_blocking(move || {
+        let mut evidence = evidence;
+        let result = evidence.finish(&status);
+        (evidence, result)
+    });
+    tokio::select! {
+        biased;
+        _ = interrupt.interrupted() => {
+            match writing.await {
+                Ok((evidence, _)) => ControlledEvidence::Interrupted(evidence),
+                Err(err) => panic!("final provenance worker failed: {err}"),
+            }
+        },
+        result = &mut writing => match result {
+            Ok((evidence, result)) => ControlledEvidence::Completed(evidence, result),
+            Err(err) => panic!("final provenance worker failed: {err}"),
+        },
+    }
+}
+
+enum ControlledIo {
+    Completed(io::Result<()>),
+    Interrupted,
+}
+
+struct NonblockingStdout {
+    file: fs::File,
+    original_flags: i32,
+}
+
+impl NonblockingStdout {
+    fn open() -> io::Result<Self> {
+        let descriptor = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(descriptor) };
+        let original_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if original_flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            file,
+            original_flags,
+        })
+    }
+
+    fn is_writable(&self) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if result >= 0 {
+                return Ok(result == 1);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
+    fn write_atomic(&self, bytes: &[u8]) -> io::Result<()> {
+        let written = unsafe {
+            libc::write(
+                self.as_raw_fd(),
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "partial session ID output",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsRawFd for NonblockingStdout {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+impl Drop for NonblockingStdout {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETFL, self.original_flags) };
+    }
+}
+
+async fn emit_session_id_controlled(
+    session_id: &str,
+    interrupt: &mut InterruptControl,
+) -> ControlledIo {
+    let output = match NonblockingStdout::open() {
+        Ok(output) => output,
+        Err(err) => return ControlledIo::Completed(Err(err)),
+    };
+    let mut bytes = session_id.as_bytes().to_vec();
+    bytes.push(b'\n');
+    if interrupt.poll_pending().await {
+        return ControlledIo::Interrupted;
+    }
+    match output.is_writable() {
+        Ok(true) => {
+            if !interrupt.claim_completion().await {
+                return ControlledIo::Interrupted;
+            }
+            return ControlledIo::Completed(output.write_atomic(&bytes));
+        }
+        Ok(false) => {}
+        Err(err) => return ControlledIo::Completed(Err(err)),
+    }
+    let output = match tokio::io::unix::AsyncFd::new(output) {
+        Ok(output) => output,
+        Err(err) => {
+            if interrupt.poll_pending().await {
+                return ControlledIo::Interrupted;
+            }
+            return ControlledIo::Completed(Err(err));
+        }
+    };
+    loop {
+        if interrupt.poll_pending().await {
+            return ControlledIo::Interrupted;
+        }
+        match output.get_ref().is_writable() {
+            Ok(true) => {
+                if !interrupt.claim_completion().await {
+                    return ControlledIo::Interrupted;
+                }
+                return ControlledIo::Completed(output.get_ref().write_atomic(&bytes));
+            }
+            Ok(false) => {}
+            Err(err) => return ControlledIo::Completed(Err(err)),
+        }
+        let readiness = tokio::select! {
+            biased;
+            _ = interrupt.interrupted() => return ControlledIo::Interrupted,
+            readiness = output.writable() => readiness,
+        };
+        match readiness {
+            Ok(mut readiness) => readiness.clear_ready(),
+            Err(err) => return ControlledIo::Completed(Err(err)),
+        }
+    }
+}
+
+fn finish_early_interrupted(evidence: &mut SessionEvidence, message: &str) -> ExitCode {
+    if evidence.provenance.operation == "start" && evidence.provenance.session_id.is_none() {
+        let _ = evidence.set_cleanup_status("not attempted: session ID unavailable".to_string());
+    }
+    let _ = evidence.error(message.to_string());
+    let _ = evidence.finish("interrupted");
+    eprintln!("{OUTPUT_PREFIX} {message}");
+    evidence_exit(evidence, 130)
+}
+
+async fn record_best_effort_stop(
+    evidence: &mut SessionEvidence,
+    session_id: &str,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+) -> String {
+    let cleanup = best_effort_stop(session_id, endpoint, token).await;
+    let _ = evidence.set_cleanup_status(cleanup.clone());
+    if cleanup.starts_with("failed:") {
+        let _ = evidence.error(format!("best-effort stop {cleanup}"));
+    }
+    cleanup
+}
+
+async fn finish_interrupted_session(
+    evidence: &mut SessionEvidence,
+    session_id: &str,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+    message: &str,
+) -> ExitCode {
+    let cleanup = record_best_effort_stop(evidence, session_id, endpoint, token).await;
+    let _ = evidence.finish("interrupted");
+    eprintln!("{OUTPUT_PREFIX} {message}; best-effort stop: {cleanup}");
+    evidence_exit(evidence, 130)
+}
+
+fn finish_remote_session_error(
+    evidence: &mut SessionEvidence,
+    err: BuildError,
+    connection: Option<&ConnectionConfig>,
+) -> ExitCode {
+    let message = err.to_string();
+    if matches!(&err, BuildError::TimedOut(_)) {
+        evidence.provenance.timed_out = Some(true);
+    }
+    let _ = evidence.error(&message);
+    let _ = evidence.finish("failed");
+    eprintln!("session request failed: {message}");
+    let code = match err {
+        BuildError::ConnectionFailed(_) => connection_failure_exit_code(
+            connection
+                .map(|config| config.local_fallback)
+                .unwrap_or(false),
+        ),
+        BuildError::TimedOut(_) => 124,
+        BuildError::Other(_) => 1,
+    };
+    evidence_exit(evidence, code)
+}
+
 fn find_client_config_path(start_dir: &Path) -> Option<PathBuf> {
     let mut dir = start_dir.to_path_buf();
     loop {
@@ -1220,7 +2880,18 @@ fn load_client_config(path: Option<&Path>) -> io::Result<ClientConfig> {
         return Ok(ClientConfig::default());
     };
 
-    let raw = fs::read_to_string(path)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "client configuration must be a regular file",
+        ));
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
     toml::from_str(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
@@ -1432,6 +3103,673 @@ fn resolve_connection_enabled(config: Option<&ConnectionConfig>) -> bool {
     }
 
     config.map(|connection| connection.enabled).unwrap_or(true)
+}
+
+enum Controlled<T> {
+    Completed(T),
+    Interrupted,
+    Provenance(io::Error),
+}
+
+struct SessionStartResult {
+    session_id: Option<String>,
+    exit_code: i32,
+    timed_out: bool,
+    phases: Vec<PhaseResult>,
+    errors: Vec<String>,
+}
+
+struct SessionActionResult {
+    action_id: String,
+    exit_code: i32,
+    timed_out: bool,
+    artifacts: Option<ArtifactArchive>,
+    artifact_restrictions: Option<ArtifactRestrictions>,
+    errors: Vec<String>,
+}
+
+async fn read_action_input(
+    path: &str,
+    interrupt: &mut InterruptControl,
+) -> io::Result<Option<Vec<u8>>> {
+    let read = async {
+        let bytes = if path == "-" {
+            let file = duplicate_nonblocking_stdin()?;
+            if file.metadata()?.file_type().is_file() {
+                let mut bytes = Vec::new();
+                let mut file = tokio::fs::File::from_std(file)
+                    .take((MAX_SESSION_ACTION_BODY_BYTES + 1) as u64);
+                file.read_to_end(&mut bytes).await?;
+                bytes
+            } else {
+                read_nonblocking_descriptor(file, false).await?
+            }
+        } else {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)?;
+            if file.metadata()?.file_type().is_fifo() {
+                read_nonblocking_descriptor(file, true).await?
+            } else {
+                let mut bytes = Vec::new();
+                let mut file = tokio::fs::File::from_std(file)
+                    .take((MAX_SESSION_ACTION_BODY_BYTES + 1) as u64);
+                file.read_to_end(&mut bytes).await?;
+                bytes
+            }
+        };
+        encode_action_input(&bytes).map(Some)
+    };
+    tokio::pin!(read);
+    tokio::select! {
+        biased;
+        _ = interrupt.interrupted() => Ok(None),
+        result = &mut read => result,
+    }
+}
+
+fn duplicate_nonblocking_stdin() -> io::Result<fs::File> {
+    let descriptor = unsafe { libc::fcntl(io::stdin().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+async fn read_nonblocking_descriptor(
+    file: fs::File,
+    wait_on_initial_eof: bool,
+) -> io::Result<Vec<u8>> {
+    let descriptor = tokio::io::unix::AsyncFd::new(file)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut ready = descriptor.readable().await?;
+        match ready.try_io(|inner| {
+            let mut file = inner.get_ref();
+            file.read(&mut chunk)
+        }) {
+            Ok(Ok(0)) if wait_on_initial_eof && bytes.is_empty() => {
+                drop(ready);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.len() > MAX_SESSION_ACTION_BODY_BYTES {
+                    break;
+                }
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => continue,
+        }
+    }
+    Ok(bytes)
+}
+
+fn encode_action_input(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if bytes.len() > MAX_SESSION_ACTION_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("action input exceeds {MAX_SESSION_ACTION_BODY_BYTES} bytes"),
+        ));
+    }
+    let input: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid action input JSON: {err}"),
+        )
+    })?;
+    let input = input.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "action input must be a JSON object",
+        )
+    })?;
+    let request = SessionActionRequest {
+        schema_version: SESSION_REQUEST_SCHEMA_VERSION.to_string(),
+        input: input.clone(),
+    };
+    let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
+    if body.len() > MAX_SESSION_ACTION_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("encoded action request exceeds {MAX_SESSION_ACTION_BODY_BYTES} bytes"),
+        ));
+    }
+    Ok(body)
+}
+
+fn session_http_client(
+    endpoint: &Endpoint,
+    path: &str,
+) -> Result<(Client, String, bool), BuildError> {
+    match endpoint {
+        Endpoint::Http { base } => Ok((
+            Client::builder()
+                .build()
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?,
+            format!("{base}{path}"),
+            true,
+        )),
+        Endpoint::Unix { path: socket } => Ok((
+            Client::builder()
+                .unix_socket(socket.clone())
+                .build()
+                .map_err(|err| BuildError::Other(format!("failed to create client: {err}")))?,
+            format!("http://localhost{path}"),
+            false,
+        )),
+    }
+}
+
+async fn session_http_error(response: reqwest::Response, operation: &str) -> BuildError {
+    let status = response.status();
+    let mut body = response.text().await.unwrap_or_default();
+    truncate_utf8(&mut body, 4096);
+    let detail = match status.as_u16() {
+        401 | 403 => "authentication failed; verify the existing bearer credential".to_string(),
+        404 if operation == "start" => {
+            "server does not support managed sessions; upgrade indentured-server".to_string()
+        }
+        404 => "session is missing or expired".to_string(),
+        408 => format!("{operation} timed out"),
+        409 => {
+            "session is busy or terminating; retry after the active operation completes".to_string()
+        }
+        503 if body.contains("busy") => {
+            "server capacity is busy; stop an existing session or retry later".to_string()
+        }
+        503 => "managed sessions are unavailable on this server".to_string(),
+        _ => format!("server returned {status}"),
+    };
+    let message = if body.is_empty() {
+        detail
+    } else {
+        format!("{detail}: {body}")
+    };
+    if status.as_u16() == 408 {
+        BuildError::TimedOut(message)
+    } else {
+        BuildError::Other(message)
+    }
+}
+
+async fn run_session_start(
+    request: &SessionStartRequest,
+    source_archive: &NamedTempFile,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+    output_limits: &OutputLimits,
+    observed_id: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<SessionStartResult, BuildError> {
+    let (client, url, send_auth) = session_http_client(endpoint, "/v1/sessions")?;
+    let metadata = serde_json::to_string(request)
+        .map_err(|err| BuildError::Other(format!("failed to serialize request: {err}")))?;
+    let length = source_archive
+        .as_file()
+        .metadata()
+        .map_err(|err| BuildError::Other(format!("failed to inspect source archive: {err}")))?
+        .len();
+    let file = tokio::fs::File::open(source_archive.path())
+        .await
+        .map_err(|err| BuildError::Other(format!("failed to read source archive: {err}")))?;
+    let source =
+        Part::stream_with_length(reqwest::Body::wrap_stream(ReaderStream::new(file)), length)
+            .file_name("source.zip")
+            .mime_str("application/zip")
+            .expect("static MIME type");
+    let form = Form::new()
+        .part(
+            "metadata",
+            Part::text(metadata)
+                .mime_str("application/json")
+                .expect("static MIME type"),
+        )
+        .part("source", source);
+    let mut builder = client.post(url).multipart(form);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) if is_connection_failure(&err) => {
+            return Err(BuildError::ConnectionFailed(format!(
+                "cannot reach endpoint: {err}"
+            )))
+        }
+        Err(err) => return Err(BuildError::Other(format!("session start failed: {err}"))),
+    };
+    if !response.status().is_success() {
+        return Err(session_http_error(response, "start").await);
+    }
+    read_session_start_response(response, output_limits, observed_id).await
+}
+
+async fn read_session_start_response(
+    mut response: reqwest::Response,
+    output_limits: &OutputLimits,
+    observed_id: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<SessionStartResult, BuildError> {
+    let mut pending = Vec::new();
+    let mut output = OutputLimiter::new(output_limits);
+    let mut logs = LogCaptureState::new(output_limits);
+    let paths = logs
+        .initialize("session")
+        .map_err(|err| BuildError::Other(format!("failed to initialize result logs: {err}")))?
+        .ok_or_else(|| BuildError::Other("result logs were not configured".to_string()))?;
+    output.set_log_paths(&paths);
+    let mut started_id: Option<String> = None;
+    let mut stream_errors = Vec::new();
+    let mut result = None;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| BuildError::Other(format!("failed to read session start response: {err}")))?
+    {
+        pending.extend_from_slice(&chunk);
+        if pending.len() > 1024 * 1024 {
+            return Err(BuildError::Other(
+                "response line exceeded 1 MiB".to_string(),
+            ));
+        }
+        while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=position).collect();
+            let line = std::str::from_utf8(&line[..line.len() - 1])
+                .map_err(|_| BuildError::Other("response was not UTF-8".to_string()))?
+                .trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            if result.is_some() {
+                return Err(BuildError::Other(
+                    "session start response contained an event after its final event".to_string(),
+                ));
+            }
+            let event: SessionStartEvent = serde_json::from_str(line)
+                .map_err(|err| BuildError::Other(format!("invalid session response: {err}")))?;
+            match event {
+                SessionStartEvent::Session {
+                    id,
+                    status,
+                    phase,
+                    duration_ms,
+                    exit_code,
+                    timed_out,
+                } => {
+                    if !valid_session_id(&id) {
+                        return Err(BuildError::Other(
+                            "server returned an invalid session ID".to_string(),
+                        ));
+                    }
+                    if let Some(existing) = &started_id {
+                        if existing != &id {
+                            return Err(BuildError::Other(
+                                "session identity changed during initialization".to_string(),
+                            ));
+                        }
+                    } else {
+                        started_id = Some(id.clone());
+                        let _ = observed_id.send(id.clone());
+                    }
+                    match status {
+                        SessionStartStatus::Started => {
+                            eprintln!("{OUTPUT_PREFIX} session {id} started")
+                        }
+                        SessionStartStatus::PhaseStarted => {
+                            if let Some(phase) = phase {
+                                eprintln!("{OUTPUT_PREFIX} {} phase started", phase.as_str());
+                            }
+                        }
+                        SessionStartStatus::PhaseFinished => {
+                            if let (Some(phase), Some(duration), Some(code), Some(timeout)) =
+                                (phase, duration_ms, exit_code, timed_out)
+                            {
+                                eprintln!(
+                                    "{OUTPUT_PREFIX} {} phase finished in {:.3}s (exit_code={code}, timed_out={timeout})",
+                                    phase.as_str(),
+                                    duration as f64 / 1000.0
+                                );
+                            }
+                        }
+                    }
+                }
+                SessionStartEvent::Stdout { data } => logs
+                    .process_event_routed(BufferedStreamEvent::Stdout(data), &mut output, true)
+                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?,
+                SessionStartEvent::Stderr { data } => logs
+                    .process_event(BufferedStreamEvent::Stderr(data), &mut output)
+                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?,
+                SessionStartEvent::Error { code, message, .. } => {
+                    let message = message
+                        .map_or_else(|| code.clone(), |message| format!("{code}: {message}"));
+                    eprintln!("{message}");
+                    stream_errors.push(message);
+                }
+                SessionStartEvent::Ready { session_id, phases } => {
+                    if !valid_session_id(&session_id)
+                        || started_id.as_deref() != Some(session_id.as_str())
+                    {
+                        return Err(BuildError::Other(
+                            "ready event had inconsistent session identity".to_string(),
+                        ));
+                    }
+                    result = Some(SessionStartResult {
+                        session_id: Some(session_id),
+                        exit_code: 0,
+                        timed_out: false,
+                        phases,
+                        errors: std::mem::take(&mut stream_errors),
+                    });
+                }
+                SessionStartEvent::Exit {
+                    code,
+                    timed_out,
+                    phases,
+                    ..
+                } => {
+                    result = Some(SessionStartResult {
+                        session_id: None,
+                        exit_code: code,
+                        timed_out,
+                        phases,
+                        errors: std::mem::take(&mut stream_errors),
+                    });
+                }
+            }
+        }
+        if result.is_some() {
+            if !pending.is_empty() {
+                return Err(BuildError::Other(
+                    "session start response contained data after its final event".to_string(),
+                ));
+            }
+            loop {
+                match response.chunk().await.map_err(|err| {
+                    BuildError::Other(format!("failed to finish Ready delivery: {err}"))
+                })? {
+                    None => break,
+                    Some(extra) if extra.is_empty() => continue,
+                    Some(_) => {
+                        return Err(BuildError::Other(
+                            "session start response contained events after its final event"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+            break;
+        }
+    }
+    output
+        .finish_routed(true)
+        .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
+    logs.write_completion_notice().map_err(|err| {
+        BuildError::Other(format!("failed to write log completion notice: {err}"))
+    })?;
+    result.ok_or_else(|| BuildError::Other("missing ready or exit event".to_string()))
+}
+
+async fn run_session_action(
+    session_id: &str,
+    action: &str,
+    body: Vec<u8>,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+    output_limits: &OutputLimits,
+    observed_action_id: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<SessionActionResult, BuildError> {
+    let path = format!("/v1/sessions/{session_id}/actions/{action}");
+    let (client, url, send_auth) = session_http_client(endpoint, &path)?;
+    let mut builder = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) if is_connection_failure(&err) => {
+            return Err(BuildError::ConnectionFailed(format!(
+                "cannot reach endpoint: {err}"
+            )))
+        }
+        Err(err) => return Err(BuildError::Other(format!("session action failed: {err}"))),
+    };
+    if !response.status().is_success() {
+        return Err(session_http_error(response, "action").await);
+    }
+    read_session_action_response(
+        response,
+        output_limits,
+        session_id,
+        action,
+        observed_action_id,
+    )
+    .await
+}
+
+async fn read_session_action_response(
+    mut response: reqwest::Response,
+    output_limits: &OutputLimits,
+    expected_session: &str,
+    expected_action: &str,
+    observed_action_id: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<SessionActionResult, BuildError> {
+    let mut pending = Vec::new();
+    let mut output = OutputLimiter::new(output_limits);
+    let mut logs = LogCaptureState::new(output_limits);
+    let paths = logs
+        .initialize("action")
+        .map_err(|err| BuildError::Other(format!("failed to initialize result logs: {err}")))?
+        .ok_or_else(|| BuildError::Other("result logs were not configured".to_string()))?;
+    output.set_log_paths(&paths);
+    let mut started_id: Option<String> = None;
+    let mut stream_errors = Vec::new();
+    let mut result = None;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| BuildError::Other(format!("failed to read action response: {err}")))?
+    {
+        pending.extend_from_slice(&chunk);
+        if pending.len() > 1024 * 1024 {
+            return Err(BuildError::Other(
+                "response line exceeded 1 MiB".to_string(),
+            ));
+        }
+        while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=position).collect();
+            let line = std::str::from_utf8(&line[..line.len() - 1])
+                .map_err(|_| BuildError::Other("response was not UTF-8".to_string()))?
+                .trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            if result.is_some() {
+                return Err(BuildError::Other(
+                    "action response contained an event after the exit event".to_string(),
+                ));
+            }
+            let event: SessionActionEvent = serde_json::from_str(line)
+                .map_err(|err| BuildError::Other(format!("invalid action response: {err}")))?;
+            match event {
+                SessionActionEvent::Action {
+                    session_id,
+                    action_id,
+                    action,
+                    status,
+                } => {
+                    if session_id != expected_session
+                        || action != expected_action
+                        || !valid_action_id(&action_id)
+                    {
+                        return Err(BuildError::Other(
+                            "action stream identity was inconsistent".to_string(),
+                        ));
+                    }
+                    if let Some(existing) = &started_id {
+                        if existing != &action_id {
+                            return Err(BuildError::Other(
+                                "action identity changed during execution".to_string(),
+                            ));
+                        }
+                    } else {
+                        started_id = Some(action_id.clone());
+                        let _ = observed_action_id.send(action_id.clone());
+                    }
+                    match status {
+                        SessionActionStatus::Started => {
+                            eprintln!("{OUTPUT_PREFIX} action {action} started ({action_id})")
+                        }
+                        SessionActionStatus::Snapshotting => {
+                            eprintln!("{OUTPUT_PREFIX} action {action} snapshotting artifacts")
+                        }
+                    }
+                }
+                SessionActionEvent::Stdout { data } => logs
+                    .process_event(BufferedStreamEvent::Stdout(data), &mut output)
+                    .map_err(|err| BuildError::Other(format!("failed to write stdout: {err}")))?,
+                SessionActionEvent::Stderr { data } => logs
+                    .process_event(BufferedStreamEvent::Stderr(data), &mut output)
+                    .map_err(|err| BuildError::Other(format!("failed to write stderr: {err}")))?,
+                SessionActionEvent::Error { code, message } => {
+                    let message = message
+                        .map_or_else(|| code.clone(), |message| format!("{code}: {message}"));
+                    eprintln!("{message}");
+                    stream_errors.push(message);
+                }
+                SessionActionEvent::Exit {
+                    session_id,
+                    action_id,
+                    action,
+                    code,
+                    timed_out,
+                    artifacts,
+                    artifact_restrictions,
+                } => {
+                    if session_id != expected_session
+                        || action != expected_action
+                        || !valid_action_id(&action_id)
+                        || started_id.as_deref() != Some(action_id.as_str())
+                    {
+                        return Err(BuildError::Other(
+                            "action exit identity was inconsistent".to_string(),
+                        ));
+                    }
+                    result = Some(SessionActionResult {
+                        action_id,
+                        exit_code: code,
+                        timed_out,
+                        artifacts,
+                        artifact_restrictions,
+                        errors: std::mem::take(&mut stream_errors),
+                    });
+                }
+            }
+        }
+        if result.is_some() {
+            if !pending.is_empty() {
+                return Err(BuildError::Other(
+                    "action response contained data after the exit event".to_string(),
+                ));
+            }
+            loop {
+                match response.chunk().await.map_err(|err| {
+                    BuildError::Other(format!("failed to acknowledge action exit: {err}"))
+                })? {
+                    None => break,
+                    Some(extra) if extra.is_empty() => continue,
+                    Some(_) => {
+                        return Err(BuildError::Other(
+                            "action response contained events after exit".to_string(),
+                        ))
+                    }
+                }
+            }
+            break;
+        }
+    }
+    output
+        .finish()
+        .map_err(|err| BuildError::Other(format!("failed to flush output: {err}")))?;
+    logs.write_completion_notice().map_err(|err| {
+        BuildError::Other(format!("failed to write log completion notice: {err}"))
+    })?;
+    result.ok_or_else(|| BuildError::Other("missing action exit event".to_string()))
+}
+
+async fn request_session_stop(
+    session_id: &str,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+) -> Result<SessionStopResponse, BuildError> {
+    let path = format!("/v1/sessions/{session_id}");
+    let (client, url, send_auth) = session_http_client(endpoint, &path)?;
+    let mut builder = client.delete(url);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) if is_connection_failure(&err) => {
+            return Err(BuildError::ConnectionFailed(format!(
+                "cannot reach endpoint: {err}"
+            )))
+        }
+        Err(err) => return Err(BuildError::Other(format!("session stop failed: {err}"))),
+    };
+    if !response.status().is_success() {
+        return Err(session_http_error(response, "stop").await);
+    }
+    response
+        .json::<SessionStopResponse>()
+        .await
+        .map_err(|err| BuildError::Other(format!("invalid stop response: {err}")))
+}
+
+async fn best_effort_stop(session_id: &str, endpoint: &Endpoint, token: Option<&str>) -> String {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        request_session_stop(session_id, endpoint, token),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.session_id != session_id => format!(
+            "failed: stop response session identity mismatch (expected {session_id}, got {})",
+            response.session_id
+        ),
+        Ok(Ok(response)) if response.teardown.timed_out => "failed: teardown timed out".to_string(),
+        Ok(Ok(response)) if response.teardown.error_code.is_some() => format!(
+            "failed: teardown {}",
+            response.teardown.error_code.as_deref().unwrap_or("failed")
+        ),
+        Ok(Ok(response)) if response.teardown.exit_code != Some(0) => format!(
+            "failed: teardown exit code {}",
+            response
+                .teardown
+                .exit_code
+                .map_or_else(|| "missing".to_string(), |code| code.to_string())
+        ),
+        Ok(Ok(_)) => "succeeded".to_string(),
+        Ok(Err(err)) => format!("failed: {err}"),
+        Err(_) => "failed: stop request timed out".to_string(),
+    }
 }
 
 struct BuildResult {
@@ -1699,12 +4037,13 @@ async fn download_and_extract(
             "artifact download failed {status}: {body}"
         )));
     }
-    let mut temp = tempfile::Builder::new()
+    let temp = tempfile::Builder::new()
         .prefix(".artifacts-download-")
         .suffix(".zip")
         .tempfile_in(run_directory)?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut temp_file = tokio::fs::File::from_std(temp.reopen()?);
     let mut received = 0u64;
     while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
         received = received.saturating_add(chunk.len() as u64);
@@ -1714,7 +4053,7 @@ async fn download_and_extract(
                 "artifact transfer exceeded advertised or client size limit",
             ));
         }
-        temp.write_all(&chunk)?;
+        temp_file.write_all(&chunk).await?;
     }
     if received != archive.size {
         return Err(io::Error::new(
@@ -1722,8 +4061,12 @@ async fn download_and_extract(
             "artifact size did not match server advertisement",
         ));
     }
-    temp.as_file().sync_all()?;
-    extract_zip_atomic(temp.path(), run_directory)
+    temp_file.sync_all().await?;
+    drop(temp_file);
+    let run_directory = run_directory.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_zip_atomic(temp.path(), &run_directory))
+        .await
+        .map_err(|err| io::Error::other(format!("artifact extraction worker failed: {err}")))?
 }
 
 fn build_artifact_url(base: &str, path: &str) -> String {
@@ -2006,10 +4349,15 @@ fn validate_zip_entry_path(name: &str) -> io::Result<()> {
 }
 
 fn to_exit_code(code: i32, timed_out: bool) -> ExitCode {
+    ExitCode::from(normalize_requested_exit(code, timed_out))
+}
+
+fn normalize_requested_exit(code: i32, timed_out: bool) -> u8 {
     if timed_out {
-        return ExitCode::from(124);
+        124
+    } else {
+        normalize_exit_code(code)
     }
-    ExitCode::from(normalize_exit_code(code))
 }
 
 fn normalize_exit_code(code: i32) -> u8 {
@@ -2059,7 +4407,145 @@ mod tests {
                 assert_eq!(args.request_id.as_deref(), Some("req.1"));
                 assert_eq!(args.source, vec!["src/**"]);
             }
+            Commands::Session(_) => panic!("expected run command"),
         }
+    }
+
+    #[test]
+    fn cli_accepts_only_the_three_explicit_session_operations() {
+        let start = Cli::try_parse_from([
+            "indentured",
+            "session",
+            "start",
+            "--source",
+            "src/**",
+            "build",
+        ])
+        .unwrap();
+        assert!(matches!(
+            start.command,
+            Commands::Session(SessionArgs {
+                command: SessionCommands::Start(SessionStartArgs { task, .. })
+            }) if task == "build"
+        ));
+        let action = Cli::try_parse_from([
+            "indentured",
+            "session",
+            "action",
+            "ses_1",
+            "observe",
+            "--input",
+            "-",
+        ])
+        .unwrap();
+        assert!(matches!(
+            action.command,
+            Commands::Session(SessionArgs {
+                command: SessionCommands::Action(SessionActionArgs { session, action, input, .. })
+            }) if session == "ses_1" && action == "observe" && input == "-"
+        ));
+        let stop = Cli::try_parse_from(["indentured", "session", "stop", "ses_1"]).unwrap();
+        assert!(matches!(
+            stop.command,
+            Commands::Session(SessionArgs {
+                command: SessionCommands::Stop(SessionStopArgs { session, .. })
+            }) if session == "ses_1"
+        ));
+        for unsupported in [
+            vec!["indentured", "session", "list"],
+            vec!["indentured", "session", "reset", "ses_1"],
+            vec!["indentured", "session", "action", "ses_1", "observe"],
+            vec![
+                "indentured",
+                "session",
+                "action",
+                "ses_1",
+                "observe",
+                "--input-json",
+                "{}",
+            ],
+            vec!["indentured", "session", "start", "--cwd", "/tmp", "build"],
+        ] {
+            assert!(Cli::try_parse_from(unsupported).is_err());
+        }
+    }
+
+    #[test]
+    fn action_input_is_an_object_wrapped_in_the_bounded_fixed_envelope() {
+        let body = encode_action_input(br#"{"operator_data":true,"argv":["data"]}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["schema_version"], SESSION_REQUEST_SCHEMA_VERSION);
+        assert_eq!(value["input"]["operator_data"], true);
+        assert_eq!(value["input"]["argv"][0], "data");
+        assert_eq!(value.as_object().unwrap().len(), 2);
+
+        assert!(encode_action_input(b"[]").is_err());
+        assert!(encode_action_input(&vec![b'x'; MAX_SESSION_ACTION_BODY_BYTES + 1]).is_err());
+
+        let empty_request = serde_json::to_vec(&SessionActionRequest {
+            schema_version: SESSION_REQUEST_SCHEMA_VERSION.to_string(),
+            input: serde_json::from_value(serde_json::json!({"data":""})).unwrap(),
+        })
+        .unwrap();
+        let exact_input = format!(
+            "{{\"data\":\"{}\"}}",
+            "x".repeat(MAX_SESSION_ACTION_BODY_BYTES - empty_request.len())
+        );
+        assert_eq!(
+            encode_action_input(exact_input.as_bytes()).unwrap().len(),
+            MAX_SESSION_ACTION_BODY_BYTES
+        );
+
+        let prefix = br#"{"data":""#;
+        let suffix = br#""}"#;
+        let mut largest = Vec::new();
+        largest.extend_from_slice(prefix);
+        largest.extend(std::iter::repeat_n(
+            b'x',
+            MAX_SESSION_ACTION_BODY_BYTES - prefix.len() - suffix.len(),
+        ));
+        largest.extend_from_slice(suffix);
+        let error = encode_action_input(&largest).unwrap_err();
+        assert!(error.to_string().contains("encoded action request exceeds"));
+    }
+
+    #[test]
+    fn session_evidence_is_private_atomic_and_records_lifecycle_fields() {
+        let root = tempdir().unwrap();
+        let mut evidence = SessionEvidence::create(
+            "action",
+            Some("ses_1"),
+            Some("observe"),
+            Some(root.path()),
+            None,
+        )
+        .unwrap();
+        evidence.provenance.action_id = Some("act_1".to_string());
+        evidence.provenance.remote_exit_code = Some(7);
+        evidence.provenance.timed_out = Some(false);
+        evidence.provenance.cleanup_status = Some("not-needed".to_string());
+        evidence.finish("failed").unwrap();
+        assert_eq!(
+            fs::metadata(&evidence.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(evidence.directory.join("provenance.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["session_id"], "ses_1");
+        assert_eq!(value["action_id"], "act_1");
+        assert_eq!(value["remote_exit_code"], 7);
+        assert!(fs::read_dir(&evidence.directory)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".provenance-")));
     }
 
     #[test]

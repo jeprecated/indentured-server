@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `7`; request protocol versions are separate. Schema 6 configurations fail closed and must explicitly migrate the version; existing one-phase task bodies remain supported after changing only their schema version.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `8`; request protocol versions are separate. Schema 7 configurations without managed-session blocks migrate by changing only their schema version; their one-shot task and `/v1/builds` behavior is unchanged. Older and future schemas fail closed.
 
 ```toml
-schema_version = "7"
+schema_version = "8"
 
 [service]
 max_concurrent_builds = 1
@@ -131,9 +131,32 @@ timeout_sec = 300
 PATH = "/usr/bin:/bin"
 LANG = "C.UTF-8"
 
+# One-shot output and the final explicit-stop snapshot for a managed session.
 [tasks.build.artifacts]
 include = ["out/**"]
 exclude = ["out/**/*.tmp"]
+
+# Optional managed-session policy. Setup and run initialize the session once.
+[tasks.build.session]
+idle_timeout_sec = 900
+max_lifetime_sec = 14400
+
+# Must be safe to call repeatedly after partial failures.
+[tasks.build.session.teardown]
+script = "./scripts/session-teardown"
+timeout_sec = 60
+
+[tasks.build.session.actions.observe]
+script = "./scripts/session-observe"
+timeout_sec = 60
+
+[tasks.build.session.actions.observe.artifacts]
+include = ["screenshots/**"]
+exclude = []
+
+[tasks.build.session.actions.act]
+script = "./scripts/session-act"
+timeout_sec = 60
 
 [sources]
 max_transfer_bytes = 134217728
@@ -163,6 +186,9 @@ Task validation occurs at daemon startup:
 - task names must match `[A-Za-z0-9_-]+` and are bounded to 64 bytes;
 - each task defines exactly one server-owned run `script` or absolute run `executable`; executable mode retains optional fixed `args` compatibility;
 - a task may also define one optional server-owned `setup` command using the same script/executable shape;
+- an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and at least one named action;
+- session action names use the task-name rules; action and teardown timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
+- actions and teardown inherit the task's fixed `cwd`, environment, and identity; actions may define their own artifact allowlist, while the top-level task artifact policy controls the final explicit-stop snapshot;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
 - scripts run exactly as `/bin/sh -eu -c SCRIPT`; `/bin/sh` and configured executables must be accessible executable regular files;
 - script tasks require an explicit nonempty `PATH` whose colon-separated components are all absolute and nonempty;
@@ -196,7 +222,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "7"
+schema_version = "8"
 
 [tasks.ci]
 script = '''
@@ -239,11 +265,23 @@ The pinned commit is an exact immutable tree. Jujutsu does not document the init
 
 Outside Jujutsu repositories, explicit include/exclude selection uses no-follow traversal and before/after manifest and file-identity checks. This detects common concurrent changes but is not an atomic filesystem snapshot.
 
-The CLI has no command arguments, remote cwd/environment/timeout/artifact flags, or workspace lifecycle subcommands. Artifact selection remains server-owned.
+Managed tasks use separate scriptable invocations:
+
+```sh
+session_id=$(indentured session start build)
+printf '{"gesture":"tap","x":40,"y":80}\n' \
+  | indentured session action "$session_id" interact --input -
+indentured session action "$session_id" observe --input ./observe.json
+indentured session stop "$session_id"
+```
+
+Only `session start` packages and uploads source; stdout contains exactly the opaque session ID line. Initialization output and human diagnostics go to stderr while stdout/stderr evidence logs retain their original streams. `session action` accepts one JSON object from a file or `-` (stdin), wraps it in the fixed protocol envelope, streams configured action output, and extracts advertised evidence into that invocation's result directory. `session stop` waits for teardown and downloads any configured final archive. Session/action identifiers are explicit; the client stores no hidden current-session state. There are no list, reset, arbitrary-command, workspace, or filesystem subcommands, and no remote cwd/environment/timeout/artifact flags. Artifact selection remains server-owned.
+
+Every session invocation writes private atomic provenance from preparation onward. As soon as a start/action execution ID is observed it is persisted, including on malformed, truncated, output, artifact, and interruption paths. SIGINT is installed and initially polled by the controlling operation before client configuration and source preparation; the same receiver remains directly polled across preparation, final provenance, artifacts, and nonblocking machine-ID output. Once a start ID is observed, interruption or a later start failure drops the stream, attempts a bounded best-effort stop, and records the cleanup outcome—even before Ready. If interruption wins before any ID is observed, cleanup is recorded as unavailable and no DELETE is attempted; a server session that committed Ready without its ID reaching the client is reclaimed by the configured idle expiry. Signal completion is elected before any machine-ID bytes are written, so an interrupted blocked output emits no ID and exits 130. Actions retain the same interruption/stop guarantee through input, response streaming, and artifact download. Client configuration must be a regular file; FIFOs and devices are rejected. A server without `/v1/sessions` produces an explicit upgrade diagnostic; authentication, capacity, conflict, expiry, timeout, and teardown failures retain the existing exit conventions and actionable stderr diagnostics.
 
 Connection precedence is CLI, `INDENTURED_SERVER_ENDPOINT`/`INDENTURED_SERVER_TOKEN_FILE`, then client config. Only credential **paths** are accepted (`--token-file`, the environment variable, or `connection.token_file`); raw-token CLI/environment/TOML surfaces are rejected. A configured credential must remain outside both submitted source and the entire configured result-root base, including canonical symlink aliases. `connection.enabled = false` or `INDENTURED_SERVER_ENABLED=false` returns exit code 222 without running a local command. When an unreachable endpoint has `local_fallback = true`, the client also returns 222; no wrapper shim is shipped.
 
-Every invocation creates a unique mode-0700 result directory under `$XDG_STATE_HOME/indentured/runs/<run-id>/` or `$HOME/.local/state/indentured/runs/<run-id>/`; an explicit `--result-root` must be absolute and must not overlap the submitted source in either direction. The resolved path is printed immediately. `stdout.log`, `stderr.log`, `source-manifest.json`, and atomically updated `provenance.json` are retained even on failure or interruption. Provenance schema 2 records setup/run durations, exit codes, timeout flags, and the failed phase when the server reports them. Artifacts are collected and downloaded after successful, ordinary nonzero, and timed-out remote tasks into a private staging tree and atomically published only as `<run>/artifacts/`; they never overwrite source or run evidence. Failure keeps the task's exit code, while timeout keeps `timed_out: true` and the client exits 124. SIGINT is controlled from source preparation onward: active Jujutsu process groups are killed/reaped, temporary workspace cleanup is attempted for a bounded interval, or the live request stream is dropped so the server cancels the remote process group. Evidence records `interrupted` and the client exits 130.
+Every invocation creates a unique mode-0700 result directory under `$XDG_STATE_HOME/indentured/runs/<run-id>/` or `$HOME/.local/state/indentured/runs/<run-id>/`; an explicit `--result-root` must be absolute and must not overlap submitted source when source is uploaded. The resolved path is printed immediately. `stdout.log`, `stderr.log`, optional `source-manifest.json`, and atomically updated `provenance.json` are retained even on failure or interruption. One-shot provenance schema 2 records setup/run durations, exit codes, timeout flags, and the failed phase; session provenance schema 1 records the operation, session/action identity, status, timings, exit/timeout or teardown outcome, artifact restrictions, cleanup outcome, and bounded errors. Artifacts are collected and downloaded after successful, ordinary nonzero, and timed-out remote tasks into a private staging tree and atomically published only as `<run>/artifacts/`; they never overwrite source or run evidence. Failure keeps the task's exit code, while timeout keeps `timed_out: true` and the client exits 124. SIGINT is controlled from source preparation onward: active Jujutsu process groups are killed/reaped, temporary workspace cleanup is attempted for a bounded interval, or the live request stream is dropped so the server cancels the remote process group. Evidence records `interrupted` and the client exits 130.
 
 ## Request protocol v1
 
@@ -286,6 +324,61 @@ Disconnecting the response stream cancels the active phase's process group. Setu
 
 Source ZIPs are bounded during upload and extraction by a server-owned upload deadline, compressed bytes, declared/actual uncompressed bytes, file/symlink count, and path depth. The single `sources.upload_timeout_sec` deadline covers source-field and multipart-trailer consumption; timeout returns `408` with `source_upload_timeout`, removes the partial file, and releases admission. Traversal, non-ASCII/normalization ambiguity, duplicates, case collisions, file/directory collisions, unsafe symlinks, and special files are rejected before extraction. Safe relative symlinks are created only after complete archive preflight and may not escape the fresh workspace. Artifacts use the server task allowlist and global restrictions, reject symlinks and every explicit Unix special-file mode, and enforce transfer, uncompressed, file-count, and depth limits before or during archive creation. Client preflight accepts only explicit Unix regular-file/directory kinds; missing or zero mode-kind fields remain compatible with portable non-Unix ZIP producers and are interpreted from directory spelling.
 
+## Managed-session protocol v1
+
+Managed sessions use the existing bearer authentication unchanged. They add no token ownership or separate authorization model. The managed-session routes are available only when the daemon runs as root and `build.run_as_user` resolves to a distinct non-root task UID; this is required so `.sessions` remains root-owned and inaccessible to task code while the session workspace is task-owned. Otherwise session start/stop returns `503 managed_sessions_unavailable` without reading an upload or reconciling `.sessions`; ordinary one-shot builds retain their existing non-root behavior. Callers can select only a configured task and configured action; argv, environment, cwd, timeouts, artifact patterns, filesystem paths, and process definitions remain server-owned.
+
+`POST /v1/sessions` uses the same ordered `metadata` then `source` multipart shape and upload bounds as `POST /v1/builds`, but its metadata is the separately versioned session-start type:
+
+```json
+{"schema_version":"1","request_id":"agent-42","task":"build","source":{"format":"zip"}}
+```
+
+Unknown metadata fields and invalid task/request identifiers fail closed. Initialization runs the task's existing optional setup and required run once in one fresh workspace. Setup plus run must still fit `build.max_timeout_sec`; their combined stdout/stderr uses one initialization output budget. A successful stream ends with `ready`, while an initialization process outcome that cannot become Ready ends with `exit`:
+
+```json
+{"type":"session","id":"ses_123","status":"started"}
+{"type":"session","id":"ses_123","status":"phase_started","phase":"setup"}
+{"type":"stdout","data":"initializing...\n"}
+{"type":"session","id":"ses_123","status":"phase_finished","phase":"setup","duration_ms":25,"exit_code":0,"timed_out":false}
+{"type":"ready","session_id":"ses_123","phases":[{"phase":"setup","duration_ms":25,"exit_code":0,"timed_out":false},{"phase":"run","duration_ms":50,"exit_code":0,"timed_out":false}]}
+```
+
+The Ready commit point is the durable write of protected, daemon-owned mode-`0700`/`0600` session metadata under the protected workspace root followed by the serialized `Initializing` → `Ready` election, before the `ready` event is sent. Commit, disconnect, explicit stop, and lifetime expiry contend on the same state lock, so only one can win while the session is Initializing. The metadata authority is separate from the task-owned session workspace. Disconnect before that commit cancels initialization—including bounded archive preflight, extraction, and recursive ownership preparation—and performs best-effort teardown and cleanup. Disconnect after commit does not undo the session; idle expiry handles a committed session whose caller did not receive its ID.
+
+After authentication and metadata/task validation, a session acquires the same global admission permit as a one-shot build and immediately records its `Initializing` reservation before reading the source field. Its absolute maximum-lifetime deadline therefore includes a slow or blocked upload as well as filesystem preparation and configured initialization. `max_lifetime_sec` is capped at 4,294,967,295 seconds so every accepted deadline is representable by the supported monotonic clocks. With the default `service.max_concurrent_builds = 1`, one reserved or Ready session makes new builds/session starts return immediate `503 busy` until it stops or expires. The started event exposes the already-registered ID, so `DELETE` during configured initialization cancels its process group, joins the single cleanup path, and waits for teardown instead of returning a transient `404`. Idle time begins at Ready and is suspended during lifecycle work. Explicit stop, idle expiry, maximum lifetime, initialization failure, and competing cleanup triggers elect one terminating owner under the lifecycle state lock, so the configured idempotent teardown runs at most once and the workspace and permit are released once. If explicit stop wins that lock it returns `200` with explicit final-artifact semantics; if automatic cleanup already won, stop returns `409 session_conflict` and never returns an automatic result as an explicit success. A missing or already removed ID receives `404`.
+
+Automatic cleanup runs teardown without publishing an unreachable final archive. Explicit `DELETE` alone collects the task's top-level final artifact snapshot. On daemon startup, durable Ready sessions are destroyed rather than resumed: current task configuration is used for best-effort teardown when available, while removed/renamed task configuration, invalid metadata, and pre-commit orphan workspaces receive logged root cleanup. Operators must keep teardown idempotent and preserve sufficient external-state identifiers in the workspace; configuration drift can prevent the operator teardown command from being recovered.
+
+`POST /v1/sessions/{session_id}/actions/{action}` accepts an `application/json` body of at most 65,536 bytes with exactly this authority envelope:
+
+```json
+{"schema_version":"1","input":{"operator_data":"value"}}
+```
+
+The `input` value must be an object. Its contents are opaque data supplied to the configured action on stdin; names such as `argv` nested inside `input` are data and never process authority. Unknown top-level fields—including `argv`, `environment`, `cwd`, `timeout_sec`, `artifacts`, and `path`—are rejected. Session IDs and action-execution IDs are opaque `[A-Za-z0-9_-]+` values bounded to 128 bytes; configured action names retain the 64-byte task-identifier rules. Action streams carry stable session, action-execution, and configured-action identity:
+
+```json
+{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"started"}
+{"type":"stdout","data":"observed\n"}
+{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"snapshotting"}
+{"type":"exit","session_id":"ses_123","action_id":"act_456","action":"observe","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_789/artifacts.zip","size":1234}}
+```
+
+Each action receives only the serialized `input` object on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each action and teardown has its own configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.
+
+A Ready session admits one action at a time. The action process and its artifact snapshot form one serialized operation, so another action receives immediate `409 session_conflict` rather than queueing, including while snapshot publication is active. Idle expiry is suspended during the operation and restarts after a completed ordinary action. Snapshot traversal retains an open workspace-root descriptor, opens every path component relative to it with no-follow semantics, verifies the opened file identity against traversal, and archives from the already-open descriptor. A task-owned symlink or rename swap therefore fails the action rather than redirecting snapshot reads.
+
+A nonzero configured action exit is reported in the final event and leaves the session Ready for diagnosis. Ready is restored only after the HTTP body consumes the final action frame and acknowledges it; enqueueing the event alone is not a commit point. A disconnect before that acknowledgement destroys the session and immediately removes any action archive already published, even when artifact TTL/GC is disabled. An action timeout, output exhaustion, response disconnect/backpressure, snapshot failure, or internal execution failure likewise makes session state untrustworthy and therefore cancels and reaps the whole action process group, runs teardown, and removes the session. Maximum lifetime remains hard during traversal, archive writing, publication, and final delivery. Explicit stop preempts every stage, waits for the same exactly-once cleanup path, and alone may collect final stop artifacts; automatic cleanup never publishes an unreachable archive. Once expiry has elected termination, a racing action receives `404` rather than observing a partially torn-down workspace.
+
+`DELETE /v1/sessions/{session_id}` waits for bounded idempotent teardown and returns JSON containing the teardown exit/timeout outcome plus any final archive selected by the task's top-level artifact policy:
+
+```json
+{"session_id":"ses_123","teardown":{"duration_ms":40,"exit_code":0,"timed_out":false},"artifacts":{"path":"/v1/builds/bld_790/artifacts.zip","size":4321}}
+```
+
+Initialization, actions, and teardown retain the existing whole-process-group termination and reaping behavior. A service that must outlive one configured command has to be handed to an external OS supervisor outside that child process group; ordinary persistent files may remain in the managed session workspace. The contract adds no session list, reset, arbitrary-command, workspace, or filesystem endpoint.
+
 ## macOS launchd and Tailscale deployment
 
 [`docs/macos-launchd-tailscale-deployment.md`](docs/macos-launchd-tailscale-deployment.md) defines the portable macOS/launchd/Tailscale contract for deployment automation. A hardened deployment runs a root daemon with a dedicated non-admin task identity, protected bearer token files, fresh workspaces, one active run with immediate busy rejection, synchronous disconnect/SIGINT cancellation, and private retained client evidence.
@@ -298,7 +391,9 @@ This repository owns generic packages/apps, behavior, documentation, and a param
 devenv tasks run integration:packaged-local
 ```
 
-It executes the exact Nix package binaries through local package/upload/named-task/stream/exit/artifact behavior without a forge, remote shell, source publication, Xcode, or remote Mac.
+It executes the exact Nix package binaries through the one-shot flow and a generic fake-state managed-session flow without a forge, remote shell, source publication, Xcode, or remote Mac. On Linux the script enters subordinate-ID user and private PID namespaces so the daemon is root, the configured task remains a verified distinct non-root identity, and harness failure kills only its namespace descendants. The harness proves build-once reuse, successful and ordinary-nonzero actions, action/final artifacts, retained admission capacity, explicit/idle/lifetime/disconnect cleanup, genuine daemon-kill reconciliation, configuration-drift cleanup, and the unchanged setup-then-run provenance/evidence/SIGINT-cancellation regression. This is deterministic protocol/package evidence, not CoreSimulator attestation.
+
+[`docs/managed-session-ios-simulator-example.md`](docs/managed-session-ios-simulator-example.md) provides an operator-owned iOS Simulator configuration and wrapper contract. It pins Xcode/runtime/device policy, records one explicit UDID in the session workspace, keeps JSON action data out of process authority, and defines idempotent simulator deletion. Indentured ships no iOS, MCP, Node, `idb`, or simulator-driver behavior.
 
 ## systemd
 

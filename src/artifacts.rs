@@ -1,8 +1,10 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
@@ -63,6 +65,9 @@ pub enum ArtifactError {
     #[error("artifact path depth exceeds artifacts.max_depth ({max_depth})")]
     TooDeep { max_depth: usize },
 
+    #[error("artifact snapshot cancelled")]
+    Cancelled,
+
     #[error("artifact path {path:?} is a symlink or unsupported special file")]
     UnsupportedFile { path: PathBuf },
 }
@@ -79,6 +84,35 @@ pub fn collect_artifacts_zip(
     config: &ArtifactsConfig,
     build_id: &str,
 ) -> Result<ArtifactCollection, ArtifactError> {
+    collect_artifacts_zip_cancellable(build_root, spec, config, build_id, &|| false)
+}
+
+pub(crate) fn collect_artifacts_zip_cancellable(
+    build_root: &Path,
+    spec: &ArtifactSpec,
+    config: &ArtifactsConfig,
+    build_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ArtifactCollection, ArtifactError> {
+    collect_artifacts_zip_controlled(build_root, spec, config, build_id, cancelled, &|_| {})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArtifactSnapshotCheckpoint {
+    Traversal,
+    ArchiveWrite,
+    Published,
+}
+
+pub(crate) fn collect_artifacts_zip_controlled(
+    build_root: &Path,
+    spec: &ArtifactSpec,
+    config: &ArtifactsConfig,
+    build_id: &str,
+    cancelled: &dyn Fn() -> bool,
+    checkpoint: &dyn Fn(ArtifactSnapshotCheckpoint),
+) -> Result<ArtifactCollection, ArtifactError> {
+    check_cancelled(cancelled)?;
     if spec.include.is_empty() {
         return Ok(ArtifactCollection {
             archive: None,
@@ -86,32 +120,40 @@ pub fn collect_artifacts_zip(
         });
     }
 
-    let root = fs::canonicalize(build_root).map_err(|source| ArtifactError::Io {
-        context: "canonicalize build_root",
-        source,
-    })?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(build_root)
+        .map_err(|source| ArtifactError::Io {
+            context: "open artifact root",
+            source,
+        })?;
+    checkpoint(ArtifactSnapshotCheckpoint::Traversal);
+    check_cancelled(cancelled)?;
 
     let mut excludes = spec.exclude.clone();
     excludes.push(INTERNAL_EXCLUDE_PATTERN.to_string());
     let exclude_patterns = compile_patterns(&excludes, "artifacts.exclude")?;
     let include_patterns = compile_patterns(&spec.include, "artifacts.include")?;
-    let mut matched_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut matched_files: HashMap<PathBuf, FileIdentity> = HashMap::new();
     let mut traversal = TraversalLimits::new(config.max_files, config.max_depth);
 
     // Walk once and apply every server-owned pattern to each candidate. This keeps
     // file-count/depth enforcement in front of recursive descent and accumulation;
     // no glob implementation performs an independent unbounded recursive walk.
-    for entry in WalkDir::new(&root).follow_links(false) {
+    for entry in WalkDir::new(build_root).follow_links(false) {
+        check_cancelled(cancelled)?;
         let entry = entry.map_err(|source| ArtifactError::Io {
             context: "walk artifact root",
             source: io::Error::other(source.to_string()),
         })?;
-        let rel = entry
-            .path()
-            .strip_prefix(&root)
-            .map_err(|_| ArtifactError::OutsideRoot {
-                path: entry.path().to_path_buf(),
-            })?;
+        let rel =
+            entry
+                .path()
+                .strip_prefix(build_root)
+                .map_err(|_| ArtifactError::OutsideRoot {
+                    path: entry.path().to_path_buf(),
+                })?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -122,23 +164,20 @@ pub fn collect_artifacts_zip(
         if is_excluded(rel, &exclude_patterns) || !is_included(rel, &include_patterns) {
             continue;
         }
-        require_regular_or_directory(entry.path())?;
-        let canonical = fs::canonicalize(entry.path()).map_err(|source| ArtifactError::Io {
-            context: "canonicalize artifact path",
-            source,
-        })?;
-        if !canonical.starts_with(&root) {
-            return Err(ArtifactError::OutsideRoot { path: canonical });
-        }
+        let metadata = require_regular_file(entry.path())?;
         matched_files
-            .entry(canonical)
-            .or_insert_with(|| rel.to_path_buf());
+            .entry(rel.to_path_buf())
+            .or_insert(FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
     }
 
     let restrictions = apply_restricted_patterns(
         &mut matched_files,
         &config.restricted_patterns,
         "artifacts.restricted_patterns",
+        cancelled,
     )?;
 
     // If no files matched any patterns, return None
@@ -151,7 +190,10 @@ pub fn collect_artifacts_zip(
     }
 
     validate_artifact_count_and_depth(&matched_files, config.max_files, config.max_depth)?;
-    let total_uncompressed_bytes = sum_matched_file_sizes(&matched_files)?;
+    let mut opened = open_matched_artifacts(&root, &matched_files, cancelled)?;
+    let total_uncompressed_bytes = opened
+        .iter()
+        .fold(0u64, |total, artifact| total.saturating_add(artifact.size));
     if total_uncompressed_bytes > config.max_uncompressed_bytes {
         return Err(ArtifactError::UncompressedTooLarge {
             max_bytes: config.max_uncompressed_bytes,
@@ -172,22 +214,38 @@ pub fn collect_artifacts_zip(
 
     let dest = dest_dir.join("artifacts.zip");
     let temp_dest = dest_dir.join(".artifacts.zip.tmp");
-    let size = write_artifacts_zip(
-        &temp_dest,
-        &matched_files,
-        config.max_transfer_bytes,
-        config.max_uncompressed_bytes,
-    )?;
-    fs::set_permissions(&temp_dest, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        ArtifactError::Io {
-            context: "protect artifact archive",
+    let publish = (|| {
+        checkpoint(ArtifactSnapshotCheckpoint::ArchiveWrite);
+        check_cancelled(cancelled)?;
+        let size = write_artifacts_zip(
+            &temp_dest,
+            &mut opened,
+            config.max_transfer_bytes,
+            config.max_uncompressed_bytes,
+            cancelled,
+        )?;
+        fs::set_permissions(&temp_dest, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            ArtifactError::Io {
+                context: "protect artifact archive",
+                source,
+            }
+        })?;
+        check_cancelled(cancelled)?;
+        fs::rename(&temp_dest, &dest).map_err(|source| ArtifactError::Io {
+            context: "publish artifact archive",
             source,
+        })?;
+        checkpoint(ArtifactSnapshotCheckpoint::Published);
+        check_cancelled(cancelled)?;
+        Ok::<u64, ArtifactError>(size)
+    })();
+    let size = match publish {
+        Ok(size) => size,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&dest_dir);
+            return Err(err);
         }
-    })?;
-    fs::rename(&temp_dest, &dest).map_err(|source| ArtifactError::Io {
-        context: "publish artifact archive",
-        source,
-    })?;
+    };
 
     Ok(ArtifactCollection {
         archive: Some(ArtifactArchive {
@@ -198,14 +256,14 @@ pub fn collect_artifacts_zip(
     })
 }
 
-fn require_regular_or_directory(path: &Path) -> Result<(), ArtifactError> {
+fn require_regular_file(path: &Path) -> Result<fs::Metadata, ArtifactError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| ArtifactError::Io {
         context: "inspect artifact path",
         source,
     })?;
     let file_type = metadata.file_type();
     if file_type.is_symlink()
-        || !(file_type.is_file() || file_type.is_dir())
+        || !file_type.is_file()
         || file_type.is_fifo()
         || file_type.is_socket()
         || file_type.is_block_device()
@@ -215,7 +273,20 @@ fn require_regular_or_directory(path: &Path) -> Result<(), ArtifactError> {
             path: path.to_path_buf(),
         });
     }
-    Ok(())
+    Ok(metadata)
+}
+
+#[derive(Clone, Copy)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct OpenedArtifact {
+    file: File,
+    relative: PathBuf,
+    mode: u32,
+    size: u64,
 }
 
 struct TraversalLimits {
@@ -252,7 +323,7 @@ impl TraversalLimits {
 }
 
 fn validate_artifact_count_and_depth(
-    matched_files: &HashMap<PathBuf, PathBuf>,
+    matched_files: &HashMap<PathBuf, FileIdentity>,
     max_files: usize,
     max_depth: usize,
 ) -> Result<(), ArtifactError> {
@@ -260,13 +331,13 @@ fn validate_artifact_count_and_depth(
         return Err(ArtifactError::TooManyFiles { max_files });
     }
     if matched_files
-        .values()
+        .keys()
         .any(|path| path.components().count() > max_depth)
     {
         return Err(ArtifactError::TooDeep { max_depth });
     }
     let mut folded = HashSet::new();
-    for rel in matched_files.values() {
+    for rel in matched_files.keys() {
         let key = rel.to_string_lossy().to_ascii_lowercase();
         if !folded.insert(key) {
             return Err(ArtifactError::UnsupportedFile { path: rel.clone() });
@@ -275,16 +346,103 @@ fn validate_artifact_count_and_depth(
     Ok(())
 }
 
-fn sum_matched_file_sizes(matched_files: &HashMap<PathBuf, PathBuf>) -> Result<u64, ArtifactError> {
-    let mut total = 0u64;
-    for source in matched_files.keys() {
-        let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
-            context: "stat artifact for size",
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), ArtifactError> {
+    if cancelled() {
+        Err(ArtifactError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn open_matched_artifacts(
+    root: &File,
+    matched_files: &HashMap<PathBuf, FileIdentity>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<OpenedArtifact>, ArtifactError> {
+    let mut relative_paths: Vec<_> = matched_files.keys().cloned().collect();
+    relative_paths.sort();
+    let mut opened = Vec::with_capacity(relative_paths.len());
+    for relative in relative_paths {
+        check_cancelled(cancelled)?;
+        let mut file = open_file_beneath(root.as_raw_fd(), &relative)?;
+        let metadata = file.metadata().map_err(|source| ArtifactError::Io {
+            context: "inspect opened artifact",
             source,
         })?;
-        total = total.saturating_add(metadata.len());
+        let expected = matched_files
+            .get(&relative)
+            .expect("matched artifact identity");
+        if !metadata.is_file()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+        {
+            return Err(ArtifactError::UnsupportedFile { path: relative });
+        }
+        file.rewind().map_err(|source| ArtifactError::Io {
+            context: "rewind opened artifact",
+            source,
+        })?;
+        opened.push(OpenedArtifact {
+            file,
+            relative,
+            mode: metadata.permissions().mode(),
+            size: metadata.len(),
+        });
     }
-    Ok(total)
+    Ok(opened)
+}
+
+fn open_file_beneath(root_fd: RawFd, relative: &Path) -> Result<File, ArtifactError> {
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(ArtifactError::UnsupportedFile {
+            path: relative.to_path_buf(),
+        });
+    }
+    let mut parent: Option<File> = None;
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("validated normal component")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            ArtifactError::UnsupportedFile {
+                path: relative.to_path_buf(),
+            }
+        })?;
+        let directory = index + 1 != components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let current_fd = parent.as_ref().map_or(root_fd, AsRawFd::as_raw_fd);
+        let fd = unsafe { libc::openat(current_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(ArtifactError::Io {
+                context: "open artifact beneath root",
+                source: io::Error::last_os_error(),
+            });
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        if directory {
+            let metadata = opened.metadata().map_err(|source| ArtifactError::Io {
+                context: "inspect artifact directory",
+                source,
+            })?;
+            if !metadata.is_dir() {
+                return Err(ArtifactError::UnsupportedFile {
+                    path: relative.to_path_buf(),
+                });
+            }
+            parent = Some(opened);
+        } else {
+            return Ok(opened);
+        }
+    }
+    unreachable!("nonempty path has final component")
 }
 
 fn compile_patterns(patterns: &[String], field: &str) -> Result<Vec<glob::Pattern>, ArtifactError> {
@@ -303,9 +461,10 @@ fn compile_patterns(patterns: &[String], field: &str) -> Result<Vec<glob::Patter
 }
 
 fn apply_restricted_patterns(
-    matched_files: &mut HashMap<PathBuf, PathBuf>,
+    matched_files: &mut HashMap<PathBuf, FileIdentity>,
     restricted_patterns: &[String],
     field: &str,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<ArtifactRestrictions>, ArtifactError> {
     if restricted_patterns.is_empty() || matched_files.is_empty() {
         return Ok(None);
@@ -315,7 +474,8 @@ fn apply_restricted_patterns(
     let mut restricted_paths = HashSet::new();
     let mut matched_pattern_indexes = HashSet::new();
 
-    for (canonical, rel) in matched_files.iter() {
+    for rel in matched_files.keys() {
+        check_cancelled(cancelled)?;
         let rel_str = rel.to_string_lossy();
         let mut restricted = false;
         for (index, pattern) in compiled.iter().enumerate() {
@@ -325,7 +485,7 @@ fn apply_restricted_patterns(
             }
         }
         if restricted {
-            restricted_paths.insert(canonical.clone());
+            restricted_paths.insert(rel.clone());
         }
     }
 
@@ -370,9 +530,10 @@ fn is_included(path: &Path, patterns: &[glob::Pattern]) -> bool {
 
 fn write_artifacts_zip(
     dest: &Path,
-    matched_files: &HashMap<PathBuf, PathBuf>,
+    opened_artifacts: &mut [OpenedArtifact],
     max_transfer_bytes: u64,
     max_uncompressed_bytes: u64,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<u64, ArtifactError> {
     let result = (|| {
         let file = File::create(dest).map_err(|source| ArtifactError::Io {
@@ -382,21 +543,15 @@ fn write_artifacts_zip(
         let transfer_limit = Rc::new(Cell::new(Some(max_transfer_bytes)));
         let mut zip = ZipWriter::new(LimitedWriter::new(file, Rc::clone(&transfer_limit)));
 
-        let mut items: Vec<_> = matched_files.iter().collect();
-        items.sort_by(|a, b| a.1.cmp(b.1));
+        opened_artifacts.sort_by(|a, b| a.relative.cmp(&b.relative));
 
         let mut uncompressed_bytes = 0u64;
         let mut buffer = [0u8; 8192];
 
-        for (source, rel) in items {
-            let name = rel.to_string_lossy().replace('\\', "/");
-
-            // Preserve source permissions inside the archive.
-            let metadata = fs::metadata(source).map_err(|source| ArtifactError::Io {
-                context: "stat artifact for permissions",
-                source,
-            })?;
-            let mode = metadata.permissions().mode();
+        for artifact in opened_artifacts {
+            check_cancelled(cancelled)?;
+            let name = artifact.relative.to_string_lossy().replace('\\', "/");
+            let mode = artifact.mode;
 
             let options = FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
@@ -412,18 +567,21 @@ fn write_artifacts_zip(
                 return Err(ArtifactError::Zip { source });
             }
 
-            let mut input = File::open(source).map_err(|source| ArtifactError::Io {
-                context: "open artifact",
+            artifact.file.rewind().map_err(|source| ArtifactError::Io {
+                context: "rewind artifact",
                 source,
             })?;
 
             loop {
-                let bytes = input
-                    .read(&mut buffer)
-                    .map_err(|source| ArtifactError::Io {
-                        context: "read artifact",
-                        source,
-                    })?;
+                check_cancelled(cancelled)?;
+                let bytes =
+                    artifact
+                        .file
+                        .read(&mut buffer)
+                        .map_err(|source| ArtifactError::Io {
+                            context: "read artifact",
+                            source,
+                        })?;
                 if bytes == 0 {
                     break;
                 }
@@ -921,6 +1079,81 @@ mod tests {
 
         let err = collect_artifacts_zip(root.path(), &spec, &config, "bld").unwrap_err();
         assert!(matches!(err, ArtifactError::UnsupportedFile { .. }));
+    }
+
+    #[test]
+    fn descriptor_relative_open_rejects_file_and_ancestor_symlink_swaps() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let output = root.path().join("out");
+        fs::create_dir(&output).unwrap();
+        let file = output.join("evidence.txt");
+        fs::write(&file, "safe").unwrap();
+        let metadata = fs::symlink_metadata(&file).unwrap();
+        let matched = HashMap::from([(
+            PathBuf::from("out/evidence.txt"),
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        )]);
+        let root_fd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root.path())
+            .unwrap();
+
+        fs::remove_file(&file).unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+        symlink(&outside_file, &file).unwrap();
+        assert!(open_matched_artifacts(&root_fd, &matched, &|| false).is_err());
+
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, "safe-again").unwrap();
+        let metadata = fs::symlink_metadata(&file).unwrap();
+        let matched = HashMap::from([(
+            PathBuf::from("out/evidence.txt"),
+            FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+        )]);
+        fs::rename(&output, root.path().join("old-out")).unwrap();
+        symlink(outside.path(), &output).unwrap();
+        assert!(open_matched_artifacts(&root_fd, &matched, &|| false).is_err());
+    }
+
+    #[test]
+    fn cancellation_at_each_snapshot_stage_removes_temporary_and_published_archives() {
+        for checkpoint in [
+            ArtifactSnapshotCheckpoint::Traversal,
+            ArtifactSnapshotCheckpoint::ArchiveWrite,
+            ArtifactSnapshotCheckpoint::Published,
+        ] {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("evidence.txt"), vec![b'x'; 32 * 1024]).unwrap();
+            let config = artifacts_config(root.path());
+            let spec = ArtifactSpec {
+                include: vec!["evidence.txt".to_string()],
+                exclude: vec![],
+            };
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let result = collect_artifacts_zip_controlled(
+                root.path(),
+                &spec,
+                &config,
+                "bld_cancelled",
+                &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+                &|reached| {
+                    if reached == checkpoint {
+                        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            );
+            assert!(matches!(result, Err(ArtifactError::Cancelled)));
+            assert!(!config.storage_root.join("bld_cancelled").exists());
+        }
     }
 
     #[test]

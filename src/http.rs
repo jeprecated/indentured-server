@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use hyper::server::conn::http1;
@@ -33,7 +33,11 @@ use tracing::{error, warn};
 use crate::bearer_token::{BearerToken, MAX_BEARER_TOKEN_FILE_BYTES};
 use crate::build::{execute_build, validate_request, CancellationFlag};
 use crate::config::{Config, SocketModeError};
-use crate::protocol::parse_request_metadata;
+use crate::protocol::{
+    parse_request_metadata, parse_session_action_request, parse_session_start_metadata,
+    valid_session_id, valid_task_id, MAX_SESSION_ACTION_BODY_BYTES,
+};
+use crate::sessions::{ActionError, SessionManager, StopError};
 use crate::user::UserError;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +67,8 @@ struct AppState {
     auth: Arc<AuthSecrets>,
     auth_required: bool,
     build_slots: Arc<Semaphore>,
+    sessions: SessionManager,
+    managed_sessions_enabled: bool,
 }
 
 struct AuthSecrets {
@@ -72,6 +78,20 @@ struct AuthSecrets {
 struct BuildEventStream {
     receiver: mpsc::Receiver<crate::protocol::ResponseEvent>,
     cancellation: CancellationFlag,
+}
+
+struct SessionEventStream {
+    receiver: mpsc::Receiver<crate::protocol::SessionStartEvent>,
+    sessions: SessionManager,
+    session_id: String,
+}
+
+struct SessionActionEventStream {
+    receiver: mpsc::Receiver<crate::protocol::SessionActionStreamItem>,
+    sessions: SessionManager,
+    session_id: String,
+    action_id: String,
+    pending_ack: Option<std::sync::mpsc::SyncSender<bool>>,
 }
 
 impl Stream for BuildEventStream {
@@ -85,6 +105,48 @@ impl Stream for BuildEventStream {
 impl Drop for BuildEventStream {
     fn drop(&mut self) {
         self.cancellation.cancel();
+    }
+}
+
+impl Stream for SessionEventStream {
+    type Item = crate::protocol::SessionStartEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for SessionEventStream {
+    fn drop(&mut self) {
+        self.sessions.disconnect(&self.session_id);
+    }
+}
+
+impl Stream for SessionActionEventStream {
+    type Item = crate::protocol::SessionActionEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(ack) = self.pending_ack.take() {
+            let accepted = self
+                .sessions
+                .acknowledge_action_delivery(&self.session_id, &self.action_id);
+            let _ = ack.send(accepted);
+        }
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(item)) => {
+                self.pending_ack = item.final_ack;
+                Poll::Ready(Some(item.event))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for SessionActionEventStream {
+    fn drop(&mut self) {
+        self.sessions
+            .disconnect_action(&self.session_id, &self.action_id);
     }
 }
 
@@ -355,11 +417,20 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         Arc::new(AuthSecrets::empty())
     };
     let build_slots = Arc::new(Semaphore::new(config.service.max_concurrent_builds));
+    let managed_sessions_enabled =
+        managed_session_authority_available(unsafe { libc::geteuid() }, task_uid);
+    let sessions = if managed_sessions_enabled {
+        SessionManager::new(Arc::clone(&config))?
+    } else {
+        SessionManager::new_disabled(Arc::clone(&config))
+    };
     let base_state = AppState {
         config: Arc::clone(&config),
         auth,
         auth_required: false,
         build_slots,
+        sessions,
+        managed_sessions_enabled,
     };
     match (config.service.http.enabled, config.service.socket.enabled) {
         (true, true) => {
@@ -372,6 +443,10 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         (false, false) => {}
     }
     Ok(())
+}
+
+fn managed_session_authority_available(daemon_uid: u32, task_uid: Option<u32>) -> bool {
+    daemon_uid == 0 && task_uid.is_some_and(|uid| uid != 0)
 }
 
 fn prepare_protected_directory(path: &Path, mode: u32) -> io::Result<()> {
@@ -443,6 +518,12 @@ fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
     Router::new()
         .route("/v1/builds", post(start_build))
         .route("/v1/builds/:build_id/artifacts.zip", get(get_artifact))
+        .route("/v1/sessions", post(start_session))
+        .route("/v1/sessions/:session_id", delete(stop_session))
+        .route(
+            "/v1/sessions/:session_id/actions/:action",
+            post(run_session_action),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body))
 }
@@ -528,6 +609,230 @@ async fn start_build(
         HeaderValue::from_static("application/x-ndjson"),
     );
     response
+}
+
+async fn start_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Some(response) = authorize(&headers, &state.auth, state.auth_required) {
+        return response;
+    }
+    if !state.managed_sessions_enabled {
+        return managed_sessions_unavailable();
+    }
+
+    let mut metadata_field = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("metadata") => field,
+        Ok(Some(_)) => return bad_request("metadata must be the first multipart field"),
+        Ok(None) => return bad_request("missing metadata field"),
+        Err(err) => return bad_request(&format!("invalid multipart metadata field: {err}")),
+    };
+    let mut metadata_bytes = Vec::new();
+    loop {
+        match metadata_field.chunk().await {
+            Ok(Some(chunk)) => {
+                if metadata_bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return payload_too_large("metadata exceeds 65536 bytes");
+                }
+                metadata_bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => return bad_request(&format!("failed to read metadata: {err}")),
+        }
+    }
+    drop(metadata_field);
+
+    let request = match parse_session_start_metadata(&metadata_bytes) {
+        Ok(request) => request,
+        Err(err) => return bad_request(&err.to_string()),
+    };
+    let task = match state.config.tasks.get(&request.task).cloned() {
+        Some(task) if task.session.is_some() => task,
+        Some(_) => return bad_request("task does not configure managed sessions"),
+        None => return bad_request(&format!("unknown task {}", request.task)),
+    };
+    let validated = crate::build::ValidatedRequest {
+        request_id: request.request_id,
+        task_id: request.task,
+        task,
+    };
+    let permit = match Arc::clone(&state.build_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return busy_response(),
+    };
+    let sessions = state.sessions.clone();
+    let reservation = sessions.reserve(validated, permit);
+    let session_id = reservation.id().to_string();
+    let upload_deadline = Duration::from_secs(state.config.sources.upload_timeout_sec);
+    let remaining_lifetime = reservation.remaining_lifetime();
+    let lifetime_limits_upload = remaining_lifetime <= upload_deadline;
+    let effective_upload_deadline = upload_deadline.min(remaining_lifetime);
+    let upload_result = tokio::select! {
+        result = tokio::time::timeout(
+            effective_upload_deadline,
+            receive_source_upload(&state, multipart),
+        ) => match result {
+            Ok(result) => result,
+            Err(_) if lifetime_limits_upload => Err(session_lifetime_timeout()),
+            Err(_) => Err(source_upload_timeout()),
+        },
+        () = reservation.cancelled() => Err(session_lifetime_timeout()),
+    };
+    let source_path = match upload_result {
+        Ok(path) => path,
+        Err(response) => {
+            sessions.cancel_upload(&reservation);
+            return response;
+        }
+    };
+    if !sessions.begin_initialization(&reservation) {
+        return session_lifetime_timeout();
+    }
+    let (tx, rx) = mpsc::channel(128);
+    let worker_sessions = sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        worker_sessions.initialize(reservation, source_path, tx);
+    });
+
+    let stream = SessionEventStream {
+        receiver: rx,
+        sessions,
+        session_id,
+    }
+    .map(|event| {
+        let line = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(err) => {
+                format!("{{\"type\":\"error\",\"code\":\"serialization\",\"message\":\"{err}\"}}")
+            }
+        };
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("{line}\n")))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response
+}
+
+async fn run_session_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((session_id, action)): AxumPath<(String, String)>,
+    body: Body,
+) -> Response {
+    if let Some(response) = authorize(&headers, &state.auth, state.auth_required) {
+        return response;
+    }
+    if !state.managed_sessions_enabled {
+        return managed_sessions_unavailable();
+    }
+    if !valid_session_id(&session_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !valid_task_id(&action) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return bad_request("session action body must use application/json");
+    }
+    let body = match to_bytes(body, MAX_SESSION_ACTION_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return payload_too_large("session action body exceeds 65536 bytes"),
+    };
+    let request = match parse_session_action_request(&body) {
+        Ok(request) => request,
+        Err(err) => return bad_request(&err.to_string()),
+    };
+    let input = match serde_json::to_vec(&request.input) {
+        Ok(input) => input,
+        Err(err) => return server_error(&format!("failed to encode session action input: {err}")),
+    };
+    let sessions = state.sessions.clone();
+    let reservation = match sessions.start_action(&session_id, &action) {
+        Ok(reservation) => reservation,
+        Err(ActionError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ActionError::UnknownAction) => {
+            let body = Json(ErrorResponse {
+                error: "unknown_action".to_string(),
+            });
+            return (StatusCode::NOT_FOUND, body).into_response();
+        }
+        Err(ActionError::Conflict) => {
+            let body = Json(ErrorResponse {
+                error: "session_conflict".to_string(),
+            });
+            return (StatusCode::CONFLICT, body).into_response();
+        }
+    };
+    let action_id = reservation.action_id().to_string();
+    let reserved_session_id = reservation.session_id().to_string();
+    let (sender, receiver) = mpsc::channel(128);
+    let worker_sessions = sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        worker_sessions.execute_action(reservation, input, sender);
+    });
+    let stream = SessionActionEventStream {
+        receiver,
+        sessions,
+        session_id: reserved_session_id,
+        action_id,
+        pending_ack: None,
+    }
+    .map(|event| {
+        let line = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(err) => {
+                format!("{{\"type\":\"error\",\"code\":\"serialization\",\"message\":\"{err}\"}}")
+            }
+        };
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("{line}\n")))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response
+}
+
+async fn stop_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(&headers, &state.auth, state.auth_required) {
+        return response;
+    }
+    if !state.managed_sessions_enabled {
+        return managed_sessions_unavailable();
+    }
+    if !valid_session_id(&session_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let sessions = state.sessions.clone();
+    match tokio::task::spawn_blocking(move || sessions.stop(&session_id)).await {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(StopError::NotFound)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(StopError::Conflict)) => {
+            let body = Json(ErrorResponse {
+                error: "session_conflict".to_string(),
+            });
+            (StatusCode::CONFLICT, body).into_response()
+        }
+        Err(err) => server_error(&format!("session stop task failed: {err}")),
+    }
 }
 
 async fn receive_source_upload(
@@ -669,6 +974,13 @@ fn busy_response() -> Response {
     response
 }
 
+fn managed_sessions_unavailable() -> Response {
+    let body = Json(ErrorResponse {
+        error: "managed_sessions_unavailable".to_string(),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+}
+
 fn valid_build_id(value: &str) -> bool {
     value.len() == 36
         && value.starts_with("bld_")
@@ -787,6 +1099,13 @@ fn source_upload_timeout() -> Response {
     (StatusCode::REQUEST_TIMEOUT, body).into_response()
 }
 
+fn session_lifetime_timeout() -> Response {
+    let body = Json(ErrorResponse {
+        error: "session_lifetime".to_string(),
+    });
+    (StatusCode::REQUEST_TIMEOUT, body).into_response()
+}
+
 fn server_error(message: &str) -> Response {
     error!("http handler error: {message}");
     let body = Json(ErrorResponse {
@@ -798,12 +1117,16 @@ fn server_error(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::ArtifactSnapshotCheckpoint;
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, Config, LoggingConfig, ScriptText,
-        ServiceConfig, SourcesConfig, TaskConfig, TaskSetupConfig, WorkspacePolicy,
-        CONFIG_SCHEMA_VERSION,
+        ServiceConfig, SessionActionConfig, SessionTeardownConfig, SourcesConfig, TaskConfig,
+        TaskSessionConfig, TaskSetupConfig, WorkspacePolicy, CONFIG_SCHEMA_VERSION,
     };
-    use crate::protocol::{BuildPhase, Request, ResponseEvent, SourceFormat, SourceMetadata};
+    use crate::protocol::{
+        BuildPhase, Request, ResponseEvent, SessionActionEvent, SessionStartEvent,
+        SessionStopResponse, SourceFormat, SourceMetadata,
+    };
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
     use std::collections::HashMap;
@@ -823,6 +1146,8 @@ mod tests {
         marker: PathBuf,
         process_pids: PathBuf,
         build_slots: Arc<Semaphore>,
+        sessions: SessionManager,
+        config: Arc<Config>,
     }
 
     const LIFECYCLE_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -999,6 +1324,59 @@ mod tests {
         assert_eq!(parse_task_group_ids(b"1 550\n", 550).unwrap(), [1, 550]);
         assert!(parse_task_group_ids(b"", 550).is_err());
         assert!(parse_task_group_ids(b"1 nope\n", 550).is_err());
+    }
+
+    #[test]
+    fn managed_session_authority_requires_root_daemon_and_distinct_non_root_task() {
+        assert!(managed_session_authority_available(0, Some(501)));
+        assert!(!managed_session_authority_available(0, None));
+        assert!(!managed_session_authority_available(0, Some(0)));
+        assert!(!managed_session_authority_available(501, None));
+        assert!(!managed_session_authority_available(501, Some(502)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_managed_authority_rejects_sessions_but_preserves_one_shot_builds() {
+        let env = setup_env_with_options(SourcesConfig::default().upload_timeout_sec, false);
+        let metadata_root = env.sessions.metadata_root().to_path_buf();
+        let workspace_root = env.workspace_root.clone();
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let response = post_session(&Client::new(), &base, "managed");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response
+                .text()
+                .unwrap()
+                .contains(r#"{"error":"managed_sessions_unavailable"}"#));
+            let stop = Client::new()
+                .delete(format!("{base}/v1/sessions/ses_unavailable"))
+                .send()
+                .unwrap();
+            assert_eq!(stop.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(stop
+                .text()
+                .unwrap()
+                .contains(r#"{"error":"managed_sessions_unavailable"}"#));
+
+            let events = run_task_events_through_eof(&Client::new(), &base, "build");
+            assert!(matches!(
+                events.last(),
+                Some(ResponseEvent::Exit {
+                    code: 0,
+                    timed_out: false,
+                    ..
+                })
+            ));
+            wait_for_slot_and_cleanup(&env.build_slots, &workspace_root);
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            std::fs::symlink_metadata(metadata_root),
+            Err(err) if err.kind() == io::ErrorKind::NotFound
+        ));
+        server.abort();
     }
 
     #[test]
@@ -1359,6 +1737,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_session_upload_obeys_absolute_lifetime_and_cleans_reservation() {
+        let env = setup_env_with_session_lifetime(2);
+        let workspace_root = env.workspace_root.clone();
+        let build_slots = Arc::clone(&env.build_slots);
+        let sessions = env.sessions.clone();
+        let (addr, server) = start_http_server(env.app).await;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect raw upload");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            let boundary = "indentured-stalled-session-upload";
+            let metadata = r#"{"schema_version":"1","request_id":"stalled-session","task":"managed","source":{"format":"zip"}}"#;
+            let partial = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"source.zip\"\r\nContent-Type: application/zip\r\n\r\nPK"
+            );
+            let request = format!(
+                "POST /v1/sessions HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: 1000000\r\n\r\n{partial}"
+            );
+            let started = std::time::Instant::now();
+            stream.write_all(request.as_bytes()).expect("write partial upload");
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+            (started.elapsed(), String::from_utf8(bytes).expect("HTTP response"))
+        })
+        .await
+        .expect("raw session upload task");
+
+        assert!(response.0 < Duration::from_secs(4));
+        assert!(
+            response.1.contains(" 408 "),
+            "unexpected response: {}",
+            response.1
+        );
+        assert!(response.1.contains(r#"{"error":"session_lifetime"}"#));
+        tokio::task::spawn_blocking(move || {
+            wait_for_session_cleanup(&build_slots, &workspace_root)
+        })
+        .await
+        .unwrap();
+        assert_eq!(sessions.active_count(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn completed_success_and_error_streams_reach_eof_promptly() {
         let env = setup_env();
         let (addr, server) = start_http_server(env.app).await;
@@ -1617,6 +2041,444 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_session_start_stop_retains_capacity_and_tears_down_once() {
+        let env = setup_env();
+        let slots = Arc::clone(&env.build_slots);
+        let sessions = env.sessions.clone();
+        let metadata_root = sessions.metadata_root().to_path_buf();
+        let teardown_log = env.process_pids.join("teardown.log");
+        let workspace_root = env.workspace_root.clone();
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let session_id = start_managed_session(&Client::new(), &base, "managed");
+            assert_eq!(slots.available_permits(), 0);
+            assert_eq!(sessions.active_count(), 1);
+            let metadata = std::fs::metadata(metadata_root.join(format!("{session_id}.json")))
+                .expect("durable ready metadata");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                post_task(&Client::new(), &base, "build").status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            let first_url = format!("{base}/v1/sessions/{session_id}");
+            let second_url = first_url.clone();
+            let stop_barrier = Arc::new(std::sync::Barrier::new(3));
+            let (first, second) = std::thread::scope(|scope| {
+                let first_barrier = Arc::clone(&stop_barrier);
+                let first = scope.spawn(move || {
+                    first_barrier.wait();
+                    let response = Client::new().delete(first_url).send().unwrap();
+                    (response.status(), response.text().unwrap())
+                });
+                let second_barrier = Arc::clone(&stop_barrier);
+                let second = scope.spawn(move || {
+                    second_barrier.wait();
+                    let response = Client::new().delete(second_url).send().unwrap();
+                    (response.status(), response.text().unwrap())
+                });
+                stop_barrier.wait();
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            let statuses = [first.0, second.0];
+            assert!(statuses.contains(&StatusCode::OK));
+            assert!(statuses.contains(&StatusCode::CONFLICT));
+            let success_body = if first.0 == StatusCode::OK {
+                first.1
+            } else {
+                second.1
+            };
+            let stopped: SessionStopResponse = serde_json::from_str(&success_body).unwrap();
+            assert_eq!(stopped.teardown.exit_code, Some(0));
+            assert!(!stopped.teardown.timed_out);
+            assert!(stopped.artifacts.is_some());
+            assert_eq!(
+                Client::new()
+                    .delete(format!("{base}/v1/sessions/{session_id}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            wait_for_session_cleanup(&slots, &workspace_root);
+            assert_eq!(
+                std::fs::read_to_string(teardown_log)
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_session_idle_timer_terminates_without_final_artifacts() {
+        let env = setup_env();
+        let (session_id, mut receiver, worker) = spawn_direct_session(&env, "managed", 128);
+        worker.await.unwrap();
+        assert!(std::iter::from_fn(|| receiver.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let timer_handles = env.sessions.timer_handles_for_test(&session_id);
+        let sessions = env.sessions.clone();
+        let id = session_id.clone();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || sessions.wait_for_terminated_for_test(&id)),
+        )
+        .await
+        .expect("idle timer boundary")
+        .unwrap();
+        assert!(stopped.artifacts.is_none());
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_eq!(env.build_slots.available_permits(), 1);
+        assert!(timer_handles.iter().all(|handle| handle.is_finished()));
+        assert_dir_empty(env.temp.path().join("artifacts").as_path());
+    }
+
+    #[tokio::test]
+    async fn managed_session_failure_and_pre_ready_disconnect_cleanup() {
+        let env = setup_env();
+        let slots = Arc::clone(&env.build_slots);
+        let sessions = env.sessions.clone();
+        let teardown_log = env.process_pids.join("teardown.log");
+        let workspace_root = env.workspace_root.clone();
+        let disconnect_pid_path = env.process_pids.join("disconnect.pid");
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let response = post_session(&Client::new(), &base, "managed-failure");
+            let events = BufReader::new(response)
+                .lines()
+                .map(|line| serde_json::from_str::<SessionStartEvent>(&line.unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, SessionStartEvent::Exit { code: 7, .. })));
+            wait_for_session_cleanup(&slots, &workspace_root);
+
+            let response = post_session(&Client::new(), &base, "managed-disconnect");
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<SessionStartEvent>(line.trim()).unwrap(),
+                SessionStartEvent::Session { .. }
+            ));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !disconnect_pid_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(reader);
+            wait_for_session_cleanup(&slots, &workspace_root);
+            assert_eq!(sessions.active_count(), 0);
+            assert_eq!(
+                std::fs::read_to_string(teardown_log)
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nonreading_session_stream_cannot_block_cleanup_or_timers() {
+        let env = setup_env();
+        let (session_id, _receiver, worker) = spawn_direct_session(&env, "managed", 1);
+        let timer_handles = env.sessions.timer_handles_for_test(&session_id);
+        tokio::time::timeout(Duration::from_secs(4), worker)
+            .await
+            .expect("nonreader cleanup deadline")
+            .unwrap();
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_eq!(env.build_slots.available_permits(), 1);
+        assert!(timer_handles.iter().all(|handle| handle.is_finished()));
+
+        let slots = Arc::clone(&env.build_slots);
+        let workspace_root = env.workspace_root.clone();
+        let pid_path = env.process_pids.join("nonreader.pid");
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                let base = format!("http://{addr}");
+                let response = post_session(&Client::new(), &base, "managed-nonreader");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let pid = loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                        .ok()
+                        .and_then(|value| value.trim().parse::<i32>().ok())
+                        .ok_or(())
+                    {
+                        break pid;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "nonreader pid was not published"
+                    );
+                    std::thread::yield_now();
+                };
+                wait_for_session_cleanup(&slots, &workspace_root);
+                assert!(!process_exists(pid));
+                drop(response);
+            }),
+        )
+        .await
+        .expect("connected nonreader cleanup deadline")
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn commit_barriers_enforce_pre_and_post_ready_disconnect_semantics() {
+        let pre = setup_env();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        pre.sessions
+            .install_commit_election_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let (pre_id, mut pre_events, pre_worker) = spawn_direct_session(&pre, "managed", 128);
+        wait_barrier(arrived).await;
+        pre.sessions.disconnect(&pre_id);
+        wait_barrier(release).await;
+        pre_worker.await.unwrap();
+        assert!(!std::iter::from_fn(|| pre_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        assert_eq!(pre.sessions.active_count(), 0);
+        assert_eq!(pre.build_slots.available_permits(), 1);
+
+        let post = setup_env();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        post.sessions
+            .install_after_commit_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let (post_id, mut post_events, post_worker) = spawn_direct_session(&post, "managed", 128);
+        wait_barrier(arrived).await;
+        post.sessions.disconnect(&post_id);
+        assert_eq!(post.sessions.active_count(), 1);
+        wait_barrier(release).await;
+        post_worker.await.unwrap();
+        assert!(std::iter::from_fn(|| post_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let stopped = post.sessions.stop(&post_id).unwrap();
+        assert_eq!(stopped.teardown.exit_code, Some(0));
+        assert_eq!(post.build_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancellation_is_forced_at_each_initialization_phase_boundary() {
+        use crate::build::InitializationCheckpoint;
+
+        for checkpoint in [
+            InitializationCheckpoint::Extraction,
+            InitializationCheckpoint::Ownership,
+            InitializationCheckpoint::Setup,
+            InitializationCheckpoint::Run,
+        ] {
+            let env = setup_env();
+            let arrived = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            env.sessions.install_initialization_checkpoint_hook(
+                checkpoint,
+                Arc::clone(&arrived),
+                Arc::clone(&release),
+            );
+            let (session_id, mut events, worker) =
+                spawn_direct_session(&env, "managed-phased", 128);
+            wait_barrier(arrived).await;
+            env.sessions.disconnect(&session_id);
+            wait_barrier(release).await;
+            worker.await.unwrap();
+            let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, SessionStartEvent::Ready { .. })),
+                "{checkpoint:?} cancellation published Ready"
+            );
+            let setup_marker = env.process_pids.join("teardown.log.setup");
+            if checkpoint == InitializationCheckpoint::Run {
+                assert!(
+                    setup_marker.is_file(),
+                    "setup did not finish before run boundary"
+                );
+            } else if checkpoint == InitializationCheckpoint::Setup {
+                assert!(!setup_marker.exists(), "setup ran before its boundary");
+            }
+            assert_eq!(env.sessions.active_count(), 0, "{checkpoint:?}");
+            assert_eq!(env.build_slots.available_permits(), 1, "{checkpoint:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_lifetime_and_explicit_stop_terminate_initialization_at_barrier() {
+        let expired = setup_env();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        expired.sessions.install_initialization_checkpoint_hook(
+            crate::build::InitializationCheckpoint::Extraction,
+            Arc::clone(&arrived),
+            Arc::clone(&release),
+        );
+        let (expired_id, mut expired_events, expired_worker) =
+            spawn_direct_session(&expired, "managed", 128);
+        wait_barrier(arrived).await;
+        let sessions = expired.sessions.clone();
+        let id = expired_id.clone();
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::task::spawn_blocking(move || sessions.wait_for_terminating_for_test(&id)),
+        )
+        .await
+        .expect("maximum lifetime during initialization")
+        .unwrap();
+        wait_barrier(release).await;
+        expired_worker.await.unwrap();
+        assert!(!std::iter::from_fn(|| expired_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        assert_eq!(expired.sessions.active_count(), 0);
+        assert_eq!(expired.build_slots.available_permits(), 1);
+
+        let stopped = setup_env();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        stopped.sessions.install_initialization_checkpoint_hook(
+            crate::build::InitializationCheckpoint::Extraction,
+            Arc::clone(&arrived),
+            Arc::clone(&release),
+        );
+        let (stopped_id, _events, stopped_worker) = spawn_direct_session(&stopped, "managed", 128);
+        wait_barrier(arrived).await;
+        let sessions = stopped.sessions.clone();
+        let id = stopped_id.clone();
+        let stop = tokio::task::spawn_blocking(move || sessions.stop(&id));
+        let sessions = stopped.sessions.clone();
+        let id = stopped_id.clone();
+        tokio::task::spawn_blocking(move || sessions.wait_for_terminating_for_test(&id))
+            .await
+            .unwrap();
+        wait_barrier(release).await;
+        let response = stop.await.unwrap().unwrap();
+        stopped_worker.await.unwrap();
+        assert!(response.teardown.error_code.is_some());
+        assert!(response.artifacts.is_none());
+        assert_eq!(stopped.sessions.active_count(), 0);
+        assert_eq!(stopped.build_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_commit_failure_removes_temp_and_cleans_session() {
+        let env = setup_env();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        env.sessions
+            .install_before_commit_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let (session_id, mut events, worker) = spawn_direct_session(&env, "managed", 128);
+        wait_barrier(arrived).await;
+        let metadata_root = env.sessions.metadata_root();
+        std::fs::create_dir_all(metadata_root).unwrap();
+        std::fs::set_permissions(metadata_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let temp_metadata = metadata_root.join(format!(".{session_id}.tmp"));
+        std::fs::write(&temp_metadata, "force create_new failure").unwrap();
+        wait_barrier(release).await;
+        worker.await.unwrap();
+        let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionStartEvent::Error { code, .. } if code == "session_commit_failed"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        assert!(!temp_metadata.exists());
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_eq!(env.build_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_and_automatic_cleanup_have_stable_lock_elected_results() {
+        let explicit = setup_env();
+        let (session_id, mut events, worker) = spawn_direct_session(&explicit, "managed", 128);
+        worker.await.unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        explicit
+            .sessions
+            .install_explicit_cleanup_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let sessions = explicit.sessions.clone();
+        let stop_id = session_id.clone();
+        let stop = tokio::task::spawn_blocking(move || sessions.stop(&stop_id));
+        wait_barrier(arrived).await;
+        explicit.sessions.force_lifetime_for_test(&session_id);
+        wait_barrier(release).await;
+        let response = stop.await.unwrap().unwrap();
+        assert!(response.artifacts.is_some());
+        assert_eq!(explicit.sessions.active_count(), 0);
+        assert_eq!(explicit.build_slots.available_permits(), 1);
+
+        let automatic = setup_env();
+        let (session_id, mut events, worker) = spawn_direct_session(&automatic, "managed", 128);
+        worker.await.unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let timer_handles = automatic.sessions.timer_handles_for_test(&session_id);
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        automatic
+            .sessions
+            .install_automatic_cleanup_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let sessions = automatic.sessions.clone();
+        let lifetime_id = session_id.clone();
+        let lifetime = tokio::task::spawn_blocking(move || {
+            sessions.force_lifetime_for_test(&lifetime_id);
+        });
+        wait_barrier(arrived).await;
+        assert!(matches!(
+            automatic.sessions.stop(&session_id),
+            Err(StopError::Conflict)
+        ));
+        wait_barrier(release).await;
+        lifetime.await.unwrap();
+        assert_eq!(automatic.sessions.active_count(), 0);
+        assert_eq!(automatic.build_slots.available_permits(), 1);
+        assert_dir_empty(automatic.temp.path().join("artifacts").as_path());
+        assert!(timer_handles.iter().all(|handle| handle.is_finished()));
+
+        let idle = setup_env();
+        let (session_id, mut events, worker) = spawn_direct_session(&idle, "managed", 128);
+        worker.await.unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        idle.sessions
+            .install_automatic_cleanup_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let sessions = idle.sessions.clone();
+        let idle_id = session_id.clone();
+        let expiry = tokio::task::spawn_blocking(move || {
+            sessions.force_idle_for_test(&idle_id);
+        });
+        wait_barrier(arrived).await;
+        assert!(matches!(
+            idle.sessions.stop(&session_id),
+            Err(StopError::Conflict)
+        ));
+        wait_barrier(release).await;
+        expiry.await.unwrap();
+        assert_eq!(idle.sessions.active_count(), 0);
+        assert_eq!(idle.build_slots.available_permits(), 1);
+        assert_dir_empty(idle.temp.path().join("artifacts").as_path());
+    }
+
+    #[tokio::test]
     async fn workspace_lifecycle_routes_are_absent() {
         let env = setup_env();
         let (addr, server) = start_http_server(env.app).await;
@@ -1644,11 +2506,684 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn configured_session_actions_stream_input_evidence_and_nonzero_reuse() {
+        let env = setup_env();
+        let slots = Arc::clone(&env.build_slots);
+        let workspace_root = env.workspace_root.clone();
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let client = bounded_lifecycle_client();
+            let session_id = start_managed_session(&client, &base, "managed");
+            let events = run_action_events(
+                &client,
+                &base,
+                &session_id,
+                "observe",
+                serde_json::json!({"operator_data": "value", "argv": ["only-data"]}),
+            );
+            assert!(matches!(
+                events.first(),
+                Some(SessionActionEvent::Action {
+                    session_id: id,
+                    action,
+                    status: crate::protocol::SessionActionStatus::Started,
+                    ..
+                }) if id == &session_id && action == "observe"
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SessionActionEvent::Stdout { data } if data.contains("observed")
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SessionActionEvent::Action {
+                    status: crate::protocol::SessionActionStatus::Snapshotting,
+                    ..
+                }
+            )));
+            let (archive_path, restrictions) = match events.last().unwrap() {
+                SessionActionEvent::Exit {
+                    session_id: id,
+                    action_id,
+                    action,
+                    code: 0,
+                    timed_out: false,
+                    artifacts: Some(archive),
+                    artifact_restrictions: Some(restrictions),
+                } => {
+                    assert_eq!(id, &session_id);
+                    assert!(action_id.starts_with("act_"));
+                    assert_eq!(action, "observe");
+                    (archive.path.clone(), restrictions.clone())
+                }
+                event => panic!("unexpected final action event: {event:?}"),
+            };
+            assert_eq!(restrictions.omitted_count, 1);
+            assert_eq!(
+                restrictions.matched_patterns,
+                ["work/screenshots/secret.txt"]
+            );
+            let zip = client
+                .get(format!("{base}{archive_path}"))
+                .send()
+                .unwrap()
+                .bytes()
+                .unwrap();
+            let expected_input = serde_json::json!({
+                "operator_data": "value",
+                "argv": ["only-data"]
+            })
+            .to_string();
+            assert_zip_exactly_contains(
+                &zip,
+                &["work/screenshots/input.json"],
+                "work/screenshots/input.json",
+                &expected_input,
+            );
+
+            let nonzero = run_action_events(
+                &client,
+                &base,
+                &session_id,
+                "nonzero",
+                serde_json::json!({"diagnostic": true}),
+            );
+            assert!(matches!(
+                nonzero.last(),
+                Some(SessionActionEvent::Exit {
+                    code: 7,
+                    timed_out: false,
+                    ..
+                })
+            ));
+            let reused = run_action_events(
+                &client,
+                &base,
+                &session_id,
+                "early",
+                serde_json::json!({"ignored": "stdin"}),
+            );
+            assert!(matches!(
+                reused.last(),
+                Some(SessionActionEvent::Exit {
+                    code: 0,
+                    timed_out: false,
+                    ..
+                })
+            ));
+            assert_eq!(
+                client
+                    .delete(format!("{base}/v1/sessions/{session_id}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            wait_for_session_cleanup(&slots, &workspace_root);
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn action_json_authority_and_exact_body_boundary_are_enforced() {
+        let env = setup_env();
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let client = bounded_lifecycle_client();
+            let session_id = start_managed_session(&client, &base, "managed");
+            for body in [
+                serde_json::json!([]),
+                serde_json::json!({"schema_version": "1", "input": []}),
+                serde_json::json!({"schema_version": "1", "input": {}, "argv": ["forbidden"]}),
+                serde_json::json!({"schema_version": "1", "input": {}, "cwd": "/tmp"}),
+                serde_json::json!({"schema_version": "1", "input": {}, "timeout_sec": 999}),
+            ] {
+                assert_eq!(
+                    post_action(&client, &base, &session_id, "early", body).status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            assert_eq!(
+                post_action(
+                    &client,
+                    &base,
+                    &session_id,
+                    "missing",
+                    serde_json::json!({"schema_version": "1", "input": {}}),
+                )
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+
+            let prefix = r#"{"schema_version":"1","input":{"padding":""#;
+            let suffix = r#""}}"#;
+            let padding = "x".repeat(MAX_SESSION_ACTION_BODY_BYTES - prefix.len() - suffix.len());
+            let exact = format!("{prefix}{padding}{suffix}");
+            assert_eq!(exact.len(), MAX_SESSION_ACTION_BODY_BYTES);
+            let exact_response = client
+                .post(format!("{base}/v1/sessions/{session_id}/actions/early"))
+                .header(header::CONTENT_TYPE.as_str(), "application/json")
+                .body(exact)
+                .send()
+                .unwrap();
+            assert_eq!(exact_response.status(), StatusCode::OK);
+            let exact_events: Vec<SessionActionEvent> = BufReader::new(exact_response)
+                .lines()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect();
+            assert!(matches!(
+                exact_events.last(),
+                Some(SessionActionEvent::Exit { code: 0, .. })
+            ));
+
+            let oversized = "x".repeat(MAX_SESSION_ACTION_BODY_BYTES + 1);
+            assert_eq!(
+                client
+                    .post(format!("{base}/v1/sessions/{session_id}/actions/early"))
+                    .header(header::CONTENT_TYPE.as_str(), "application/json")
+                    .body(oversized)
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+            let _ = client
+                .delete(format!("{base}/v1/sessions/{session_id}"))
+                .send()
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn action_conflicts_disconnects_and_destructive_failures_cleanup() {
+        let env = setup_env_with_session_lifetime(60);
+        let slots = Arc::clone(&env.build_slots);
+        let workspace_root = env.workspace_root.clone();
+        let process_pids = env.process_pids.clone();
+        let sessions = env.sessions.clone();
+        let (addr, server) = start_http_server(env.app).await;
+        tokio::task::spawn_blocking(move || {
+            let base = format!("http://{addr}");
+            let client = bounded_lifecycle_client();
+            let session_id = start_managed_session(&client, &base, "managed");
+            let response = post_action(
+                &client,
+                &base,
+                &session_id,
+                "block",
+                serde_json::json!({"schema_version": "1", "input": {}}),
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut reader = BufReader::new(response);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            assert!(matches!(
+                serde_json::from_str::<SessionActionEvent>(line.trim()).unwrap(),
+                SessionActionEvent::Action {
+                    status: crate::protocol::SessionActionStatus::Started,
+                    ..
+                }
+            ));
+            assert_eq!(
+                post_action(
+                    &client,
+                    &base,
+                    &session_id,
+                    "early",
+                    serde_json::json!({"schema_version": "1", "input": {}}),
+                )
+                .status(),
+                StatusCode::CONFLICT
+            );
+            let pid_path = process_pids.join("action-block.pid");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !pid_path.is_file() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            sessions.force_lifetime_for_test(&session_id);
+            drop(reader);
+            wait_for_session_cleanup(&slots, &workspace_root);
+            if pid_path.is_file() {
+                let pid = std::fs::read_to_string(&pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!(!process_exists(pid));
+            }
+
+            let _ = std::fs::remove_file(&pid_path);
+            let disconnect_id = start_managed_session(&client, &base, "managed");
+            let response = post_action(
+                &client,
+                &base,
+                &disconnect_id,
+                "block",
+                serde_json::json!({"schema_version": "1", "input": {}}),
+            );
+            let mut disconnected = BufReader::new(response);
+            line.clear();
+            assert!(disconnected.read_line(&mut line).unwrap() > 0);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !pid_path.is_file() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(disconnected);
+            wait_for_session_cleanup(&slots, &workspace_root);
+            if pid_path.is_file() {
+                let pid = std::fs::read_to_string(&pid_path)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!(!process_exists(pid));
+            }
+
+            let timeout_id = start_managed_session(&client, &base, "managed");
+            let timeout = run_action_events(
+                &client,
+                &base,
+                &timeout_id,
+                "timeout",
+                serde_json::json!({"ignored": true}),
+            );
+            assert!(matches!(
+                timeout.last(),
+                Some(SessionActionEvent::Exit {
+                    timed_out: true,
+                    ..
+                })
+            ));
+            wait_for_session_cleanup(&slots, &workspace_root);
+            assert_eq!(
+                client
+                    .delete(format!("{base}/v1/sessions/{timeout_id}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+
+            let output_id = start_managed_session(&client, &base, "managed");
+            let output =
+                run_action_events(&client, &base, &output_id, "output", serde_json::json!({}));
+            assert!(output.iter().any(|event| matches!(
+                event,
+                SessionActionEvent::Error { code, .. } if code == "output_limit"
+            )));
+            wait_for_session_cleanup(&slots, &workspace_root);
+            assert_eq!(
+                std::fs::read_to_string(process_pids.join("teardown.log"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                4,
+                "lifetime, disconnect, timeout, and output exhaustion must each teardown once"
+            );
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_preempts_snapshot_and_idle_expiry_hides_half_torn_session() {
+        let snapshot = setup_env();
+        let (snapshot_addr, snapshot_server) = start_http_server(snapshot.app).await;
+        let snapshot_base = format!("http://{snapshot_addr}");
+        let session_id = tokio::task::spawn_blocking({
+            let base = snapshot_base.clone();
+            move || start_managed_session(&bounded_lifecycle_client(), &base, "managed")
+        })
+        .await
+        .unwrap();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        snapshot
+            .sessions
+            .install_action_snapshot_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let action = tokio::task::spawn_blocking({
+            let base = snapshot_base.clone();
+            let id = session_id.clone();
+            move || {
+                run_action_events(
+                    &bounded_lifecycle_client(),
+                    &base,
+                    &id,
+                    "observe",
+                    serde_json::json!({"snapshot": true}),
+                )
+            }
+        });
+        wait_barrier(arrived).await;
+        let stop = tokio::task::spawn_blocking({
+            let base = snapshot_base.clone();
+            let id = session_id.clone();
+            move || {
+                bounded_lifecycle_client()
+                    .delete(format!("{base}/v1/sessions/{id}"))
+                    .send()
+                    .unwrap()
+            }
+        });
+        tokio::task::spawn_blocking({
+            let sessions = snapshot.sessions.clone();
+            let id = session_id.clone();
+            move || sessions.wait_for_terminating_for_test(&id)
+        })
+        .await
+        .unwrap();
+        wait_barrier(release).await;
+        assert_eq!(stop.await.unwrap().status(), StatusCode::OK);
+        let action_events = action.await.unwrap();
+        assert!(action_events.iter().any(|event| matches!(
+            event,
+            SessionActionEvent::Action {
+                status: crate::protocol::SessionActionStatus::Snapshotting,
+                ..
+            }
+        )));
+        assert!(!action_events
+            .iter()
+            .any(|event| matches!(event, SessionActionEvent::Exit { .. })));
+        assert_eq!(snapshot.sessions.active_count(), 0);
+        snapshot_server.abort();
+
+        let idle = setup_env();
+        let (idle_addr, idle_server) = start_http_server(idle.app).await;
+        let idle_base = format!("http://{idle_addr}");
+        let idle_id = tokio::task::spawn_blocking({
+            let base = idle_base.clone();
+            move || start_managed_session(&bounded_lifecycle_client(), &base, "managed")
+        })
+        .await
+        .unwrap();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        idle.sessions
+            .install_automatic_cleanup_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let expiry = tokio::task::spawn_blocking({
+            let sessions = idle.sessions.clone();
+            let id = idle_id.clone();
+            move || sessions.force_idle_for_test(&id)
+        });
+        wait_barrier(arrived).await;
+        let status = tokio::task::spawn_blocking({
+            let base = idle_base.clone();
+            let id = idle_id.clone();
+            move || {
+                post_action(
+                    &bounded_lifecycle_client(),
+                    &base,
+                    &id,
+                    "early",
+                    serde_json::json!({"schema_version": "1", "input": {}}),
+                )
+                .status()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        wait_barrier(release).await;
+        expiry.await.unwrap();
+        assert_eq!(idle.sessions.active_count(), 0);
+        idle_server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_and_lifetime_preempt_every_snapshot_stage_with_single_teardown() {
+        for checkpoint in [
+            ArtifactSnapshotCheckpoint::Traversal,
+            ArtifactSnapshotCheckpoint::ArchiveWrite,
+            ArtifactSnapshotCheckpoint::Published,
+        ] {
+            let env = setup_env_with_session_lifetime(60);
+            let (session_id, mut ready_events, initializer) =
+                spawn_direct_session(&env, "managed", 128);
+            initializer.await.unwrap();
+            assert!(std::iter::from_fn(|| ready_events.try_recv().ok())
+                .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+            let arrived = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            env.sessions.install_artifact_checkpoint_hook(
+                checkpoint,
+                Arc::clone(&arrived),
+                Arc::clone(&release),
+            );
+            let reservation = env.sessions.start_action(&session_id, "observe").unwrap();
+            let (sender, _receiver) = mpsc::channel(128);
+            let sessions = env.sessions.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                sessions.execute_action(reservation, br#"{}"#.to_vec(), sender);
+            });
+            wait_barrier(arrived).await;
+            assert!(matches!(
+                env.sessions.start_action(&session_id, "early"),
+                Err(ActionError::Conflict)
+            ));
+            if checkpoint == ArtifactSnapshotCheckpoint::Published {
+                assert!(std::fs::read_dir(env.temp.path().join("artifacts"))
+                    .unwrap()
+                    .next()
+                    .is_some());
+            }
+            let stop = tokio::task::spawn_blocking({
+                let sessions = env.sessions.clone();
+                let id = session_id.clone();
+                move || sessions.stop(&id).unwrap()
+            });
+            tokio::task::spawn_blocking({
+                let sessions = env.sessions.clone();
+                let id = session_id.clone();
+                move || sessions.wait_for_terminating_for_test(&id)
+            })
+            .await
+            .unwrap();
+            wait_barrier(release).await;
+            let stopped = stop.await.unwrap();
+            assert_eq!(stopped.teardown.exit_code, Some(0));
+            assert!(stopped.artifacts.is_some());
+            worker.await.unwrap();
+            assert_eq!(env.sessions.active_count(), 0);
+            assert_eq!(
+                std::fs::read_dir(env.temp.path().join("artifacts"))
+                    .unwrap()
+                    .count(),
+                1,
+                "cancelled action archive leaked alongside explicit-stop archive"
+            );
+            assert_eq!(
+                std::fs::read_to_string(env.process_pids.join("teardown.log"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{checkpoint:?} teardown count"
+            );
+        }
+
+        let env = setup_env_with_session_lifetime(60);
+        let (session_id, mut ready_events, initializer) =
+            spawn_direct_session(&env, "managed", 128);
+        initializer.await.unwrap();
+        assert!(std::iter::from_fn(|| ready_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        env.sessions.install_artifact_checkpoint_hook(
+            ArtifactSnapshotCheckpoint::Published,
+            Arc::clone(&arrived),
+            Arc::clone(&release),
+        );
+        let reservation = env.sessions.start_action(&session_id, "observe").unwrap();
+        let (sender, _receiver) = mpsc::channel(128);
+        let sessions = env.sessions.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            sessions.execute_action(reservation, br#"{}"#.to_vec(), sender);
+        });
+        wait_barrier(arrived).await;
+        env.sessions.force_lifetime_for_test(&session_id);
+        wait_barrier(release).await;
+        worker.await.unwrap();
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_dir_empty(&env.temp.path().join("artifacts"));
+        assert_eq!(
+            std::fs::read_to_string(env.process_pids.join("teardown.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn final_enqueue_without_delivery_ack_destroys_session_and_archive() {
+        let env = setup_env();
+        let (session_id, mut ready_events, initializer) =
+            spawn_direct_session(&env, "managed", 128);
+        initializer.await.unwrap();
+        assert!(std::iter::from_fn(|| ready_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        env.sessions
+            .install_final_enqueued_hook(Arc::clone(&arrived), Arc::clone(&release));
+        let reservation = env.sessions.start_action(&session_id, "observe").unwrap();
+        let action_id = reservation.action_id().to_string();
+        let (sender, _receiver) = mpsc::channel(128);
+        let sessions = env.sessions.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            sessions.execute_action(reservation, br#"{"late":true}"#.to_vec(), sender);
+        });
+        wait_barrier(arrived).await;
+        assert!(std::fs::read_dir(env.temp.path().join("artifacts"))
+            .unwrap()
+            .next()
+            .is_some());
+        env.sessions.disconnect_action(&session_id, &action_id);
+        wait_barrier(release).await;
+        worker.await.unwrap();
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_dir_empty(&env.temp.path().join("artifacts"));
+        assert_eq!(
+            std::fs::read_to_string(env.process_pids.join("teardown.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_after_final_poll_but_before_delivery_ack_destroys_session() {
+        let env = setup_env();
+        let (session_id, mut ready_events, initializer) =
+            spawn_direct_session(&env, "managed", 128);
+        initializer.await.unwrap();
+        assert!(std::iter::from_fn(|| ready_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        let reservation = env.sessions.start_action(&session_id, "observe").unwrap();
+        let action_id = reservation.action_id().to_string();
+        let (sender, receiver) = mpsc::channel(128);
+        let sessions = env.sessions.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            sessions.execute_action(reservation, br#"{}"#.to_vec(), sender);
+        });
+        let mut stream = SessionActionEventStream {
+            receiver,
+            sessions: env.sessions.clone(),
+            session_id: session_id.clone(),
+            action_id,
+            pending_ack: None,
+        };
+        loop {
+            let event = stream.next().await.expect("action stream event");
+            if matches!(event, SessionActionEvent::Exit { .. }) {
+                break;
+            }
+        }
+        assert!(stream.pending_ack.is_some());
+        drop(stream);
+        worker.await.unwrap();
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_dir_empty(&env.temp.path().join("artifacts"));
+        assert_eq!(
+            std::fs::read_to_string(env.process_pids.join("teardown.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_post_spawn_action_setup_failure_destroys_session_once() {
+        let env = setup_env();
+        let (session_id, mut ready_events, initializer) =
+            spawn_direct_session(&env, "managed", 128);
+        initializer.await.unwrap();
+        assert!(std::iter::from_fn(|| ready_events.try_recv().ok())
+            .any(|event| matches!(event, SessionStartEvent::Ready { .. })));
+        env.sessions.force_next_action_setup_failure();
+        let reservation = env.sessions.start_action(&session_id, "block").unwrap();
+        let (sender, mut receiver) = mpsc::channel(128);
+        let sessions = env.sessions.clone();
+        tokio::task::spawn_blocking(move || {
+            sessions.execute_action(reservation, br#"{}"#.to_vec(), sender);
+        })
+        .await
+        .unwrap();
+        let events = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|item| item.event)
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionActionEvent::Error { code, .. } if code == "stdin_write_failed"
+        )));
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_eq!(
+            std::fs::read_to_string(env.process_pids.join("teardown.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
     fn setup_env() -> TestEnv {
-        setup_env_with_upload_timeout(SourcesConfig::default().upload_timeout_sec)
+        setup_env_with_options(SourcesConfig::default().upload_timeout_sec, true)
     }
 
     fn setup_env_with_upload_timeout(upload_timeout_sec: u64) -> TestEnv {
+        setup_env_with_options(upload_timeout_sec, true)
+    }
+
+    fn setup_env_with_options(upload_timeout_sec: u64, managed_sessions_enabled: bool) -> TestEnv {
+        setup_env_with_options_and_lifetime(upload_timeout_sec, managed_sessions_enabled, 2)
+    }
+
+    fn setup_env_with_session_lifetime(max_lifetime_sec: u64) -> TestEnv {
+        setup_env_with_options_and_lifetime(
+            SourcesConfig::default().upload_timeout_sec,
+            true,
+            max_lifetime_sec,
+        )
+    }
+
+    fn setup_env_with_options_and_lifetime(
+        upload_timeout_sec: u64,
+        managed_sessions_enabled: bool,
+        max_lifetime_sec: u64,
+    ) -> TestEnv {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join("workspaces");
         let artifacts_root = temp.path().join("artifacts");
@@ -1661,8 +3196,11 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  setup) printf 'prepared\n' > setup.txt ;;\n  setup-error) printf setup-failed > out/setup-failed.txt; exit 9 ;;\n  setup-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  phase-output) dd if=/dev/zero bs=1048576 count=17 2>/dev/null ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  teardown) printf 'teardown\\n' >> \"$TEARDOWN_LOG\"; sleep 0.2 ;;\n  setup) printf 'prepared\n' > setup.txt ;;\n  managed-setup) printf 'prepared\n' > setup.txt; printf complete > \"$TEARDOWN_LOG.setup\" ;;\n  setup-error) printf setup-failed > out/setup-failed.txt; exit 9 ;;\n  setup-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  phase-output) dd if=/dev/zero bs=1048576 count=17 2>/dev/null ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  action-observe) mkdir -p screenshots; cat > screenshots/input.json; printf observed; printf secret > screenshots/secret.txt ;;\n  action-nonzero) cat > action-nonzero.json; exit 7 ;;\n  action-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  action-output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null | tr '\\000' x; exec sleep 60 ;;\n  action-early) exit 0 ;;\n  action-block) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
                 marker.display(),
+                process_pids.display(),
+                process_pids.display(),
+                process_pids.display(),
                 process_pids.display(),
                 process_pids.display(),
                 process_pids.display(),
@@ -1676,6 +3214,7 @@ mod tests {
 
         let artifacts = ArtifactsConfig {
             storage_root: artifacts_root,
+            restricted_patterns: vec!["work/screenshots/secret.txt".to_string()],
             ..ArtifactsConfig::default()
         };
         let mut service = ServiceConfig::default();
@@ -1696,10 +3235,15 @@ mod tests {
                     executable: Some(script.clone()),
                     args: vec!["fixed".to_string()],
                     setup: None,
+                    session: None,
                     cwd: "work".to_string(),
                     timeout_sec: 30,
                     environment: HashMap::from([
                         ("FIXED".to_string(), "server".to_string()),
+                        (
+                            "TEARDOWN_LOG".to_string(),
+                            process_pids.join("teardown.log").display().to_string(),
+                        ),
                         (
                             "PATH".to_string(),
                             "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
@@ -1748,6 +3292,66 @@ mod tests {
                     });
                     task
                 };
+                let action =
+                    |arg: &str, timeout_sec: u64, artifacts: ArtifactSpec| SessionActionConfig {
+                        script: None,
+                        executable: Some(script.clone()),
+                        args: vec![arg.to_string()],
+                        timeout_sec,
+                        artifacts,
+                    };
+                let mut managed = build_task.clone();
+                managed.session = Some(TaskSessionConfig {
+                    idle_timeout_sec: max_lifetime_sec / 2,
+                    max_lifetime_sec,
+                    teardown: SessionTeardownConfig {
+                        script: None,
+                        executable: Some(script.clone()),
+                        args: vec!["teardown".to_string()],
+                        timeout_sec: 3,
+                    },
+                    actions: HashMap::from([
+                        (
+                            "observe".to_string(),
+                            action(
+                                "action-observe",
+                                3,
+                                ArtifactSpec {
+                                    include: vec!["work/screenshots/**".to_string()],
+                                    exclude: Vec::new(),
+                                },
+                            ),
+                        ),
+                        (
+                            "nonzero".to_string(),
+                            action("action-nonzero", 3, ArtifactSpec::default()),
+                        ),
+                        (
+                            "timeout".to_string(),
+                            action("action-timeout", 1, ArtifactSpec::default()),
+                        ),
+                        (
+                            "output".to_string(),
+                            action("action-output", 9, ArtifactSpec::default()),
+                        ),
+                        (
+                            "early".to_string(),
+                            action("action-early", 3, ArtifactSpec::default()),
+                        ),
+                        (
+                            "block".to_string(),
+                            action("action-block", 30, ArtifactSpec::default()),
+                        ),
+                    ]),
+                });
+                let mut managed_phased = phased_task("managed-setup", 3);
+                managed_phased.session = managed.session.clone();
+                let mut managed_failure = process_task("error", 3);
+                managed_failure.session = managed.session.clone();
+                let mut managed_disconnect = process_task("disconnect", 30);
+                managed_disconnect.session = managed.session.clone();
+                let mut managed_nonreader = process_task("nonreader", 10);
+                managed_nonreader.session = managed.session.clone();
                 let mut setup_error = phased_task("setup-error", 30);
                 setup_error.script = Some(ScriptText::new(format!(
                     "printf forbidden > '{}'",
@@ -1766,6 +3370,11 @@ mod tests {
                 shared_output.artifacts.include.clear();
                 HashMap::from([
                     ("build".to_string(), build_task.clone()),
+                    ("managed".to_string(), managed),
+                    ("managed-phased".to_string(), managed_phased),
+                    ("managed-failure".to_string(), managed_failure),
+                    ("managed-disconnect".to_string(), managed_disconnect),
+                    ("managed-nonreader".to_string(), managed_nonreader),
                     ("error".to_string(), process_task("error", 30)),
                     ("timeout".to_string(), process_task("timeout", 1)),
                     ("disconnect".to_string(), process_task("disconnect", 30)),
@@ -1801,12 +3410,16 @@ mod tests {
         config.validate().expect("valid test config");
         let max_transfer_bytes = config.sources.max_transfer_bytes;
         let build_slots = Arc::new(Semaphore::new(1));
+        let config = Arc::new(config);
+        let sessions = SessionManager::new(Arc::clone(&config)).expect("session manager");
         let app = build_router(
             AppState {
-                config: Arc::new(config),
+                config: Arc::clone(&config),
                 auth: Arc::new(AuthSecrets::empty()),
                 auth_required: false,
                 build_slots: Arc::clone(&build_slots),
+                sessions: sessions.clone(),
+                managed_sessions_enabled,
             },
             max_transfer_bytes,
         );
@@ -1817,6 +3430,8 @@ mod tests {
             marker,
             process_pids,
             build_slots,
+            sessions,
+            config,
         }
     }
 
@@ -1927,6 +3542,131 @@ mod tests {
         )
     }
 
+    fn spawn_direct_session(
+        env: &TestEnv,
+        task: &str,
+        channel_capacity: usize,
+    ) -> (
+        String,
+        mpsc::Receiver<SessionStartEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let permit = Arc::clone(&env.build_slots)
+            .try_acquire_owned()
+            .expect("test session permit");
+        let validated = crate::build::ValidatedRequest {
+            request_id: Some(format!("{task}-direct")),
+            task_id: task.to_string(),
+            task: env.config.tasks.get(task).unwrap().clone(),
+        };
+        let reservation = env.sessions.reserve(validated, permit);
+        let session_id = reservation.id().to_string();
+        assert!(env.sessions.begin_initialization(&reservation));
+        let source = source_zip().into_temp_path();
+        let sessions = env.sessions.clone();
+        let (sender, receiver) = mpsc::channel(channel_capacity);
+        let worker = tokio::task::spawn_blocking(move || {
+            sessions.initialize(reservation, source, sender);
+        });
+        (session_id, receiver, worker)
+    }
+
+    async fn wait_barrier(barrier: Arc<std::sync::Barrier>) {
+        tokio::task::spawn_blocking(move || barrier.wait())
+            .await
+            .unwrap();
+    }
+
+    fn post_session(client: &Client, base: &str, task: &str) -> reqwest::blocking::Response {
+        let source = source_zip();
+        client
+            .post(format!("{base}/v1/sessions"))
+            .multipart(
+                Form::new()
+                    .part(
+                        "metadata",
+                        Part::text(
+                            serde_json::json!({
+                                "schema_version": "1",
+                                "request_id": format!("{task}-session"),
+                                "task": task,
+                                "source": {"format": "zip"}
+                            })
+                            .to_string(),
+                        )
+                        .mime_str("application/json")
+                        .unwrap(),
+                    )
+                    .part(
+                        "source",
+                        Part::file(source.path())
+                            .unwrap()
+                            .mime_str("application/zip")
+                            .unwrap(),
+                    ),
+            )
+            .send()
+            .expect("post session")
+    }
+
+    fn start_managed_session(client: &Client, base: &str, task: &str) -> String {
+        let response = post_session(client, base, task);
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut reader = BufReader::new(response);
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            match serde_json::from_str::<SessionStartEvent>(line.trim()).unwrap() {
+                SessionStartEvent::Ready { session_id, .. } => return session_id,
+                SessionStartEvent::Exit { code, .. } => {
+                    panic!("session initialization exited {code}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn post_action(
+        client: &Client,
+        base: &str,
+        session_id: &str,
+        action: &str,
+        body: serde_json::Value,
+    ) -> reqwest::blocking::Response {
+        client
+            .post(format!("{base}/v1/sessions/{session_id}/actions/{action}"))
+            .json(&body)
+            .send()
+            .expect("post session action")
+    }
+
+    fn run_action_events(
+        client: &Client,
+        base: &str,
+        session_id: &str,
+        action: &str,
+        input: serde_json::Value,
+    ) -> Vec<SessionActionEvent> {
+        let response = post_action(
+            client,
+            base,
+            session_id,
+            action,
+            serde_json::json!({"schema_version": "1", "input": input}),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut reader = BufReader::new(response);
+        let mut events = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            events.push(serde_json::from_str(line.trim()).expect("session action event"));
+        }
+        events
+    }
+
     fn run_task_events(client: &Client, base: &str, task: &str) -> (Vec<String>, (i32, bool)) {
         let response = post_task(client, base, task);
         assert_eq!(response.status(), StatusCode::OK);
@@ -1983,6 +3723,33 @@ mod tests {
         }
         assert_eq!(slots.available_permits(), 1);
         assert_dir_empty(workspace_root);
+    }
+
+    fn wait_for_session_cleanup(slots: &Semaphore, workspace_root: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (slots.available_permits() != 1
+            || std::fs::read_dir(workspace_root)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.file_name() != ".sessions")
+                })
+                .unwrap_or(true))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(slots.available_permits(), 1);
+        let remaining = std::fs::read_dir(workspace_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != ".sessions")
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.is_empty(),
+            "session workspace not clean: {remaining:?}"
+        );
     }
 
     fn read_pid(path: &Path) -> i32 {
