@@ -160,11 +160,11 @@ Use an absolute, operator-selected Devenv executable and adjust only deployment-
 
 - `indentured:check` runs the repository check appropriate to this host profile;
 - `indentured:session:setup` prepares files consumed by session startup;
-- `indentured:session:start` initializes the retained external state once;
+- `indentured:session:start` initializes the retained external state once and then exits successfully; the server retains the session record and workspace, not that foreground process;
 - `indentured:session:action` reads exactly one dispatcher envelope from inherited stdin;
 - `indentured:session:stop` performs idempotent cleanup and may populate `.indentured-output/final/`.
 
-The action task receives compact JSON such as `{"schema_version":"1","action":"observe","input":{}}`. It must validate schema and action, treat every input field as data, reject unsupported names promptly with a nonzero exit, and avoid Devenv task dependencies that compete for stdin. All names share the dispatcher's fixed 120-second example timeout and `.indentured-output/action/**` snapshot policy. Use strict named actions instead when implementations must remain operator-owned or need different limits or artifact allowlists.
+The action task receives compact JSON with no trailing newline, such as `{"schema_version":"1","action":"observe","input":{}}`. A shell task can capture it with `IFS= read -r envelope || test -n "$envelope"`. It must validate schema and action, treat every input field as data, reject unsupported names promptly with a nonzero exit, and avoid Devenv task dependencies that compete for stdin. All names share the dispatcher's fixed 120-second example timeout and `.indentured-output/action/**` snapshot policy. Use strict named actions instead when implementations must remain operator-owned or need different limits or artifact allowlists.
 
 Uploaded repository hooks are arbitrary code under the configured task identity. A fixed `repo_check` or `repo_session` name is not a per-script security boundary. Create a separate host profile only for a distinct identity, permission set, resource limit, lifecycle, artifact policy, or operator-owned capability. The source tree uploaded by `session start` remains pinned for that session; stop and start a new session to pick up repository changes.
 
