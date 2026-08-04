@@ -99,6 +99,32 @@ The managed-session regression uses only distinguishable fake file-backed extern
 
 This is package/protocol evidence, not a production security bypass or a native macOS/CoreSimulator runtime attestation. The supported unauthenticated loopback setting exists only inside the isolated test and does not change production defaults or bearer behavior. Tasks are trusted server-owned commands, not caller-provided shell authority. The harness uses no forge, SSH/remote-shell transport, source publication, Xcode, or remote Mac. It remains a Devenv/script check rather than a universal flake check because loopback networking and privilege setup are not portable across all Nix build sandboxes.
 
+## Bootstrap native checks through Indentured
+
+The repository tracks `.indentured-server/config.toml` without an endpoint or credential path. From a trusted client, set `INDENTURED_SERVER_ENDPOINT` and `INDENTURED_SERVER_TOKEN_FILE`, then submit this tree to a fixed one-shot task named `darwin_check`:
+
+```sh
+INDENTURED_SERVER_ENDPOINT=https://mac-builder.example.ts.net \
+INDENTURED_SERVER_TOKEN_FILE=/absolute/operator-local/bearer-token \
+  indentured run darwin_check
+```
+
+Before managed sessions are deployed, that one-shot task can provide native package/build evidence using an operator-selected absolute Devenv executable:
+
+```toml
+[tasks.darwin_check]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["shell", "--", "/bin/sh", "scripts/check-darwin.sh"]
+cwd = "."
+timeout_sec = 1800
+workspace = "fresh"
+
+[tasks.darwin_check.environment]
+PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+```
+
+Merge the task into the root-owned deployed schema-8 server configuration and adjust only deployment-owned absolute paths. Leave `INDENTURED_DARWIN_SESSION_GATE` unset for this bootstrap run: a one-shot task holds the default global permit, so calling the same service's managed-session gate from inside it would receive `503 busy`. After deploying managed sessions, drive `session start/action/stop` externally against the live service and run the operator-owned CoreSimulator gate outside an Indentured task. This avoids a self-deadlock while keeping endpoint, credential, users, and host paths out of the repository.
+
 ## Native macOS acceptance gate
 
 Deployment automation/operator policy must block live-service acceptance until tests against the actual launchd job and concrete configured task prove all of the following:

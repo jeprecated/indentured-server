@@ -3,7 +3,6 @@
 *.swp
 *.swo
 .DS_Store
-/.indentured-server/config.toml
 .codemap
 .specs
 /.pi-subagents/

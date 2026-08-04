@@ -247,11 +247,13 @@ The configured `PATH` controls initial unpinned `devenv` resolution; Devenv then
 
 ## Client configuration and use
 
-`indentured` searches upward for `.indentured-server/config.toml`. Copy [`config/client.toml.example`](config/client.toml.example) to that path to start from the strict client schema. The live `.indentured-server/config.toml` is ignored local state: review its endpoint and credential-file path for the current environment before enabling remote submission. The optional source patterns apply only when no `.jj` repository marker is found.
+`indentured` searches upward for `.indentured-server/config.toml`. This repository tracks a no-secret [client configuration](.indentured-server/config.toml) with connection behavior and output defaults; it deliberately contains no endpoint or credential path. Supply those through `INDENTURED_SERVER_ENDPOINT` and `INDENTURED_SERVER_TOKEN_FILE` (or CLI flags). Other repositories can copy [`config/client.toml.example`](config/client.toml.example) as a starting point. The optional source patterns apply only when no `.jj` repository marker is found.
 
 Run one configured task:
 
 ```sh
+export INDENTURED_SERVER_ENDPOINT=https://builder.example.internal
+export INDENTURED_SERVER_TOKEN_FILE=/absolute/operator-local/bearer-token
 indentured run build
 indentured --endpoint unix:///run/indentured-server/control/server.sock run --request-id agent-42 build
 indentured run --result-root /var/tmp/my-run-evidence build
