@@ -1,4 +1,4 @@
-schema_version = "8"
+schema_version = "9"
 
 [service]
 # Immediate admission control; excess authenticated requests receive HTTP 503.
@@ -55,6 +55,58 @@ LANG = "C.UTF-8"
 [tasks.build.artifacts]
 include = ["out/**"]
 exclude = ["out/**/*.tmp"]
+
+# Reusable host profile: each repository owns its `indentured:check` task.
+[tasks.repo_check]
+script = "exec devenv tasks run indentured:check"
+cwd = "."
+timeout_sec = 1800
+workspace = "fresh"
+
+[tasks.repo_check.environment]
+PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+LANG = "C.UTF-8"
+
+[tasks.repo_check.artifacts]
+include = []
+exclude = []
+
+# A session selects exactly one action mode. This sample uses one fixed
+# repository dispatcher; use [tasks.repo_session.session.actions.<name>]
+# instead when each action must remain operator-owned or needs its own policy.
+[tasks.repo_session]
+script = "exec devenv tasks run indentured:session:start"
+cwd = "."
+timeout_sec = 600
+workspace = "fresh"
+
+[tasks.repo_session.setup]
+script = "exec devenv tasks run indentured:session:setup"
+timeout_sec = 600
+
+[tasks.repo_session.environment]
+PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+LANG = "C.UTF-8"
+
+[tasks.repo_session.artifacts]
+include = [".indentured-output/final/**"]
+exclude = []
+
+[tasks.repo_session.session]
+idle_timeout_sec = 900
+max_lifetime_sec = 14400
+
+[tasks.repo_session.session.teardown]
+script = "exec devenv tasks run indentured:session:stop"
+timeout_sec = 120
+
+[tasks.repo_session.session.action_dispatcher]
+script = "exec devenv tasks run indentured:session:action"
+timeout_sec = 120
+
+[tasks.repo_session.session.action_dispatcher.artifacts]
+include = [".indentured-output/action/**"]
+exclude = []
 
 [sources]
 max_transfer_bytes = 134217728

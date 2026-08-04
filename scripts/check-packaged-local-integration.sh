@@ -12,6 +12,8 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 2
 fi
 
+printf '%s\n' '{"probe":"devenv-stdin"}' | devenv tasks run integration:stdin-probe >/dev/null
+
 server_out=$(nix build --no-link --print-out-paths .#indentured-server)
 client_out=$(nix build --no-link --print-out-paths .#indentured)
 

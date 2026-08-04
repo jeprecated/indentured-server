@@ -1,6 +1,7 @@
 # Repository-owned defaults only. Jujutsu submissions always use the complete
 # pinned @ tree. Keep endpoint and credential paths in environment variables or
-# CLI flags.
+# CLI flags. Reusable servers conventionally expose `repo_check` and
+# `repo_session`; this repository defines `indentured:check` in devenv.nix.
 [connection]
 enabled = true
 local_fallback = false

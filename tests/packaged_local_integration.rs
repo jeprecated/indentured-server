@@ -216,13 +216,82 @@ printf 'holding:%s\n' "$payload"
 while :; do :; done
 '''
 timeout_sec = 10
+
+[tasks.dispatch_probe]
+script = '''
+IFS= read -r prepared < .setup-complete
+test "$prepared" = prepared
+name=${{PWD##*/}}
+uid=$("{id_command}" -u)
+gid=$("{id_command}" -g)
+groups=
+for group in $("{id_command}" -G); do groups=${{groups:+$groups,}}$group; done
+printf 'uid=%s gid=%s groups=%s\n' "$uid" "$gid" "$groups" > "{task_state}/$name.identity"
+printf 'ready\n' > "{task_state}/$name.status"
+printf 'initialized\n'
+'''
+cwd = "."
+timeout_sec = 2
+workspace = "fresh"
+[tasks.dispatch_probe.setup]
+script = "printf 'prepared\\n' > .setup-complete"
+timeout_sec = 2
+[tasks.dispatch_probe.environment]
+PATH = "/usr/bin:/bin"
+LANG = "C"
+[tasks.dispatch_probe.artifacts]
+include = ["final/**"]
+exclude = ["final/.keep"]
+[tasks.dispatch_probe.session]
+idle_timeout_sec = 4
+max_lifetime_sec = 15
+[tasks.dispatch_probe.session.teardown]
+script = '''
+name=${{PWD##*/}}
+printf '{teardown_state}\n' > "{task_state}/$name.status"
+printf 'teardown\n' > final/teardown.txt
+'''
+timeout_sec = 2
+[tasks.dispatch_probe.session.action_dispatcher]
+script = '''
+IFS= read -r envelope || test -n "$envelope"
+case "$envelope" in
+  '{{"schema_version":"1","action":"observe-later","input":{{"step":1}}}}'|'{{"schema_version":"1","action":"observe-again","input":{{"step":1}}}}')
+    IFS= read -r count < counter
+    count=$((count + 1))
+    printf '%s\n' "$count" > counter
+    printf '%s\n' "$envelope" > evidence/dispatch.txt
+    printf 'dispatched:%s\n' "$count"
+    ;;
+  '{{"schema_version":"1","action":"fail-later","input":{{"step":1}}}}')
+    printf 'ordinary-dispatch-failure:%s\n' "$envelope" >&2
+    exit 9
+    ;;
+  '{{"schema_version":"1","action":"timeout-later","input":{{"step":1}}}}')
+    trap '' TERM
+    while :; do :; done
+    ;;
+  '{{"schema_version":"1","action":"hold-later","input":{{"step":1}}}}')
+    printf 'holding-dispatch\n'
+    while :; do :; done
+    ;;
+  *)
+    printf 'unsupported-action\n' >&2
+    exit 64
+    ;;
+esac
+'''
+timeout_sec = 2
+[tasks.dispatch_probe.session.action_dispatcher.artifacts]
+include = ["evidence/**"]
+exclude = ["evidence/.keep"]
 "#,
         )
     });
     fs::write(
         &config,
         format!(
-            r#"schema_version = "8"
+            r#"schema_version = "9"
 [service]
 max_concurrent_builds = 1
 [service.socket]
@@ -690,11 +759,17 @@ fn packaged_client(client: &Path, source: &Path, state: &Path) -> Command {
     command
 }
 
-fn start_session(client: &Path, source: &Path, state: &Path, results: &Path) -> String {
+fn start_session_for_task(
+    client: &Path,
+    source: &Path,
+    state: &Path,
+    results: &Path,
+    task: &str,
+) -> String {
     let output = packaged_client(client, source, state)
         .args(["session", "start", "--result-root"])
         .arg(results)
-        .arg("session_probe")
+        .arg(task)
         .output()
         .expect("start packaged managed session");
     assert_success(&output, "session start");
@@ -802,8 +877,19 @@ fn start_session_with_state(
     results: &Path,
     task_state: &Path,
 ) -> (String, PathBuf) {
+    start_session_with_state_for_task(client, source, state, results, task_state, "session_probe")
+}
+
+fn start_session_with_state_for_task(
+    client: &Path,
+    source: &Path,
+    state: &Path,
+    results: &Path,
+    task_state: &Path,
+    task: &str,
+) -> (String, PathBuf) {
     let before = task_status_paths(task_state);
-    let session = start_session(client, source, state, results);
+    let session = start_session_for_task(client, source, state, results, task);
     let mut created = None;
     wait_until(
         || {
@@ -884,6 +970,23 @@ fn wait_for_teardown(status: &Path, expected: &str, message: &str) {
     );
 }
 
+fn assert_action_provenance(results: &Path, action: &str, exit_code: i32) {
+    let found = fs::read_dir(results)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read(entry.path().join("provenance.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .any(|value| {
+            value["operation"] == "action"
+                && value["action"] == action
+                && value["remote_exit_code"] == exit_code
+        });
+    assert!(
+        found,
+        "missing action provenance for {action} exit {exit_code}"
+    );
+}
+
 fn assert_result_artifact(results: &Path, suffix: &Path, expected: &str) {
     let found = fs::read_dir(results)
         .unwrap()
@@ -930,7 +1033,147 @@ fn packaged_managed_session_flow() {
         start_packaged_server(&server_bin, &server_root, ServerConfigMode::Full);
     write_client_config(&source, &endpoint);
 
-    // Initialization is reused across successful and ordinary nonzero actions.
+    // One fixed dispatcher receives arbitrary names only through its bounded stdin envelope.
+    let (dispatched, dispatched_status) = start_session_with_state_for_task(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &task_state,
+        "dispatch_probe",
+    );
+    let observed = session_action(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &dispatched,
+        "observe-later",
+    );
+    assert_success(&observed, "dispatcher observe-later");
+    assert!(String::from_utf8_lossy(&observed.stdout).contains("dispatched:1"));
+    let failed = session_action(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &dispatched,
+        "fail-later",
+    );
+    assert_eq!(failed.status.code(), Some(9));
+    let unknown_started = Instant::now();
+    let unknown = session_action(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &dispatched,
+        "not-supported",
+    );
+    assert_eq!(unknown.status.code(), Some(64));
+    assert!(unknown_started.elapsed() < Duration::from_secs(2));
+    let reused = session_action(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &dispatched,
+        "observe-again",
+    );
+    assert_success(&reused, "dispatcher reuse after nonzero exits");
+    assert!(String::from_utf8_lossy(&reused.stdout).contains("dispatched:2"));
+    assert_action_provenance(&results, "observe-later", 0);
+    assert_action_provenance(&results, "fail-later", 9);
+    assert_action_provenance(&results, "not-supported", 64);
+    assert_action_provenance(&results, "observe-again", 0);
+    assert_result_artifact(
+        &results,
+        Path::new("evidence/dispatch.txt"),
+        "{\"schema_version\":\"1\",\"action\":\"observe-again\",\"input\":{\"step\":1}}\n",
+    );
+    assert_success(
+        &stop_session(&client_bin, &source, &state, &results, &dispatched),
+        "dispatcher explicit stop",
+    );
+    wait_for_teardown(
+        &dispatched_status,
+        "torn-down\n",
+        "dispatcher stop did not run teardown",
+    );
+    wait_until(
+        || workspace_count(&server_root) == 0 && metadata_count(&server_root) == 0,
+        "dispatcher stop did not remove session state",
+    );
+
+    let (timed_dispatch, timed_dispatch_status) = start_session_with_state_for_task(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &task_state,
+        "dispatch_probe",
+    );
+    let timed = session_action(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &timed_dispatch,
+        "timeout-later",
+    );
+    assert_eq!(timed.status.code(), Some(124));
+    wait_for_teardown(
+        &timed_dispatch_status,
+        "torn-down\n",
+        "dispatcher timeout did not run teardown",
+    );
+    wait_until(
+        || workspace_count(&server_root) == 0,
+        "dispatcher timeout did not destroy the session",
+    );
+
+    let (dropped_dispatch, dropped_dispatch_status) = start_session_with_state_for_task(
+        &client_bin,
+        &source,
+        &state,
+        &results,
+        &task_state,
+        "dispatch_probe",
+    );
+    let mut dropped = ChildGuard(
+        packaged_client(&client_bin, &source, &state)
+            .args([
+                "session",
+                "action",
+                &dropped_dispatch,
+                "hold-later",
+                "--input",
+            ])
+            .arg(source.join("action.json"))
+            .arg("--result-root")
+            .arg(&results)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut dropped_stdout = BufReader::new(dropped.stdout.take().unwrap());
+    let mut marker = String::new();
+    dropped_stdout.read_line(&mut marker).unwrap();
+    assert_eq!(marker, "holding-dispatch\n");
+    dropped.kill().unwrap();
+    dropped.wait().unwrap();
+    wait_for_teardown(
+        &dropped_dispatch_status,
+        "torn-down\n",
+        "dispatcher disconnect did not run teardown",
+    );
+    wait_until(
+        || workspace_count(&server_root) == 0,
+        "dispatcher disconnect did not destroy the session",
+    );
+
+    // Initialization is reused across successful and ordinary nonzero named actions.
     let (session, explicit_status) =
         start_session_with_state(&client_bin, &source, &state, &results, &task_state);
     assert_eq!(workspace_count(&server_root), 1);

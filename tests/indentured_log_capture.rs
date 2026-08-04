@@ -205,7 +205,7 @@ fn start_real_server(root: &Path) -> (String, Child) {
     fs::write(
         &config,
         format!(
-            r#"schema_version = "8"
+            r#"schema_version = "9"
 [service]
 max_concurrent_builds = 1
 [service.socket]

@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::artifacts::{collect_artifacts_zip, ArtifactError};
-use crate::config::{Config, TaskConfig, TaskExecution, SCRIPT_SHELL};
+use crate::config::{Config, SessionActionConfig, TaskConfig, TaskExecution, SCRIPT_SHELL};
 use crate::protocol::{
     ArtifactArchive, BuildPhase, PhaseResult, Request, ResponseEvent, SessionActionEvent,
     SessionActionStatus, SessionActionStreamItem, SessionStartEvent, SessionStartStatus,
@@ -720,6 +720,7 @@ pub(crate) struct SessionActionRunOutcome {
 pub(crate) fn run_session_action(
     task_id: &str,
     task: &TaskConfig,
+    action: &SessionActionConfig,
     config: &Config,
     workspace: &Path,
     session_id: &str,
@@ -729,11 +730,6 @@ pub(crate) fn run_session_action(
     sender: &Sender<SessionActionStreamItem>,
     cancellation: &CancellationFlag,
 ) -> Result<SessionActionRunOutcome, BuildError> {
-    let action = task
-        .session
-        .as_ref()
-        .and_then(|session| session.actions.get(action_name))
-        .ok_or_else(|| BuildError::new("unknown_action", "configured session action missing"))?;
     send_action_response(
         sender,
         SessionActionEvent::Action {
@@ -2265,7 +2261,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "8"
+schema_version = "9"
 tasks = {}
 [service.http]
 enabled = true
@@ -2496,6 +2492,7 @@ required = false
                     timeout_sec: 1,
                 },
                 actions: HashMap::from([("forced".to_string(), action)]),
+                action_dispatcher: None,
             }),
             cwd: ".".to_string(),
             timeout_sec: 30,
@@ -2527,6 +2524,12 @@ required = false
         let error = run_session_action(
             "managed",
             &task,
+            task.session
+                .as_ref()
+                .unwrap()
+                .actions
+                .get("forced")
+                .unwrap(),
             &config,
             temp.path(),
             "ses_forced",
@@ -2555,6 +2558,13 @@ required = false
         let outcome = run_session_action(
             "managed",
             &blocking_task,
+            blocking_task
+                .session
+                .as_ref()
+                .unwrap()
+                .actions
+                .get("forced")
+                .unwrap(),
             &config,
             temp.path(),
             "ses_blocked_stdin",

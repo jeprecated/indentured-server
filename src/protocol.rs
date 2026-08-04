@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUEST_SCHEMA_VERSION: &str = "1";
 pub const SESSION_REQUEST_SCHEMA_VERSION: &str = "1";
+pub(crate) const SESSION_ACTION_DISPATCH_SCHEMA_VERSION: &str = "1";
 pub const MAX_REQUEST_ID_LEN: usize = 128;
 pub const MAX_TASK_ID_LEN: usize = 64;
 pub const MAX_SESSION_ID_LEN: usize = 128;
@@ -39,6 +40,13 @@ pub struct SessionStartRequest {
 pub struct SessionActionRequest {
     pub schema_version: String,
     pub input: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionActionDispatchInput<'a> {
+    pub schema_version: &'static str,
+    pub action: &'a str,
+    pub input: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

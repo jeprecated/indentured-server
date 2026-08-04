@@ -2,6 +2,8 @@
 
 This example shows how an operator can use Indentured's generic managed-session contract for an iOS Simulator workflow. It is policy and wrapper code owned by the deployment, not built-in iOS behavior. Indentured does not install Xcode, choose a runtime, parse action JSON, invoke `simctl`, or ship MCP, Node, `idb`, or a simulator driver.
 
+This remains the strict **named-action** example: root-owned wrappers and per-action policy are deliberate. When uploaded repository code may own dispatch instead, use the generic `repo_session` convention in [the macOS deployment guide](macos-launchd-tailscale-deployment.md#reusable-repository-capability-profiles); do not treat that profile name as an additional security boundary.
+
 ## Fixed deployment inputs
 
 Pin these values in deployment configuration and review them when Xcode or the runtime changes:
@@ -17,7 +19,7 @@ Do not use the ambiguous `booted` selector. Every wrapper reads the one explicit
 Example operator configuration:
 
 ```toml
-schema_version = "8"
+schema_version = "9"
 
 [build]
 workspace_root = "/var/db/indentured-server/workspaces"

@@ -21,10 +21,11 @@ use crate::build::{
     initialize_session, run_session_action, run_session_teardown, send_action_response,
     CancellationFlag, ValidatedRequest,
 };
-use crate::config::{Config, TaskConfig, MAX_SESSION_LIFETIME_SEC};
+use crate::config::{Config, SessionActionConfig, TaskConfig, MAX_SESSION_LIFETIME_SEC};
 use crate::protocol::{
-    SessionActionEvent, SessionActionStatus, SessionActionStreamItem, SessionStartEvent,
-    SessionStopResponse, SessionTeardownResult,
+    SessionActionDispatchInput, SessionActionEvent, SessionActionStatus, SessionActionStreamItem,
+    SessionStartEvent, SessionStopResponse, SessionTeardownResult,
+    SESSION_ACTION_DISPATCH_SCHEMA_VERSION,
 };
 
 const METADATA_VERSION: u8 = 1;
@@ -51,7 +52,15 @@ pub(crate) struct SessionActionReservation {
     entry: Arc<SessionEntry>,
     action_id: String,
     action_name: String,
+    action: SessionActionConfig,
+    mode: SessionActionMode,
     cancellation: CancellationFlag,
+}
+
+#[derive(Clone, Copy)]
+enum SessionActionMode {
+    Named,
+    Dispatcher,
 }
 
 impl SessionActionReservation {
@@ -61,6 +70,21 @@ impl SessionActionReservation {
 
     pub(crate) fn action_id(&self) -> &str {
         &self.action_id
+    }
+
+    pub(crate) fn encode_input(
+        &self,
+        input: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<u8> {
+        let encoded = match self.mode {
+            SessionActionMode::Named => serde_json::to_vec(input),
+            SessionActionMode::Dispatcher => serde_json::to_vec(&SessionActionDispatchInput {
+                schema_version: SESSION_ACTION_DISPATCH_SCHEMA_VERSION,
+                action: &self.action_name,
+                input,
+            }),
+        };
+        encoded.expect("JSON value serialization cannot fail")
     }
 }
 
@@ -522,14 +546,14 @@ impl SessionManager {
         action_name: &str,
     ) -> Result<SessionActionReservation, ActionError> {
         let entry = self.lookup(session_id).ok_or(ActionError::NotFound)?;
-        if !entry
-            .task
-            .session
-            .as_ref()
-            .is_some_and(|session| session.actions.contains_key(action_name))
-        {
+        let session = entry.task.session.as_ref().ok_or(ActionError::NotFound)?;
+        let (action, mode) = if let Some(action) = session.actions.get(action_name) {
+            (action.clone(), SessionActionMode::Named)
+        } else if let Some(action) = &session.action_dispatcher {
+            (action.clone(), SessionActionMode::Dispatcher)
+        } else {
             return Err(ActionError::UnknownAction);
-        }
+        };
         let cancellation = CancellationFlag::default();
         #[cfg(test)]
         {
@@ -553,6 +577,8 @@ impl SessionManager {
                     entry,
                     action_id,
                     action_name: action_name.to_string(),
+                    action,
+                    mode,
                     cancellation,
                 })
             }
@@ -574,10 +600,12 @@ impl SessionManager {
         let entry = reservation.entry;
         let action_id = reservation.action_id;
         let action_name = reservation.action_name;
+        let action = reservation.action;
         let cancellation = reservation.cancellation;
         let outcome = run_session_action(
             &entry.task_id,
             &entry.task,
+            &action,
             &self.inner.config,
             &entry.workspace,
             &entry.id,
@@ -650,12 +678,6 @@ impl SessionManager {
         }
 
         let archive_id = format!("bld_{}", Uuid::new_v4().simple());
-        let action = entry
-            .task
-            .session
-            .as_ref()
-            .and_then(|session| session.actions.get(&action_name))
-            .expect("reserved configured action");
         let checkpoint = |checkpoint| {
             #[cfg(test)]
             self.wait_at_hook(HookKind::ArtifactSnapshot(checkpoint));
@@ -1605,6 +1627,7 @@ mod tests {
                         artifacts: ArtifactSpec::default(),
                     },
                 )]),
+                action_dispatcher: None,
             }),
             cwd: ".".to_string(),
             timeout_sec: 1,
@@ -1710,6 +1733,51 @@ mod tests {
         );
         assert!(reservation.remaining_lifetime() > Duration::from_secs(1));
         manager.cancel_upload(&reservation);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_reservation_retains_fixed_action_and_encodes_name_as_data() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = test_config(temp.path(), &executable);
+        config.service.http.enabled = true;
+        let session = config
+            .tasks
+            .get_mut("managed")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap();
+        session.action_dispatcher = session.actions.remove("observe");
+        config.validate().unwrap();
+        let config = Arc::new(config);
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new(Arc::clone(&config)).unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let reservation = manager.reserve(
+            ValidatedRequest {
+                request_id: None,
+                task_id: "managed".to_string(),
+                task: config.tasks["managed"].clone(),
+            },
+            permit,
+        );
+        *reservation.entry.state.lock().unwrap() = SessionState::Ready {
+            last_activity: Instant::now(),
+        };
+
+        let action = manager
+            .start_action(reservation.id(), "observe-later")
+            .unwrap();
+        assert_eq!(action.action.args, vec!["observe".to_string()]);
+        let input = serde_json::Map::from_iter([("count".to_string(), serde_json::Value::from(2))]);
+        assert_eq!(
+            action.encode_input(&input),
+            br#"{"schema_version":"1","action":"observe-later","input":{"count":2}}"#
+        );
     }
 
     #[test]

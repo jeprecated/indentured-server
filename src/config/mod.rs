@@ -11,7 +11,7 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "8";
+pub const CONFIG_SCHEMA_VERSION: &str = "9";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
 pub(crate) const MAX_SESSION_LIFETIME_SEC: u64 = u32::MAX as u64;
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
@@ -587,7 +587,10 @@ pub struct TaskSessionConfig {
     pub idle_timeout_sec: u64,
     pub max_lifetime_sec: u64,
     pub teardown: SessionTeardownConfig,
+    #[serde(default)]
     pub actions: HashMap<String, SessionActionConfig>,
+    #[serde(default)]
+    pub action_dispatcher: Option<SessionActionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +665,10 @@ impl TaskConfig {
                         .actions
                         .values()
                         .any(|action| action.script.is_some())
+                    || session
+                        .action_dispatcher
+                        .as_ref()
+                        .is_some_and(|action| action.script.is_some())
             })
     }
 
@@ -775,9 +782,9 @@ impl TaskSessionConfig {
             max_timeout_sec,
         )?;
 
-        if self.actions.is_empty() {
+        if self.actions.is_empty() == self.action_dispatcher.is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{field}.actions must include at least one named action"
+                "{field} must configure exactly one of named actions or action_dispatcher"
             )));
         }
         for (action_name, action) in &self.actions {
@@ -787,6 +794,19 @@ impl TaskSessionConfig {
                 )));
             }
             let action_field = format!("{field}.actions.{action_name}");
+            validate_session_execution(
+                &action.script,
+                &action.executable,
+                &action.args,
+                action.timeout_sec,
+                &action_field,
+                environment,
+                max_timeout_sec,
+            )?;
+            validate_artifact_spec(&action.artifacts, &format!("{action_field}.artifacts"))?;
+        }
+        if let Some(action) = &self.action_dispatcher {
+            let action_field = format!("{field}.action_dispatcher");
             validate_session_execution(
                 &action.script,
                 &action.executable,
@@ -1248,6 +1268,7 @@ mod tests {
                     },
                 },
             )]),
+            action_dispatcher: None,
         }
     }
 
@@ -1283,7 +1304,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "8"
+schema_version = "9"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1294,7 +1315,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "8"
+schema_version = "9"
 tasks = {}
 [service.http]
 enabled = true
@@ -1456,6 +1477,90 @@ tokens = ["secret"]
     }
 
     #[test]
+    fn managed_session_requires_exactly_one_action_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = valid_config(temp.path());
+
+        let mut dispatched = session(executable.clone());
+        dispatched.action_dispatcher = dispatched.actions.remove("observe");
+        config.tasks.get_mut("build").unwrap().session = Some(dispatched.clone());
+        config.validate().expect("dispatcher-only session");
+
+        let mut both = session(executable.clone());
+        both.action_dispatcher = dispatched.action_dispatcher.clone();
+        config.tasks.get_mut("build").unwrap().session = Some(both);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+
+        dispatched.action_dispatcher = None;
+        config.tasks.get_mut("build").unwrap().session = Some(dispatched);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+    }
+
+    #[test]
+    fn managed_session_dispatcher_uses_named_action_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = valid_config(temp.path());
+        let mut dispatched = session(executable);
+        dispatched.action_dispatcher = dispatched.actions.remove("observe");
+        config.tasks.get_mut("build").unwrap().session = Some(dispatched);
+
+        type DispatcherMutation = Box<dyn Fn(&mut SessionActionConfig, u64)>;
+        let cases: Vec<DispatcherMutation> = vec![
+            Box::new(|action, _| action.timeout_sec = 0),
+            Box::new(|action, max| action.timeout_sec = max + 1),
+            Box::new(|action, _| action.artifacts.include = vec!["../outside".to_string()]),
+            Box::new(|action, _| action.executable = None),
+            Box::new(|action, _| {
+                action.script = Some(ScriptText::new("true"));
+                action.args = vec!["not-allowed".to_string()];
+                action.executable = None;
+            }),
+        ];
+        for mutate in cases {
+            let mut invalid = config.clone();
+            let max_timeout = invalid.build.max_timeout_sec;
+            mutate(
+                invalid
+                    .tasks
+                    .get_mut("build")
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .action_dispatcher
+                    .as_mut()
+                    .unwrap(),
+                max_timeout,
+            );
+            assert!(invalid.validate().is_err());
+        }
+
+        let task = config.tasks.get_mut("build").unwrap();
+        let dispatcher = task
+            .session
+            .as_mut()
+            .unwrap()
+            .action_dispatcher
+            .as_mut()
+            .unwrap();
+        dispatcher.script = Some(ScriptText::new("true"));
+        dispatcher.executable = None;
+        dispatcher.args.clear();
+        assert!(task.uses_script());
+        config.validate().expect("script dispatcher");
+    }
+
+    #[test]
     fn managed_session_lifetime_has_a_representable_instant_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
         let executable = std::env::current_exe().expect("current executable");
@@ -1499,17 +1604,21 @@ timeout_sec = 30
     }
 
     #[test]
-    fn schema_seven_without_sessions_migrates_by_version_only() {
+    fn schema_eight_named_actions_migrate_by_version_only() {
         let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
         let mut legacy = valid_config(temp.path());
-        legacy.schema_version = "7".to_string();
+        legacy.tasks.get_mut("build").unwrap().session = Some(session(executable));
+        legacy.schema_version = "8".to_string();
         assert!(legacy.validate().is_err());
         let legacy_toml = toml::to_string(&legacy).unwrap();
         let migrated_toml =
-            legacy_toml.replacen("schema_version = \"7\"", "schema_version = \"8\"", 1);
+            legacy_toml.replacen("schema_version = \"8\"", "schema_version = \"9\"", 1);
         let migrated: Config = toml::from_str(&migrated_toml).unwrap();
         migrated.validate().expect("version-only migration");
-        assert!(migrated.tasks.values().all(|task| task.session.is_none()));
+        let session = migrated.tasks["build"].session.as_ref().unwrap();
+        assert!(session.actions.contains_key("observe"));
+        assert!(session.action_dispatcher.is_none());
     }
 
     #[test]
@@ -1526,7 +1635,7 @@ timeout_sec = 30
         }
 
         let legacy = r#"
-schema_version = "8"
+schema_version = "9"
 tasks = {}
 [service.http]
 enabled = true
@@ -1574,10 +1683,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_eight_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_nine_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "8"
+            r#"schema_version = "9"
 [service.http]
 enabled = true
 [build]
@@ -1632,7 +1741,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["7", "9"] {
+        for version in ["8", "10"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config

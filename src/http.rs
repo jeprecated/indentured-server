@@ -755,10 +755,6 @@ async fn run_session_action(
         Ok(request) => request,
         Err(err) => return bad_request(&err.to_string()),
     };
-    let input = match serde_json::to_vec(&request.input) {
-        Ok(input) => input,
-        Err(err) => return server_error(&format!("failed to encode session action input: {err}")),
-    };
     let sessions = state.sessions.clone();
     let reservation = match sessions.start_action(&session_id, &action) {
         Ok(reservation) => reservation,
@@ -776,6 +772,7 @@ async fn run_session_action(
             return (StatusCode::CONFLICT, body).into_response();
         }
     };
+    let input = reservation.encode_input(&request.input);
     let action_id = reservation.action_id().to_string();
     let reserved_session_id = reservation.session_id().to_string();
     let (sender, receiver) = mpsc::channel(128);
@@ -2659,6 +2656,15 @@ mod tests {
                 .status(),
                 StatusCode::NOT_FOUND
             );
+            assert_eq!(
+                client
+                    .delete(format!("{base}/v1/sessions/{session_id}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            let session_id = start_managed_session(&client, &base, "managed-dispatch");
 
             let prefix = r#"{"schema_version":"1","input":{"padding":""#;
             let suffix = r#""}}"#;
@@ -2666,7 +2672,9 @@ mod tests {
             let exact = format!("{prefix}{padding}{suffix}");
             assert_eq!(exact.len(), MAX_SESSION_ACTION_BODY_BYTES);
             let exact_response = client
-                .post(format!("{base}/v1/sessions/{session_id}/actions/early"))
+                .post(format!(
+                    "{base}/v1/sessions/{session_id}/actions/observe-later"
+                ))
                 .header(header::CONTENT_TYPE.as_str(), "application/json")
                 .body(exact)
                 .send()
@@ -2676,9 +2684,16 @@ mod tests {
                 .lines()
                 .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
                 .collect();
+            assert!(exact_events.iter().any(
+                |event| matches!(event, SessionActionEvent::Stdout { data } if data == "dispatched")
+            ));
             assert!(matches!(
                 exact_events.last(),
-                Some(SessionActionEvent::Exit { code: 0, .. })
+                Some(SessionActionEvent::Exit {
+                    action,
+                    code: 0,
+                    ..
+                }) if action == "observe-later"
             ));
 
             let oversized = "x".repeat(MAX_SESSION_ACTION_BODY_BYTES + 1);
@@ -3196,7 +3211,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  teardown) printf 'teardown\\n' >> \"$TEARDOWN_LOG\"; sleep 0.2 ;;\n  setup) printf 'prepared\n' > setup.txt ;;\n  managed-setup) printf 'prepared\n' > setup.txt; printf complete > \"$TEARDOWN_LOG.setup\" ;;\n  setup-error) printf setup-failed > out/setup-failed.txt; exit 9 ;;\n  setup-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  phase-output) dd if=/dev/zero bs=1048576 count=17 2>/dev/null ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  action-observe) mkdir -p screenshots; cat > screenshots/input.json; printf observed; printf secret > screenshots/secret.txt ;;\n  action-nonzero) cat > action-nonzero.json; exit 7 ;;\n  action-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  action-output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null | tr '\\000' x; exec sleep 60 ;;\n  action-early) exit 0 ;;\n  action-block) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\nset -eu\ntest \"$FIXED\" = server\nprintf spawned > {}\ncase \"$1\" in\n  fixed) IFS= read -r input < input.txt || true; printf '%s:%s:%s' \"$input\" \"$1\" \"$FIXED\" > out/result.txt ;;\n  teardown) printf 'teardown\\n' >> \"$TEARDOWN_LOG\"; sleep 0.2 ;;\n  setup) printf 'prepared\n' > setup.txt ;;\n  managed-setup) printf 'prepared\n' > setup.txt; printf complete > \"$TEARDOWN_LOG.setup\" ;;\n  setup-error) printf setup-failed > out/setup-failed.txt; exit 9 ;;\n  setup-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  phase-output) dd if=/dev/zero bs=1048576 count=17 2>/dev/null ;;\n  error) exit 7 ;;\n  timeout|disconnect) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null; exec sleep 60 ;;\n  nonreader) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=16 2>/dev/null; exec sleep 60 ;;\n  action-observe) mkdir -p screenshots; cat > screenshots/input.json; printf observed; printf secret > screenshots/secret.txt ;;\n  action-dispatch) mkdir -p screenshots; cat > screenshots/input.json; printf dispatched ;;\n  action-nonzero) cat > action-nonzero.json; exit 7 ;;\n  action-timeout) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  action-output) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; dd if=/dev/zero bs=1048576 count=33 2>/dev/null | tr '\\000' x; exec sleep 60 ;;\n  action-early) exit 0 ;;\n  action-block) trap '' TERM; sleep 60 & echo $! > {}/$1.pid; exec sleep 60 ;;\n  *) exit 64 ;;\nesac\n",
                 marker.display(),
                 process_pids.display(),
                 process_pids.display(),
@@ -3343,7 +3358,14 @@ mod tests {
                             action("action-block", 30, ArtifactSpec::default()),
                         ),
                     ]),
+                    action_dispatcher: None,
                 });
+                let mut managed_dispatch = managed.clone();
+                let dispatch_session = managed_dispatch.session.as_mut().unwrap();
+                let mut dispatcher = dispatch_session.actions.remove("observe").unwrap();
+                dispatcher.args = vec!["action-dispatch".to_string()];
+                dispatch_session.actions.clear();
+                dispatch_session.action_dispatcher = Some(dispatcher);
                 let mut managed_phased = phased_task("managed-setup", 3);
                 managed_phased.session = managed.session.clone();
                 let mut managed_failure = process_task("error", 3);
@@ -3371,6 +3393,7 @@ mod tests {
                 HashMap::from([
                     ("build".to_string(), build_task.clone()),
                     ("managed".to_string(), managed),
+                    ("managed-dispatch".to_string(), managed_dispatch),
                     ("managed-phased".to_string(), managed_phased),
                     ("managed-failure".to_string(), managed_failure),
                     ("managed-disconnect".to_string(), managed_disconnect),

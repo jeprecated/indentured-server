@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `8`; request protocol versions are separate. Schema 7 configurations without managed-session blocks migrate by changing only their schema version; their one-shot task and `/v1/builds` behavior is unchanged. Older and future schemas fail closed.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `9`; request protocol versions are separate. Schema 8 named-action configurations migrate by changing only their schema version; existing task and request behavior is unchanged. Older and future schemas fail closed.
 
 ```toml
-schema_version = "8"
+schema_version = "9"
 
 [service]
 max_concurrent_builds = 1
@@ -186,9 +186,9 @@ Task validation occurs at daemon startup:
 - task names must match `[A-Za-z0-9_-]+` and are bounded to 64 bytes;
 - each task defines exactly one server-owned run `script` or absolute run `executable`; executable mode retains optional fixed `args` compatibility;
 - a task may also define one optional server-owned `setup` command using the same script/executable shape;
-- an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and at least one named action;
+- an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and exactly one action mode: a nonempty named `actions` map or one fixed `action_dispatcher`;
 - session action names use the task-name rules; action and teardown timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
-- actions and teardown inherit the task's fixed `cwd`, environment, and identity; actions may define their own artifact allowlist, while the top-level task artifact policy controls the final explicit-stop snapshot;
+- actions and teardown inherit the task's fixed `cwd`, environment, and identity; named actions may each define an artifact allowlist, while one dispatcher has one timeout and artifact policy shared by every accepted action name; the top-level task artifact policy controls the final explicit-stop snapshot;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
 - scripts run exactly as `/bin/sh -eu -c SCRIPT`; `/bin/sh` and configured executables must be accessible executable regular files;
 - script tasks require an explicit nonempty `PATH` whose colon-separated components are all absolute and nonempty;
@@ -222,7 +222,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "8"
+schema_version = "9"
 
 [tasks.ci]
 script = '''
@@ -244,6 +244,21 @@ exclude = []
 ```
 
 The configured `PATH` controls initial unpinned `devenv` resolution; Devenv then intentionally establishes the inner command environment. Configured script bodies and excerpts are redacted from daemon configuration diagnostics. Normal task stdout/stderr can still contain text deliberately emitted by the server-owned script.
+
+A dispatcher is an alternative to the named `[tasks.<task>.session.actions.<name>]` tables above, not an additional fallback:
+
+```toml
+[tasks.build.session.action_dispatcher]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["tasks", "run", "indentured:session:action"]
+timeout_sec = 120
+
+[tasks.build.session.action_dispatcher.artifacts]
+include = [".indentured-output/action/**"]
+exclude = []
+```
+
+The executable, arguments, timeout, working directory, environment, identity, and artifact allowlist remain server-owned. The repository dispatcher receives a versioned JSON envelope on stdin and must reject unsupported names promptly. Use named actions when the operator, rather than uploaded repository code, must own each action implementation or when actions need different limits.
 
 ## Client configuration and use
 
@@ -277,7 +292,9 @@ indentured session action "$session_id" observe --input ./observe.json
 indentured session stop "$session_id"
 ```
 
-Only `session start` packages and uploads source; stdout contains exactly the opaque session ID line. Initialization output and human diagnostics go to stderr while stdout/stderr evidence logs retain their original streams. `session action` accepts one JSON object from a file or `-` (stdin), wraps it in the fixed protocol envelope, streams configured action output, and extracts advertised evidence into that invocation's result directory. `session stop` waits for teardown and downloads any configured final archive. Session/action identifiers are explicit; the client stores no hidden current-session state. There are no list, reset, arbitrary-command, workspace, or filesystem subcommands, and no remote cwd/environment/timeout/artifact flags. Artifact selection remains server-owned.
+Only `session start` packages and uploads source; stdout contains exactly the opaque session ID line. That pinned source remains in use for the session lifetime, so stop and start a new session to pick up repository changes. Initialization output and human diagnostics go to stderr while stdout/stderr evidence logs retain their original streams. `session action` accepts one JSON object from a file or `-` (stdin), wraps it in the fixed HTTP request, streams configured action output, and extracts advertised evidence into that invocation's result directory. `session stop` waits for teardown and downloads any configured final archive. Session/action identifiers are explicit; the client stores no hidden current-session state. There are no list, reset, arbitrary-command, workspace, or filesystem subcommands, and no remote cwd/environment/timeout/artifact flags. Artifact selection remains server-owned.
+
+Reusable deployments may expose `repo_check` and `repo_session` host profiles. Repositories then own conventional Devenv tasks named `indentured:check`, `indentured:session:setup`, `indentured:session:start`, `indentured:session:action`, and `indentured:session:stop`; see the [macOS deployment guide](docs/macos-launchd-tailscale-deployment.md#reusable-repository-capability-profiles). These hooks are arbitrary uploaded code under the configured task identity, not a security boundary created by the profile name. Separate profiles are warranted only for different identity, permissions, limits, lifecycle, artifact policy, or operator-owned capability. This repository's `indentured:check` intentionally runs the Apple-silicon-Darwin-only `scripts/check-darwin.sh` because its target profile is Quartz, not every development host.
 
 Every session invocation writes private atomic provenance from preparation onward. As soon as a start/action execution ID is observed it is persisted, including on malformed, truncated, output, artifact, and interruption paths. SIGINT is installed and initially polled by the controlling operation before client configuration and source preparation; the same receiver remains directly polled across preparation, final provenance, artifacts, and nonblocking machine-ID output. Once a start ID is observed, interruption or a later start failure drops the stream, attempts a bounded best-effort stop, and records the cleanup outcome—even before Ready. If interruption wins before any ID is observed, cleanup is recorded as unavailable and no DELETE is attempted; a server session that committed Ready without its ID reaching the client is reclaimed by the configured idle expiry. Signal completion is elected before any machine-ID bytes are written, so an interrupted blocked output emits no ID and exits 130. Actions retain the same interruption/stop guarantee through input, response streaming, and artifact download. Client configuration must be a regular file; FIFOs and devices are rejected. A server without `/v1/sessions` produces an explicit upgrade diagnostic; authentication, capacity, conflict, expiry, timeout, and teardown failures retain the existing exit conventions and actionable stderr diagnostics.
 
@@ -328,7 +345,7 @@ Source ZIPs are bounded during upload and extraction by a server-owned upload de
 
 ## Managed-session protocol v1
 
-Managed sessions use the existing bearer authentication unchanged. They add no token ownership or separate authorization model. The managed-session routes are available only when the daemon runs as root and `build.run_as_user` resolves to a distinct non-root task UID; this is required so `.sessions` remains root-owned and inaccessible to task code while the session workspace is task-owned. Otherwise session start/stop returns `503 managed_sessions_unavailable` without reading an upload or reconciling `.sessions`; ordinary one-shot builds retain their existing non-root behavior. Callers can select only a configured task and configured action; argv, environment, cwd, timeouts, artifact patterns, filesystem paths, and process definitions remain server-owned.
+Managed sessions use the existing bearer authentication unchanged. They add no token ownership or separate authorization model. The managed-session routes are available only when the daemon runs as root and `build.run_as_user` resolves to a distinct non-root task UID; this is required so `.sessions` remains root-owned and inaccessible to task code while the session workspace is task-owned. Otherwise session start/stop returns `503 managed_sessions_unavailable` without reading an upload or reconciling `.sessions`; ordinary one-shot builds retain their existing non-root behavior. Callers can select only a configured task and either a configured named action or a validated action name delivered to one configured dispatcher; argv, environment, cwd, timeouts, artifact patterns, filesystem paths, and process definitions remain server-owned.
 
 `POST /v1/sessions` uses the same ordered `metadata` then `source` multipart shape and upload bounds as `POST /v1/builds`, but its metadata is the separately versioned session-start type:
 
@@ -358,7 +375,13 @@ Automatic cleanup runs teardown without publishing an unreachable final archive.
 {"schema_version":"1","input":{"operator_data":"value"}}
 ```
 
-The `input` value must be an object. Its contents are opaque data supplied to the configured action on stdin; names such as `argv` nested inside `input` are data and never process authority. Unknown top-level fields—including `argv`, `environment`, `cwd`, `timeout_sec`, `artifacts`, and `path`—are rejected. Session IDs and action-execution IDs are opaque `[A-Za-z0-9_-]+` values bounded to 128 bytes; configured action names retain the 64-byte task-identifier rules. Action streams carry stable session, action-execution, and configured-action identity:
+The `input` value must be an object. Names such as `argv` nested inside it are data and never process authority. Unknown top-level fields—including `argv`, `environment`, `cwd`, `timeout_sec`, `artifacts`, and `path`—are rejected. Session IDs and action-execution IDs are opaque `[A-Za-z0-9_-]+` values bounded to 128 bytes; action names retain the 64-byte task-identifier rules. Named mode rejects an unconfigured name with `404 unknown_action` and supplies only the compact serialized `input` object to that action's stdin. Dispatcher mode accepts every syntactically valid name and supplies this compact internal envelope to the one fixed dispatcher command:
+
+```json
+{"schema_version":"1","action":"observe","input":{"operator_data":"value"}}
+```
+
+The external encoded request remains bounded to 65,536 bytes. Dispatcher stdin is bounded by that request plus the fixed envelope and an action name of at most 64 bytes. The dispatcher must treat the name and input as data, reject unsupported names promptly with a nonzero exit, and avoid task dependencies that compete to read the inherited stdin. All dispatcher names share its configured timeout and artifact allowlist. Action streams carry stable session, action-execution, and action-name identity:
 
 ```json
 {"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"started"}
@@ -367,7 +390,7 @@ The `input` value must be an object. Its contents are opaque data supplied to th
 {"type":"exit","session_id":"ses_123","action_id":"act_456","action":"observe","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_789/artifacts.zip","size":1234}}
 ```
 
-Each action receives only the serialized `input` object on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each action and teardown has its own configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.
+Each child receives only its mode's serialized JSON on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each named action, the shared dispatcher, and teardown has its configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.
 
 A Ready session admits one action at a time. The action process and its artifact snapshot form one serialized operation, so another action receives immediate `409 session_conflict` rather than queueing, including while snapshot publication is active. Idle expiry is suspended during the operation and restarts after a completed ordinary action. Snapshot traversal retains an open workspace-root descriptor, opens every path component relative to it with no-follow semantics, verifies the opened file identity against traversal, and archives from the already-open descriptor. A task-owned symlink or rename swap therefore fails the action rather than redirecting snapshot reads.
 
@@ -393,7 +416,7 @@ This repository owns generic packages/apps, behavior, documentation, and a param
 devenv tasks run integration:packaged-local
 ```
 
-It executes the exact Nix package binaries through the one-shot flow and a generic fake-state managed-session flow without a forge, remote shell, source publication, Xcode, or remote Mac. On Linux the script enters subordinate-ID user and private PID namespaces so the daemon is root, the configured task remains a verified distinct non-root identity, and harness failure kills only its namespace descendants. The harness proves build-once reuse, successful and ordinary-nonzero actions, action/final artifacts, retained admission capacity, explicit/idle/lifetime/disconnect cleanup, genuine daemon-kill reconciliation, configuration-drift cleanup, and the unchanged setup-then-run provenance/evidence/SIGINT-cancellation regression. This is deterministic protocol/package evidence, not CoreSimulator attestation.
+It executes the exact Nix package binaries through the one-shot flow and a generic fake-state managed-session flow without a forge, remote shell, source publication, Xcode, or remote Mac. On Linux the script enters subordinate-ID user and private PID namespaces so the daemon is root, the configured task remains a verified distinct non-root identity, and harness failure kills only its namespace descendants. The harness proves named-action compatibility, arbitrary names through one fixed dispatcher, exact JSON envelopes, prompt unsupported-name failure, ordinary-nonzero reuse, action/final artifacts, retained admission capacity, explicit/idle/lifetime/timeout/disconnect cleanup, genuine daemon-kill reconciliation, configuration-drift cleanup, and the unchanged setup-then-run provenance/evidence/SIGINT-cancellation regression. This is deterministic protocol/package evidence, not CoreSimulator attestation.
 
 [`docs/managed-session-ios-simulator-example.md`](docs/managed-session-ios-simulator-example.md) provides an operator-owned iOS Simulator configuration and wrapper contract. It pins Xcode/runtime/device policy, records one explicit UDID in the session workspace, keeps JSON action data out of process authority, and defines idempotent simulator deletion. Indentured ships no iOS, MCP, Node, `idb`, or simulator-driver behavior.
 

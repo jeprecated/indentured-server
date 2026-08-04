@@ -75,7 +75,7 @@ Initial throughput is exactly one active operation: `service.max_concurrent_buil
 
 Every accepted request gets a new unpredictable workspace. The server-owned `sources.upload_timeout_sec` deadline covers source chunks and multipart trailer consumption; timeout returns stable HTTP `408 source_upload_timeout`, removes the partial file, and releases the single-run permit. Upload and complete archive preflight/extraction finish before the fixed server-owned task starts. A root daemon refuses every enabled transport unless a distinct non-root run-as identity is configured. The daemon calls `initgroups`, `setgid`, and `setuid` for that identity, clears inherited environment, and retains ownership of credentials, logs, artifacts, and control paths. Only the fresh workspace transfers to the task identity.
 
-The one-shot lifecycle is synchronous. Client SIGINT or response disconnect closes the request and cancels the remote process group. Managed sessions use separate start/action/stop requests: setup+run initialize once, one configured action runs at a time with a bounded JSON object on stdin, and configured idempotent teardown owns cleanup. The session retains only workspace files and operator-owned external state identifiers. Initialization, each action, and teardown still reap their process groups; an external service that must persist between commands must be handed to its supported launchd/CoreSimulator service context, never daemonized merely to evade cleanup.
+The one-shot lifecycle is synchronous. Client SIGINT or response disconnect closes the request and cancels the remote process group. Managed sessions use separate start/action/stop requests: setup+run initialize once, one named action or one fixed dispatcher runs at a time with bounded JSON on stdin, and configured idempotent teardown owns cleanup. The session retains only workspace files and operator-owned external state identifiers. Initialization, each action, and teardown still reap their process groups; an external service that must persist between commands must be handed to its supported launchd/CoreSimulator service context, never daemonized merely to evade cleanup.
 
 A Ready session is destroyed by explicit stop, idle expiry, maximum lifetime, unsafe action failure/disconnect, or daemon-start reconciliation. A daemon restart destroys rather than resumes durable sessions. If task configuration drifted away, the daemon can remove protected metadata/workspace but cannot reconstruct removed operator teardown authority, so wrappers must be idempotent and deployment changes must drain sessions first. Reuse of bearer authentication is unchanged; there is no new session-specific auth model.
 
@@ -95,35 +95,91 @@ scripts/check-packaged-local-integration.sh
 
 The harness builds the stable Nix server/client outputs, verifies that each package contains only its named binary, and executes those exact store binaries through bounded local loopback flows. The unchanged one-shot regression reads uploaded source, verifies exactly two provenance outcomes in setup-then-run order, observes stdout/stderr markers while the client is still active, writes an allowlisted artifact, exits 7, and verifies exact exit, private evidence/modes, provenance/manifest, artifact retrieval, controlled SIGINT cancellation, and workspace cleanup.
 
-The managed-session regression uses only distinguishable fake file-backed external state and fixed server-owned commands. It proves one initialization reused by multiple successful actions, ordinary nonzero action reuse, JSON stdin, action/final artifacts, explicit stop, retained capacity, and Ready-to-torn-down evidence for idle expiry, hard lifetime, action disconnect, and real daemon-kill restart reconciliation. It separately proves current-policy teardown after configuration drift and root-only workspace/metadata fallback when task policy was removed. Commands record their effective UID, GID, and supplementary groups; the test requires the configured distinct non-root identity and rejects root membership. On Linux the script uses subordinate UID/GID mappings so the packaged daemon is namespace-root while the task remains non-root, and runs the harness as PID-namespace init with kill-child semantics so a panic cannot orphan daemon/action descendants. It never weakens the production authority check or uses a broad process-name kill.
+The managed-session regression uses only distinguishable fake file-backed external state and fixed server-owned commands. It proves named-action compatibility, arbitrary names through one fixed dispatcher, exact JSON stdin envelopes, prompt unsupported-name failure, ordinary nonzero reuse, action/final artifacts, explicit stop, retained capacity, dispatcher timeout/disconnect cleanup, and Ready-to-torn-down evidence for idle expiry, hard lifetime, action disconnect, and real daemon-kill restart reconciliation. It separately proves current-policy teardown after configuration drift and root-only workspace/metadata fallback when task policy was removed. Commands record their effective UID, GID, and supplementary groups; the test requires the configured distinct non-root identity and rejects root membership. On Linux the script uses subordinate UID/GID mappings so the packaged daemon is namespace-root while the task remains non-root, and runs the harness as PID-namespace init with kill-child semantics so a panic cannot orphan daemon/action descendants. It never weakens the production authority check or uses a broad process-name kill.
 
 This is package/protocol evidence, not a production security bypass or a native macOS/CoreSimulator runtime attestation. The supported unauthenticated loopback setting exists only inside the isolated test and does not change production defaults or bearer behavior. Tasks are trusted server-owned commands, not caller-provided shell authority. The harness uses no forge, SSH/remote-shell transport, source publication, Xcode, or remote Mac. It remains a Devenv/script check rather than a universal flake check because loopback networking and privilege setup are not portable across all Nix build sandboxes.
 
-## Bootstrap native checks through Indentured
+## Reusable repository capability profiles
 
-The repository tracks `.indentured-server/config.toml` without an endpoint or credential path. From a trusted client, set `INDENTURED_SERVER_ENDPOINT` and `INDENTURED_SERVER_TOKEN_FILE`, then submit this tree to a fixed one-shot task named `darwin_check`:
-
-```sh
-INDENTURED_SERVER_ENDPOINT=https://mac-builder.example.ts.net \
-INDENTURED_SERVER_TOKEN_FILE=/absolute/operator-local/bearer-token \
-  indentured run darwin_check
-```
-
-Before managed sessions are deployed, that one-shot task can provide native package/build evidence using an operator-selected absolute Devenv executable:
+Deploy schema 9 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:
 
 ```toml
-[tasks.darwin_check]
+[tasks.repo_check]
 executable = "/run/current-system/sw/bin/devenv"
-args = ["shell", "--", "/bin/sh", "scripts/check-darwin.sh"]
+args = ["tasks", "run", "indentured:check"]
 cwd = "."
 timeout_sec = 1800
 workspace = "fresh"
 
-[tasks.darwin_check.environment]
+[tasks.repo_check.environment]
 PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+
+[tasks.repo_check.artifacts]
+include = []
+exclude = []
+
+[tasks.repo_session]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["tasks", "run", "indentured:session:start"]
+cwd = "."
+timeout_sec = 600
+workspace = "fresh"
+
+[tasks.repo_session.setup]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["tasks", "run", "indentured:session:setup"]
+timeout_sec = 600
+
+[tasks.repo_session.environment]
+PATH = "/run/current-system/sw/bin:/usr/bin:/bin"
+
+[tasks.repo_session.artifacts]
+include = [".indentured-output/final/**"]
+exclude = []
+
+[tasks.repo_session.session]
+idle_timeout_sec = 900
+max_lifetime_sec = 14400
+
+[tasks.repo_session.session.teardown]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["tasks", "run", "indentured:session:stop"]
+timeout_sec = 120
+
+[tasks.repo_session.session.action_dispatcher]
+executable = "/run/current-system/sw/bin/devenv"
+args = ["tasks", "run", "indentured:session:action"]
+timeout_sec = 120
+
+[tasks.repo_session.session.action_dispatcher.artifacts]
+include = [".indentured-output/action/**"]
+exclude = []
 ```
 
-Merge the task into the root-owned deployed schema-8 server configuration and adjust only deployment-owned absolute paths. Leave `INDENTURED_DARWIN_SESSION_GATE` unset for this bootstrap run: a one-shot task holds the default global permit, so calling the same service's managed-session gate from inside it would receive `503 busy`. After deploying managed sessions, drive `session start/action/stop` externally against the live service and run the operator-owned CoreSimulator gate outside an Indentured task. This avoids a self-deadlock while keeping endpoint, credential, users, and host paths out of the repository.
+Use an absolute, operator-selected Devenv executable and adjust only deployment-owned paths and limits. Repository tasks are ordinary Devenv tasks:
+
+- `indentured:check` runs the repository check appropriate to this host profile;
+- `indentured:session:setup` prepares files consumed by session startup;
+- `indentured:session:start` initializes the retained external state once;
+- `indentured:session:action` reads exactly one dispatcher envelope from inherited stdin;
+- `indentured:session:stop` performs idempotent cleanup and may populate `.indentured-output/final/`.
+
+The action task receives compact JSON such as `{"schema_version":"1","action":"observe","input":{}}`. It must validate schema and action, treat every input field as data, reject unsupported names promptly with a nonzero exit, and avoid Devenv task dependencies that compete for stdin. All names share the dispatcher's fixed 120-second example timeout and `.indentured-output/action/**` snapshot policy. Use strict named actions instead when implementations must remain operator-owned or need different limits or artifact allowlists.
+
+Uploaded repository hooks are arbitrary code under the configured task identity. A fixed `repo_check` or `repo_session` name is not a per-script security boundary. Create a separate host profile only for a distinct identity, permission set, resource limit, lifecycle, artifact policy, or operator-owned capability. The source tree uploaded by `session start` remains pinned for that session; stop and start a new session to pick up repository changes.
+
+This repository defines `indentured:check` as `scripts/check-darwin.sh`. That convention means “this repository's check for the selected Quartz capability profile,” not a portable local check; it deliberately refuses non-Apple-silicon-Darwin execution. From a trusted client:
+
+```sh
+export INDENTURED_SERVER_ENDPOINT=https://mac-builder.example.ts.net
+export INDENTURED_SERVER_TOKEN_FILE=/absolute/operator-local/bearer-token
+indentured run repo_check
+session_id=$(indentured session start repo_session)
+indentured session action "$session_id" observe --input ./observe.json
+indentured session stop "$session_id"
+```
+
+Leave `INDENTURED_DARWIN_SESSION_GATE` unset inside `repo_check`: a one-shot task holds the default global permit, so recursively calling the same service would receive `503 busy`. Drive native managed-session/CoreSimulator acceptance externally. Endpoint, credential, users, absolute deployment paths, and native results remain operator-local.
 
 ## Native macOS acceptance gate
 
@@ -136,7 +192,7 @@ Deployment automation/operator policy must block live-service acceptance until t
 - **Cleanup:** different fresh workspaces are used and removed after success, nonzero exit, timeout, output limit, disconnect, extraction failure, and artifact failure.
 - **Immediate busy behavior:** while one run is active, a second request gets stable immediate 503 busy before source persistence; the permit is released after every completion/error path.
 - **Edge topology:** Tailscale HTTPS plus a valid bearer reaches the loopback origin; no daemon listener is exposed on a non-loopback address; UDS and built-in rustls are disabled; Serve state is reconciled after reboot and deliberate drift.
-- **Managed-session identity:** a root daemon and distinct non-root task identity preserve the protected metadata boundary; a Ready session retains the one global permit; action JSON reaches only stdin; and another action conflicts rather than queues.
+- **Managed-session identity:** a root daemon and distinct non-root task identity preserve the protected metadata boundary; a Ready session retains the one global permit; named input or the dispatcher envelope reaches only stdin; caller data cannot select process authority; and another action conflicts rather than queues.
 - **CoreSimulator context:** the exact task UID/GID/supplementary groups can reach the intended per-user launchd/bootstrap context using pinned `DEVELOPER_DIR`, runtime, and device type. Every operation uses the recorded explicit UDID, never `booted`.
 - **Simulator lifecycle:** initialization builds once and creates/boots/installs/launches once; separate observe/act invocations reuse it; observe returns a screenshot; explicit stop, idle/lifetime expiry, disconnect, failure, and restart cleanup delete the recorded simulator. `simctl list devices -j` confirms the UDID is absent after every cleanup case.
 - **Simulator authority separation:** the simulator task cannot read or modify bearer credentials, daemon config/logs/artifacts, launchd policy, control paths, or other users' simulator state. Signing and unrelated deployment credentials are absent.

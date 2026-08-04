@@ -1,3 +1,5 @@
+# Server profile names are explicit CLI arguments. Reusable deployments may
+# expose `repo_check` and `repo_session`; repository hooks live in devenv.nix.
 # Used only when no .jj repository marker is found.
 [sources]
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]

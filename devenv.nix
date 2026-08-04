@@ -21,5 +21,10 @@
   tasks."cargo:test".exec = "cargo test --locked --offline --all-targets --all-features";
   tasks."cargo:release-build".exec = "cargo build --locked --offline --release --all-features";
   tasks."integration:packaged-local".exec = "scripts/check-packaged-local-integration.sh";
+  tasks."integration:stdin-probe".exec = ''
+    IFS= read -r input
+    test "$input" = '{"probe":"devenv-stdin"}'
+  '';
+  tasks."indentured:check".exec = "scripts/check-darwin.sh";
   tasks."nix:flake-check".exec = "nix flake check --print-build-logs";
 }
