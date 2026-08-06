@@ -9,6 +9,7 @@ pub const MAX_TASK_ID_LEN: usize = 64;
 pub const MAX_SESSION_ID_LEN: usize = 128;
 pub const MAX_ACTION_ID_LEN: usize = 128;
 pub const MAX_SESSION_ACTION_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_SESSION_UPDATE_METADATA_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,7 +210,7 @@ pub fn parse_revision(value: &str) -> Option<u64> {
     (format!("rev_{revision}") == value).then_some(revision)
 }
 
-fn validate_update_path(path: &str, max_depth: usize) -> Result<(), RequestError> {
+pub fn validate_update_path(path: &str, max_depth: usize) -> Result<(), RequestError> {
     if path.is_empty()
         || !path.is_ascii()
         || path.contains(['\\', '\0'])
@@ -312,6 +313,10 @@ pub fn parse_session_action_request(
 
 pub fn valid_task_id(value: &str) -> bool {
     validate_identifier(value, MAX_TASK_ID_LEN, false).is_ok()
+}
+
+pub fn valid_request_id(value: &str) -> bool {
+    validate_identifier(value, MAX_REQUEST_ID_LEN, true).is_ok()
 }
 
 pub fn valid_session_id(value: &str) -> bool {

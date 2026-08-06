@@ -16,6 +16,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -24,15 +25,18 @@ use tokio_util::io::ReaderStream;
 
 use indentured_server::bearer_token::{BearerToken, MAX_BEARER_TOKEN_FILE_BYTES};
 use indentured_server::client_source::{
-    find_jj_root, package_source_cancellable, FilesystemPatterns, SourceCancellation,
-    SourceIdentity, SourceManifest,
+    find_jj_root, package_source_cancellable, package_update_source_cancellable,
+    FilesystemPatterns, SourceCancellation, SourceIdentity, SourceManifest,
 };
 use indentured_server::protocol::{
-    valid_action_id, valid_session_id, valid_task_id, ArtifactArchive, ArtifactRestrictions,
-    BuildPhase, PhaseResult, Request, ResponseEvent, SessionActionEvent, SessionActionRequest,
-    SessionActionStatus, SessionStartEvent, SessionStartRequest, SessionStartStatus,
-    SessionStopResponse, SessionTeardownResult, SourceFormat, SourceMetadata,
-    MAX_SESSION_ACTION_BODY_BYTES, REQUEST_SCHEMA_VERSION, SESSION_REQUEST_SCHEMA_VERSION,
+    parse_revision, valid_action_id, valid_request_id, valid_session_id, valid_task_id,
+    validate_update_path, ArtifactArchive, ArtifactRestrictions, BuildPhase, PhaseResult, Request,
+    ResponseEvent, SessionActionEvent, SessionActionRequest, SessionActionStatus,
+    SessionStartEvent, SessionStartRequest, SessionStartStatus, SessionStopResponse,
+    SessionTeardownResult, SessionUpdateChange, SessionUpdateEvidence, SessionUpdateRequest,
+    SessionUpdateResponse, SourceFormat, SourceMetadata, MAX_SESSION_ACTION_BODY_BYTES,
+    MAX_SESSION_UPDATE_METADATA_BYTES, REQUEST_SCHEMA_VERSION, SESSION_REQUEST_SCHEMA_VERSION,
+    SESSION_UPDATE_SCHEMA_VERSION,
 };
 use indentured_server::validation::validate_relative_pattern;
 
@@ -162,6 +166,7 @@ struct SessionArgs {
 #[derive(Clone, Debug, Subcommand)]
 enum SessionCommands {
     Start(SessionStartArgs),
+    Update(SessionUpdateArgs),
     Action(SessionActionArgs),
     Stop(SessionStopArgs),
 }
@@ -185,6 +190,30 @@ struct SessionStartArgs {
 
     #[arg(required = true)]
     task: String,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct SessionUpdateArgs {
+    #[arg(required = true)]
+    session: String,
+
+    #[arg(long, required = true)]
+    revision: String,
+
+    #[arg(long)]
+    request_id: Option<String>,
+
+    #[arg(long, action = ArgAction::Append, num_args = 1.., required_unless_present = "delete")]
+    file: Vec<String>,
+
+    #[arg(long, action = ArgAction::Append, num_args = 1.., required_unless_present = "file")]
+    delete: Vec<String>,
+
+    #[arg(
+        long,
+        help = "Absolute directory under which a unique update result is created"
+    )]
+    result_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -963,6 +992,15 @@ struct SessionProvenance {
     session_id: Option<String>,
     action: Option<String>,
     action_id: Option<String>,
+    request_id: Option<String>,
+    base_revision: Option<String>,
+    workspace_revision: Option<String>,
+    update_id: Option<String>,
+    endpoint_authority: Option<String>,
+    metadata_sha256: Option<String>,
+    changed: Vec<SessionUpdateEvidence>,
+    deleted: Vec<SessionUpdateEvidence>,
+    requested_deletes: Vec<String>,
     source: Option<SourceIdentity>,
     remote_exit_code: Option<i32>,
     timed_out: Option<bool>,
@@ -1022,6 +1060,15 @@ impl SessionEvidence {
             session_id: session_id.map(ToString::to_string),
             action: action.map(ToString::to_string),
             action_id: None,
+            request_id: None,
+            base_revision: None,
+            workspace_revision: None,
+            update_id: None,
+            endpoint_authority: None,
+            metadata_sha256: None,
+            changed: Vec::new(),
+            deleted: Vec::new(),
+            requested_deletes: Vec::new(),
             source: None,
             remote_exit_code: None,
             timed_out: None,
@@ -1288,6 +1335,30 @@ fn prepare_session_evidence(
                 args.result_root.as_deref(),
                 Some(&source_root),
             )?;
+            Ok(PreparedSession {
+                evidence,
+                source_root: Some(source_root),
+            })
+        }
+        SessionCommands::Update(args) => {
+            let source_root = match find_jj_root(invocation_dir)? {
+                Some(root) => root,
+                None => fs::canonicalize(filesystem_root)?,
+            };
+            let mut evidence = SessionEvidence::create(
+                "update",
+                Some(&args.session),
+                None,
+                args.result_root.as_deref(),
+                Some(&source_root),
+            )?;
+            evidence.provenance.request_id = Some(
+                args.request_id
+                    .clone()
+                    .unwrap_or_else(|| evidence.provenance.invocation_id.clone()),
+            );
+            evidence.provenance.base_revision = Some(args.revision.clone());
+            evidence.write_provenance()?;
             Ok(PreparedSession {
                 evidence,
                 source_root: Some(source_root),
@@ -1793,6 +1864,15 @@ async fn session_command(
             )
             .await
         }
+        SessionCommands::Update(args) => {
+            session_update_command(
+                args,
+                evidence,
+                source_root.expect("update source root prepared"),
+                context,
+            )
+            .await
+        }
         SessionCommands::Action(args) => session_action_command(args, evidence, context).await,
         SessionCommands::Stop(args) => session_stop_command(args, evidence, context).await,
     }
@@ -2125,6 +2205,318 @@ async fn session_start_command(
             finish_remote_session_error(&mut evidence, err, connection)
         }
     }
+}
+
+async fn session_update_command(
+    args: SessionUpdateArgs,
+    mut evidence: SessionEvidence,
+    source_root: PathBuf,
+    context: SessionCommandContext,
+) -> ExitCode {
+    let SessionCommandContext {
+        mut interrupt,
+        endpoint_arg,
+        token_file_arg,
+        invocation_dir,
+        filesystem_root,
+        client_config,
+        config_loaded,
+    } = context;
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted before update preparation");
+    }
+    if !valid_session_id(&args.session) {
+        return finish_session_failure(&mut evidence, "invalid session ID".to_string(), false);
+    }
+    if parse_revision(&args.revision).is_none() {
+        return finish_session_failure(
+            &mut evidence,
+            "--revision must be the explicit opaque rev_<decimal> base revision".to_string(),
+            false,
+        );
+    }
+    let request_id = evidence
+        .provenance
+        .request_id
+        .clone()
+        .expect("update request ID prepared");
+    if !valid_request_id(&request_id) {
+        return finish_session_failure(&mut evidence, "invalid request ID".to_string(), false);
+    }
+    let (files, deletes) = match validate_update_changes(&args.file, &args.delete) {
+        Ok(changes) => changes,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    evidence.provenance.requested_deletes = deletes.clone();
+    if let Err(err) = evidence.write_provenance() {
+        return provenance_failure(&mut evidence, err);
+    }
+
+    let connection = client_config.connection.as_ref();
+    if let Some(path) = selected_token_path(token_file_arg.clone(), connection) {
+        if path.exists() {
+            if let Err(err) = reject_credential_overlap(&path, &source_root, &evidence.base) {
+                return finish_session_failure(&mut evidence, err.to_string(), false);
+            }
+        }
+    }
+    let endpoint = match resolve_endpoint(endpoint_arg, connection, config_loaded) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return finish_session_failure(&mut evidence, err.to_string(), false),
+    };
+    evidence.provenance.endpoint_authority = Some(endpoint_authority(&endpoint));
+    if let Err(err) = evidence.write_provenance() {
+        return provenance_failure(&mut evidence, err);
+    }
+    let token = match resolve_token(token_file_arg, connection) {
+        Ok(token) => token,
+        Err(err) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("failed to load bearer credential: {err}"),
+                false,
+            )
+        }
+    };
+    if interrupt.poll_pending().await {
+        return finish_early_interrupted(&mut evidence, "interrupted during update preparation");
+    }
+
+    let cancellation = SourceCancellation::new();
+    let packaging_cancellation = cancellation.clone();
+    let packaging_temp = evidence.directory.clone();
+    let mut packaging = tokio::task::spawn_blocking(move || {
+        package_update_source_cancellable(
+            &invocation_dir,
+            &filesystem_root,
+            &files,
+            &deletes,
+            &packaging_temp,
+            &packaging_cancellation,
+        )
+    });
+    let package = tokio::select! {
+        biased;
+        _ = interrupt.interrupted() => {
+            cancellation.cancel();
+            match tokio::time::timeout(Duration::from_secs(7), &mut packaging).await {
+                Ok(Ok(Err(err))) if err.kind() != io::ErrorKind::Interrupted || err.to_string().contains("cleanup") => {
+                    let _ = evidence.error(format!("source cleanup after interruption failed: {err}"));
+                }
+                Ok(Err(err)) => { let _ = evidence.error(format!("source cleanup worker failed after interruption: {err}")); }
+                Err(_) => { packaging.abort(); let _ = evidence.error("source cleanup did not finish within 7 seconds after interruption"); }
+                _ => {}
+            }
+            return finish_early_interrupted(&mut evidence, "interrupted during update source preparation");
+        }
+        result = &mut packaging => match result {
+            Ok(Ok(package)) => package,
+            Ok(Err(err)) => return finish_session_failure(&mut evidence, format!("failed to package update sources: {err}"), false),
+            Err(err) => return finish_session_failure(&mut evidence, format!("update source packaging worker failed: {err}"), false),
+        },
+    };
+    evidence.provenance.source = Some(package.identity.clone());
+    evidence.provenance.changed = package
+        .entries
+        .iter()
+        .map(|entry| SessionUpdateEvidence {
+            path: entry.path.clone(),
+            sha256: entry.sha256.clone(),
+        })
+        .collect();
+    let mut changes: Vec<_> = package
+        .entries
+        .iter()
+        .map(|entry| SessionUpdateChange::File {
+            path: entry.path.clone(),
+            sha256: entry.sha256.clone(),
+        })
+        .chain(
+            evidence
+                .provenance
+                .requested_deletes
+                .iter()
+                .cloned()
+                .map(|path| SessionUpdateChange::Delete { path }),
+        )
+        .collect();
+    changes.sort_by(|a, b| a.path().as_bytes().cmp(b.path().as_bytes()));
+    let request = SessionUpdateRequest {
+        schema_version: SESSION_UPDATE_SCHEMA_VERSION.to_string(),
+        request_id,
+        base_revision: args.revision,
+        source: SourceMetadata {
+            format: SourceFormat::Zip,
+        },
+        changes,
+    };
+    let metadata = match serde_json::to_vec(&request) {
+        Ok(metadata) if metadata.len() <= MAX_SESSION_UPDATE_METADATA_BYTES => metadata,
+        Ok(_) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("update metadata exceeds {MAX_SESSION_UPDATE_METADATA_BYTES} bytes"),
+                false,
+            )
+        }
+        Err(err) => {
+            return finish_session_failure(
+                &mut evidence,
+                format!("failed to serialize update metadata: {err}"),
+                false,
+            )
+        }
+    };
+    evidence.provenance.metadata_sha256 = Some(sha256_hex(&metadata));
+    if let Err(err) = evidence.set_status("running") {
+        return provenance_failure(&mut evidence, err);
+    }
+    let outcome = {
+        let remote = run_session_update(
+            &args.session,
+            metadata,
+            &package.archive,
+            &endpoint,
+            token.as_deref(),
+        );
+        tokio::pin!(remote);
+        tokio::select! {
+            biased;
+            _ = interrupt.interrupted() => None,
+            result = &mut remote => Some(result),
+        }
+    };
+    let Some(outcome) = outcome else {
+        return finish_early_interrupted(&mut evidence, "interrupted; update request disconnected");
+    };
+    let response = match outcome {
+        Ok(response) => response,
+        Err(err) => return finish_remote_session_error(&mut evidence, err, connection),
+    };
+    if let Err(err) = validate_update_response(&response, &request, &evidence.provenance.changed) {
+        return finish_session_failure(&mut evidence, err.to_string(), false);
+    }
+    if response.session_id != args.session {
+        return finish_session_failure(
+            &mut evidence,
+            "update response had inconsistent session identity".to_string(),
+            false,
+        );
+    }
+    evidence.provenance.update_id = Some(response.update_id);
+    evidence.provenance.workspace_revision = Some(response.workspace_revision.clone());
+    evidence.provenance.changed = response.changed;
+    evidence.provenance.deleted = response.deleted;
+    match finish_evidence_controlled(evidence, "succeeded", &mut interrupt).await {
+        ControlledEvidence::Interrupted(mut returned) => {
+            finish_early_interrupted(&mut returned, "interrupted during final update provenance")
+        }
+        ControlledEvidence::Completed(mut returned, Err(err)) => {
+            provenance_failure(&mut returned, err)
+        }
+        ControlledEvidence::Completed(mut returned, Ok(())) => {
+            match emit_session_id_controlled(&response.workspace_revision, &mut interrupt).await {
+                ControlledIo::Interrupted => {
+                    finish_early_interrupted(&mut returned, "interrupted during revision output")
+                }
+                ControlledIo::Completed(Ok(())) => evidence_exit(&returned, 0),
+                ControlledIo::Completed(Err(err)) => finish_session_failure(
+                    &mut returned,
+                    format!("failed to emit workspace revision: {err}"),
+                    false,
+                ),
+            }
+        }
+    }
+}
+
+fn validate_update_changes(
+    files: &[String],
+    deletes: &[String],
+) -> io::Result<(Vec<String>, Vec<String>)> {
+    if files.is_empty() && deletes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one --file or --delete is required",
+        ));
+    }
+    let mut exact = HashSet::new();
+    let mut folded = HashSet::new();
+    for path in files.iter().chain(deletes) {
+        validate_update_path(path, 64)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        if !exact.insert(path.clone()) || !folded.insert(path.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "update contains duplicate, case-colliding, or cross-list paths",
+            ));
+        }
+    }
+    let mut files = files.to_vec();
+    let mut deletes = deletes.to_vec();
+    files.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    deletes.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ok((files, deletes))
+}
+
+fn validate_update_response(
+    response: &SessionUpdateResponse,
+    request: &SessionUpdateRequest,
+    expected_changed: &[SessionUpdateEvidence],
+) -> io::Result<()> {
+    if !valid_action_id(&response.update_id)
+        || response.request_id != request.request_id
+        || response.base_revision != request.base_revision
+        || parse_revision(&response.workspace_revision).is_none()
+        || response.changed != expected_changed
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update response had inconsistent identity, revision, or changed-file evidence",
+        ));
+    }
+    let expected_deleted: Vec<_> = request
+        .changes
+        .iter()
+        .filter_map(|change| match change {
+            SessionUpdateChange::Delete { path } => Some(path.as_str()),
+            SessionUpdateChange::File { .. } => None,
+        })
+        .collect();
+    if response.deleted.len() != expected_deleted.len()
+        || response
+            .deleted
+            .iter()
+            .zip(expected_deleted)
+            .any(|(actual, expected_path)| {
+                actual.path != expected_path
+                    || actual.sha256.len() != 64
+                    || !actual
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update response had inconsistent delete evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn endpoint_authority(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Http { base } => base.clone(),
+        Endpoint::Unix { path } => format!("unix://{}", path.display()),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn session_action_command(
@@ -3280,8 +3672,34 @@ async fn session_http_error(response: reqwest::Response, operation: &str) -> Bui
         404 if operation == "start" => {
             "server does not support managed sessions; upgrade indentured-server".to_string()
         }
+        404 if operation == "update" => {
+            "session is missing, expired, or does not support source updates".to_string()
+        }
         404 => "session is missing or expired".to_string(),
+        400 if operation == "update" => "server rejected update metadata or source".to_string(),
         408 => format!("{operation} timed out"),
+        413 if operation == "update" => {
+            "update exceeds the server source-update limits".to_string()
+        }
+        409 if operation == "update" => {
+            let conflict: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            match (
+                conflict.get("error").and_then(serde_json::Value::as_str),
+                conflict
+                    .get("current_revision")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                (Some("revision_conflict"), Some(current)) => format!(
+                    "base revision is stale; current_revision={current}; retry with that revision and a new request ID"
+                ),
+                (Some("request_conflict"), _) => {
+                    "request ID was already used with different metadata or source bytes".to_string()
+                }
+                _ => "session is busy or terminating; retry after the active operation completes"
+                    .to_string(),
+            }
+        }
         409 => {
             "session is busy or terminating; retry after the active operation completes".to_string()
         }
@@ -3289,6 +3707,7 @@ async fn session_http_error(response: reqwest::Response, operation: &str) -> Bui
             "server capacity is busy; stop an existing session or retry later".to_string()
         }
         503 => "managed sessions are unavailable on this server".to_string(),
+        500 if operation == "update" => "server failed to apply the update".to_string(),
         _ => format!("server returned {status}"),
     };
     let message = if body.is_empty() {
@@ -3520,6 +3939,60 @@ async fn read_session_start_response(
         BuildError::Other(format!("failed to write log completion notice: {err}"))
     })?;
     result.ok_or_else(|| BuildError::Other("missing ready or exit event".to_string()))
+}
+
+async fn run_session_update(
+    session_id: &str,
+    metadata: Vec<u8>,
+    source_archive: &NamedTempFile,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+) -> Result<SessionUpdateResponse, BuildError> {
+    let path = format!("/v1/sessions/{session_id}/updates");
+    let (client, url, send_auth) = session_http_client(endpoint, &path)?;
+    let length = source_archive
+        .as_file()
+        .metadata()
+        .map_err(|err| BuildError::Other(format!("failed to inspect update archive: {err}")))?
+        .len();
+    let file = tokio::fs::File::open(source_archive.path())
+        .await
+        .map_err(|err| BuildError::Other(format!("failed to read update archive: {err}")))?;
+    let source =
+        Part::stream_with_length(reqwest::Body::wrap_stream(ReaderStream::new(file)), length)
+            .file_name("source.zip")
+            .mime_str("application/zip")
+            .expect("static MIME type");
+    let form = Form::new()
+        .part(
+            "metadata",
+            Part::bytes(metadata)
+                .mime_str("application/json")
+                .expect("static MIME type"),
+        )
+        .part("source", source);
+    let mut builder = client.post(url).multipart(form);
+    if send_auth {
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+    }
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) if is_connection_failure(&err) => {
+            return Err(BuildError::ConnectionFailed(format!(
+                "cannot reach endpoint: {err}"
+            )))
+        }
+        Err(err) => return Err(BuildError::Other(format!("session update failed: {err}"))),
+    };
+    if !response.status().is_success() {
+        return Err(session_http_error(response, "update").await);
+    }
+    response
+        .json::<SessionUpdateResponse>()
+        .await
+        .map_err(|err| BuildError::Other(format!("invalid update response: {err}")))
 }
 
 async fn run_session_action(
@@ -4416,7 +4889,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_only_the_three_explicit_session_operations() {
+    fn cli_accepts_only_the_four_explicit_session_operations() {
         let start = Cli::try_parse_from([
             "indentured",
             "session",
@@ -4432,6 +4905,37 @@ mod tests {
                 command: SessionCommands::Start(SessionStartArgs { task, .. })
             }) if task == "build"
         ));
+        let update = Cli::try_parse_from([
+            "indentured",
+            "session",
+            "update",
+            "ses_1",
+            "--revision",
+            "rev_2",
+            "--request-id",
+            "update.1",
+            "--file",
+            "src/a",
+            "src/b",
+            "--delete",
+            "old",
+        ])
+        .unwrap();
+        assert!(matches!(
+            update.command,
+            Commands::Session(SessionArgs {
+                command: SessionCommands::Update(SessionUpdateArgs { session, revision, file, delete, .. })
+            }) if session == "ses_1" && revision == "rev_2" && file == ["src/a", "src/b"] && delete == ["old"]
+        ));
+        assert!(Cli::try_parse_from([
+            "indentured",
+            "session",
+            "update",
+            "ses_1",
+            "--revision",
+            "rev_0"
+        ])
+        .is_err());
         let action = Cli::try_parse_from([
             "indentured",
             "session",
@@ -4472,6 +4976,24 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(unsupported).is_err());
         }
+    }
+
+    #[test]
+    fn update_change_validation_rejects_unsafe_duplicate_case_and_cross_list_paths() {
+        assert!(validate_update_changes(&[], &[]).is_err());
+        for (files, deletes) in [
+            (vec!["same".into(), "same".into()], vec![]),
+            (vec!["Name".into(), "name".into()], vec![]),
+            (vec!["same".into()], vec!["same".into()]),
+            (vec!["../escape".into()], vec![]),
+            (vec![".indentured/state".into()], vec![]),
+        ] {
+            assert!(validate_update_changes(&files, &deletes).is_err());
+        }
+        assert_eq!(
+            validate_update_changes(&["b".into(), "a".into()], &["gone".into()]).unwrap(),
+            (vec!["a".into(), "b".into()], vec!["gone".into()])
+        );
     }
 
     #[test]

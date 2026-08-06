@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -140,6 +141,19 @@ fn wait_for_provenance(root: &TempDir, matches: impl Fn(&serde_json::Value) -> b
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for session provenance condition");
+}
+
+fn multipart_metadata(body: &[u8]) -> serde_json::Value {
+    let start = body
+        .windows(b"{\"schema_version\"".len())
+        .position(|window| window == b"{\"schema_version\"")
+        .unwrap();
+    let end = body[start..]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .unwrap()
+        + start;
+    serde_json::from_slice(&body[start..end]).unwrap()
 }
 
 fn only_result(root: &TempDir) -> std::path::PathBuf {
@@ -332,6 +346,347 @@ fn separate_start_action_and_stop_invocations_preserve_evidence_and_authority() 
         serde_json::from_slice(&fs::read(result.join("provenance.json")).unwrap()).unwrap();
     assert_eq!(provenance["teardown"]["exit_code"], 7);
     assert_eq!(provenance["status"], "failed");
+}
+
+#[test]
+fn update_posts_explicit_deterministic_source_and_prints_only_revision() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        let metadata = multipart_metadata(&request.body);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "session_id":"ses_update",
+            "update_id":"upd_1",
+            "request_id":metadata["request_id"],
+            "base_revision":"rev_4",
+            "workspace_revision":"rev_5",
+            "changed":[{"path":"changed.txt","sha256":format!("{:x}", Sha256::digest(b"changed\n"))}],
+            "deleted":[{"path":"gone.txt","sha256":"b".repeat(64)}]
+        }))
+        .unwrap();
+        request_tx.send(request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+    });
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_config(&repo, &endpoint);
+    fs::write(repo.path().join("changed.txt"), b"changed\n").unwrap();
+    fs::write(repo.path().join("undeclared.txt"), b"secret").unwrap();
+    let runtime_root = std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+    let credentials = tempfile::tempdir_in(runtime_root).unwrap();
+    let token = credentials.path().join("token");
+    fs::write(&token, b"update-token").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indentured"))
+        .current_dir(repo.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["--token-file", token.to_str().unwrap()])
+        .args([
+            "session",
+            "update",
+            "ses_update",
+            "--revision",
+            "rev_4",
+            "--file",
+            "changed.txt",
+            "--delete",
+            "gone.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"rev_5\n");
+    let request = request_rx.recv().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        (request.method.as_str(), request.path.as_str()),
+        ("POST", "/v1/sessions/ses_update/updates")
+    );
+    assert!(request
+        .headers
+        .contains("authorization: Bearer update-token"));
+    let metadata_position = request
+        .body
+        .windows(b"name=\"metadata\"".len())
+        .position(|window| window == b"name=\"metadata\"")
+        .unwrap();
+    let source_position = request
+        .body
+        .windows(b"name=\"source\"".len())
+        .position(|window| window == b"name=\"source\"")
+        .unwrap();
+    assert!(metadata_position < source_position);
+    let metadata = multipart_metadata(&request.body);
+    let request_id = metadata["request_id"].as_str().unwrap();
+    assert!(!request_id.is_empty());
+    assert_eq!(metadata["base_revision"], "rev_4");
+    assert_eq!(metadata["changes"][0]["path"], "changed.txt");
+    assert_eq!(metadata["changes"][1]["path"], "gone.txt");
+    let zip_start = request
+        .body
+        .windows(4)
+        .position(|window| window == b"PK\x03\x04")
+        .unwrap();
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(&request.body[zip_start..])).unwrap();
+    assert_eq!(archive.len(), 1);
+    assert_eq!(archive.by_index(0).unwrap().name(), "changed.txt");
+    assert!(archive.by_name("undeclared.txt").is_err());
+    assert!(archive.by_name("gone.txt").is_err());
+
+    let result = only_result(&state);
+    let provenance_bytes = fs::read(result.join("provenance.json")).unwrap();
+    let provenance: serde_json::Value = serde_json::from_slice(&provenance_bytes).unwrap();
+    assert_eq!(provenance["operation"], "update");
+    assert_eq!(provenance["request_id"], request_id);
+    assert_eq!(provenance["base_revision"], "rev_4");
+    assert_eq!(provenance["workspace_revision"], "rev_5");
+    assert_eq!(provenance["update_id"], "upd_1");
+    assert_eq!(provenance["source"]["mode"], "filesystem");
+    assert_eq!(provenance["changed"][0]["path"], "changed.txt");
+    assert_eq!(provenance["deleted"][0]["path"], "gone.txt");
+    assert_eq!(provenance["metadata_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        provenance["source"]["archive_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(!String::from_utf8_lossy(&provenance_bytes).contains("undeclared.txt"));
+    assert!(!String::from_utf8_lossy(&provenance_bytes).contains("update-token"));
+}
+
+#[test]
+fn update_local_validation_prevents_network_and_conflict_surfaces_current_revision() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_config(&repo, &endpoint);
+    fs::write(repo.path().join("same"), b"x").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indentured"))
+        .current_dir(repo.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args([
+            "session",
+            "update",
+            "ses_1",
+            "--revision",
+            "rev_0",
+            "--file",
+            "same",
+            "--delete",
+            "same",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cross-list"));
+    assert!(matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock));
+
+    drop(listener);
+    let body = br#"{"error":"revision_conflict","current_revision":"rev_9"}"#.to_vec();
+    let (endpoint, captured, server) = serve(vec![ResponseSpec {
+        status: "409 Conflict",
+        content_type: "application/json",
+        body,
+    }]);
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_config(&repo, &endpoint);
+    fs::write(repo.path().join("changed"), b"x").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indentured"))
+        .current_dir(repo.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args([
+            "session",
+            "update",
+            "ses_1",
+            "--revision",
+            "rev_0",
+            "--file",
+            "changed",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("current_revision=rev_9"));
+    assert_eq!(captured.recv().unwrap().path, "/v1/sessions/ses_1/updates");
+    server.join().unwrap();
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(only_result(&state).join("provenance.json")).unwrap())
+            .unwrap();
+    assert_eq!(provenance["status"], "failed");
+    assert_eq!(provenance["base_revision"], "rev_0");
+    assert_eq!(provenance["source"]["mode"], "filesystem");
+}
+
+#[test]
+fn update_structured_http_errors_are_actionable_and_preserve_evidence() {
+    for (status, body, expected) in [
+        (
+            "400 Bad Request",
+            br#"{"error":"invalid update"}"#.as_slice(),
+            "rejected update metadata or source",
+        ),
+        (
+            "404 Not Found",
+            br#"{"error":"missing"}"#.as_slice(),
+            "does not support source updates",
+        ),
+        (
+            "413 Payload Too Large",
+            br#"{"error":"too_large"}"#.as_slice(),
+            "source-update limits",
+        ),
+        (
+            "500 Internal Server Error",
+            br#"{"error":"update_failed"}"#.as_slice(),
+            "failed to apply the update",
+        ),
+    ] {
+        let (endpoint, captured, server) = serve(vec![ResponseSpec {
+            status,
+            content_type: "application/json",
+            body: body.to_vec(),
+        }]);
+        let repo = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        write_config(&repo, &endpoint);
+        fs::write(repo.path().join("changed"), b"x").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_indentured"))
+            .current_dir(repo.path())
+            .env("XDG_STATE_HOME", state.path())
+            .args([
+                "session",
+                "update",
+                "ses_error",
+                "--revision",
+                "rev_0",
+                "--file",
+                "changed",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            captured.recv().unwrap().path,
+            "/v1/sessions/ses_error/updates"
+        );
+        server.join().unwrap();
+        let provenance: serde_json::Value =
+            serde_json::from_slice(&fs::read(only_result(&state).join("provenance.json")).unwrap())
+                .unwrap();
+        assert_eq!(provenance["status"], "failed");
+        assert!(!provenance["request_id"].as_str().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn update_sigint_disconnects_without_stopping_and_preserves_retry_evidence() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (received_tx, received_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut update, _) = listener.accept().unwrap();
+        let request = read_request(&mut update);
+        assert_eq!(request.path, "/v1/sessions/ses_interrupt/updates");
+        received_tx.send(()).unwrap();
+        update
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut remainder = Vec::new();
+        assert_eq!(update.read_to_end(&mut remainder).unwrap(), 0);
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    });
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_config(&repo, &endpoint);
+    fs::write(repo.path().join("changed"), b"x").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_indentured"))
+        .current_dir(repo.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args([
+            "session",
+            "update",
+            "ses_interrupt",
+            "--revision",
+            "rev_0",
+            "--file",
+            "changed",
+        ])
+        .spawn()
+        .unwrap();
+    received_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    server.join().unwrap();
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(only_result(&state).join("provenance.json")).unwrap())
+            .unwrap();
+    assert_eq!(provenance["status"], "interrupted");
+    assert_eq!(provenance["operation"], "update");
+    assert!(!provenance["request_id"].as_str().unwrap().is_empty());
+    assert_eq!(provenance["base_revision"], "rev_0");
+    assert_eq!(provenance["changed"][0]["path"], "changed");
+}
+
+#[test]
+fn update_transport_failure_preserves_generated_request_evidence() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", unavailable.local_addr().unwrap());
+    drop(unavailable);
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_config(&repo, &endpoint);
+    fs::write(repo.path().join("changed"), b"x").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_indentured"))
+        .current_dir(repo.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args([
+            "session",
+            "update",
+            "ses_transport",
+            "--revision",
+            "rev_0",
+            "--file",
+            "changed",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot reach endpoint"));
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(only_result(&state).join("provenance.json")).unwrap())
+            .unwrap();
+    assert_eq!(provenance["status"], "failed");
+    assert!(!provenance["request_id"].as_str().unwrap().is_empty());
+    assert_eq!(provenance["source"]["mode"], "filesystem");
+    assert_eq!(provenance["metadata_sha256"].as_str().unwrap().len(), 64);
 }
 
 #[test]

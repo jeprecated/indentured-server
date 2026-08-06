@@ -1,7 +1,9 @@
-use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsStr};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -69,6 +71,13 @@ pub struct SourceIdentity {
 pub struct SourcePackage {
     pub archive: NamedTempFile,
     pub manifest: SourceManifest,
+    pub identity: SourceIdentity,
+}
+
+/// A deterministic archive of explicit regular, non-executable update files.
+pub struct UpdateSourcePackage {
+    pub archive: NamedTempFile,
+    pub entries: Vec<SourceEntry>,
     pub identity: SourceIdentity,
 }
 
@@ -215,6 +224,397 @@ pub fn package_source_cancellable(
     } else {
         package_filesystem_cancellable(filesystem_root, patterns, temporary_root, cancellation)
     }
+}
+
+pub fn package_update_source_cancellable(
+    invocation_dir: &Path,
+    filesystem_root: &Path,
+    files: &[String],
+    deletes: &[String],
+    temporary_root: &Path,
+    cancellation: &SourceCancellation,
+) -> io::Result<UpdateSourcePackage> {
+    cancellation.check()?;
+    if files.is_empty() && deletes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one update file or delete is required",
+        ));
+    }
+    let mut exact = HashSet::new();
+    let mut folded = HashSet::new();
+    for path in files.iter().chain(deletes) {
+        crate::protocol::validate_update_path(path, MAX_DEPTH)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        if !exact.insert(path.as_str()) || !folded.insert(path.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "update contains duplicate or case-colliding paths",
+            ));
+        }
+    }
+    if let Some(root) = find_jj_root(invocation_dir)? {
+        package_jj_update(
+            &root,
+            invocation_dir,
+            files,
+            deletes,
+            temporary_root,
+            cancellation,
+        )
+    } else {
+        package_filesystem_update(
+            filesystem_root,
+            files,
+            deletes,
+            temporary_root,
+            cancellation,
+        )
+    }
+}
+
+fn package_jj_update(
+    root: &Path,
+    invocation_dir: &Path,
+    files: &[String],
+    deletes: &[String],
+    temporary_root: &Path,
+    cancellation: &SourceCancellation,
+) -> io::Result<UpdateSourcePackage> {
+    let version = one_line(
+        &run_jj_bounded(root, &["--version"], true, cancellation, None)?,
+        256,
+        "jj version",
+    )?;
+    let pin = one_line(
+        &run_jj_bounded(
+            invocation_dir,
+            &[
+                "--no-pager",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ],
+            true,
+            cancellation,
+            None,
+        )?,
+        128,
+        "Jujutsu commit id",
+    )?;
+    if pin.len() < 40 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Jujutsu did not return one full hexadecimal commit id",
+        ));
+    }
+    let listing = run_jj_bounded(
+        root,
+        &[
+            "--ignore-working-copy",
+            "--no-pager",
+            "file",
+            "list",
+            "-r",
+            &pin,
+            "-T",
+            JJ_MANIFEST_TEMPLATE,
+        ],
+        true,
+        cancellation,
+        None,
+    )?;
+    let mut tree = HashMap::new();
+    for line in listing.lines().filter(|line| !line.is_empty()) {
+        let entry: JjEntry = serde_json::from_str(line).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid jj manifest JSON: {err}"),
+            )
+        })?;
+        if tree.insert(entry.path.clone(), entry).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Jujutsu tree contains duplicate paths",
+            ));
+        }
+    }
+    for path in deletes {
+        if tree.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--delete path is present at pinned revision: {path:?}"),
+            ));
+        }
+    }
+    let mut paths = files.to_vec();
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let temp = tempfile::Builder::new()
+        .prefix(".update-source-")
+        .suffix(".zip")
+        .tempfile_in(temporary_root)?;
+    let mut writer = ZipWriter::new(temp.reopen()?);
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut total = 0;
+    for path in paths {
+        cancellation.check()?;
+        let entry = tree.get(&path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("--file path is missing at pinned revision: {path:?}"),
+            )
+        })?;
+        if entry.conflict || entry.file_type == "conflict" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Jujutsu tree contains a conflict at {path:?}"),
+            ));
+        }
+        if entry.file_type != "file" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("--file path is not a regular file at pinned revision: {path:?}"),
+            ));
+        }
+        if entry.executable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("--file path is executable at pinned revision: {path:?}"),
+            ));
+        }
+        writer
+            .start_file(&path, regular_options(false))
+            .map_err(io::Error::other)?;
+        let fileset = format!("root-file:{}", serde_json::to_string(&path).unwrap());
+        let (size, digest) =
+            stream_jj_file(root, &pin, &fileset, &mut writer, &mut total, cancellation)?;
+        entries.push(SourceEntry {
+            path,
+            kind: EntryKind::File,
+            mode: 0o100644,
+            size,
+            sha256: hex(&digest),
+        });
+    }
+    writer.finish().map_err(io::Error::other)?;
+    finish_update_package(
+        temp,
+        entries,
+        SourceIdentity {
+            mode: "jujutsu".to_string(),
+            root: root.to_path_buf(),
+            jj_version: Some(version),
+            jj_commit_id: Some(pin),
+            initial_snapshot_atomicity: "not-guaranteed".to_string(),
+            archive_sha256: String::new(),
+            archive_bytes: 0,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FileSnapshot {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+fn package_filesystem_update(
+    root: &Path,
+    files: &[String],
+    deletes: &[String],
+    temporary_root: &Path,
+    cancellation: &SourceCancellation,
+) -> io::Result<UpdateSourcePackage> {
+    let root = fs::canonicalize(root)?;
+    for path in deletes {
+        require_absent_nofollow(&root, path)?;
+    }
+    let mut paths = files.to_vec();
+    paths.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let temp = tempfile::Builder::new()
+        .prefix(".update-source-")
+        .suffix(".zip")
+        .tempfile_in(temporary_root)?;
+    let mut writer = ZipWriter::new(temp.reopen()?);
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut snapshots = HashMap::new();
+    let mut total = 0u64;
+    for path in paths {
+        cancellation.check()?;
+        let mut file = open_relative_nofollow(&root, &path)?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("--file path is not a regular file: {path:?}"),
+            ));
+        }
+        if before.permissions().mode() & 0o111 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("--file path is executable: {path:?}"),
+            ));
+        }
+        writer
+            .start_file(&path, regular_options(false))
+            .map_err(io::Error::other)?;
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            cancellation.check()?;
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            size = size.saturating_add(read as u64);
+            add_total(&mut total, read as u64)?;
+            hasher.update(&buffer[..read]);
+            writer.write_all(&buffer[..read])?;
+        }
+        let after = file.metadata()?;
+        let snapshot = FileSnapshot {
+            dev: before.dev(),
+            ino: before.ino(),
+            len: before.len(),
+            mtime: before.mtime(),
+            mtime_nsec: before.mtime_nsec(),
+        };
+        if snapshot.dev != after.dev()
+            || snapshot.ino != after.ino()
+            || snapshot.len != after.len()
+            || snapshot.mtime != after.mtime()
+            || snapshot.mtime_nsec != after.mtime_nsec()
+        {
+            return Err(io::Error::other(
+                "source changed while it was being packaged",
+            ));
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        snapshots.insert(path.clone(), snapshot);
+        entries.push(SourceEntry {
+            path,
+            kind: EntryKind::File,
+            mode: 0o100644,
+            size,
+            sha256: hex(&digest),
+        });
+    }
+    writer.finish().map_err(io::Error::other)?;
+    cancellation.check()?;
+    for entry in &entries {
+        let file = open_relative_nofollow(&root, &entry.path)?;
+        let metadata = file.metadata()?;
+        let first = snapshots[&entry.path];
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 != 0
+            || first.dev != metadata.dev()
+            || first.ino != metadata.ino()
+            || first.len != metadata.len()
+            || first.mtime != metadata.mtime()
+            || first.mtime_nsec != metadata.mtime_nsec()
+        {
+            return Err(io::Error::other(
+                "filesystem source manifest changed concurrently; retry after writers are quiescent",
+            ));
+        }
+    }
+    for path in deletes {
+        require_absent_nofollow(&root, path)?;
+    }
+    finish_update_package(
+        temp,
+        entries,
+        SourceIdentity {
+            mode: "filesystem".to_string(),
+            root,
+            jj_version: None,
+            jj_commit_id: None,
+            initial_snapshot_atomicity: "not-guaranteed".to_string(),
+            archive_sha256: String::new(),
+            archive_bytes: 0,
+        },
+    )
+}
+
+fn open_relative_nofollow(root: &Path, path: &str) -> io::Result<File> {
+    let root = CString::new(root.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { File::from_raw_fd(descriptor) };
+    let components: Vec<_> = path.split('/').collect();
+    for component in &components[..components.len().saturating_sub(1)] {
+        let component = CString::new(*component).map_err(io::Error::other)?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    let name = CString::new(*components.last().expect("validated nonempty path"))
+        .map_err(io::Error::other)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn require_absent_nofollow(root: &Path, path: &str) -> io::Result<()> {
+    match open_relative_nofollow(root, path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("failed to prove --delete path absent {path:?}: {err}"),
+        )),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--delete path exists: {path:?}"),
+        )),
+    }
+}
+
+fn finish_update_package(
+    mut archive: NamedTempFile,
+    entries: Vec<SourceEntry>,
+    mut identity: SourceIdentity,
+) -> io::Result<UpdateSourcePackage> {
+    archive.as_file_mut().flush()?;
+    archive.as_file_mut().seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut archive.as_file_mut(), &mut HashWriter(&mut hasher))?;
+    identity.archive_bytes = archive.as_file().metadata()?.len();
+    identity.archive_sha256 = hex(&hasher.finalize().into());
+    Ok(UpdateSourcePackage {
+        archive,
+        entries,
+        identity,
+    })
 }
 
 fn package_jj(
@@ -1266,6 +1666,150 @@ fn hex(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn explicit_filesystem_update_is_deterministic_and_nofollow() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/b"), b"b").unwrap();
+        fs::write(root.path().join("src/a"), b"a").unwrap();
+        let output = tempdir().unwrap();
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["../escape".into()],
+            &[],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+        let package = package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["src/b".into(), "src/a".into()],
+            &["gone".into()],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            package
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a", "src/b"]
+        );
+        let retry_package = package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["src/b".into(), "src/a".into()],
+            &["gone".into()],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(package.archive.path()).unwrap(),
+            fs::read(retry_package.archive.path()).unwrap()
+        );
+        let mut archive = zip::ZipArchive::new(package.archive.reopen().unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        assert_eq!(
+            archive.by_name("src/a").unwrap().unix_mode(),
+            Some(0o100644)
+        );
+        assert!(archive.by_name("gone").is_err());
+
+        std::os::unix::fs::symlink("a", root.path().join("src/link")).unwrap();
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["missing".into()],
+            &[],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["src/link".into()],
+            &[],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &[],
+            &["src/link".into()],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+        fs::set_permissions(root.path().join("src/a"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["src/a".into()],
+            &[],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_jj_update_uses_one_pinned_file_and_delete_tree() {
+        let root = tempdir().unwrap();
+        assert!(Command::new("jj")
+            .current_dir(root.path())
+            .args(["git", "init", "."])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join("old"), b"old").unwrap();
+        assert!(Command::new("jj")
+            .current_dir(root.path())
+            .args(["commit", "-m", "base"])
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(root.path().join("old")).unwrap();
+        fs::write(root.path().join("new"), b"pinned").unwrap();
+        let output = tempdir().unwrap();
+        let package = package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &["new".into()],
+            &["old".into()],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .unwrap();
+        fs::write(root.path().join("new"), b"after").unwrap();
+        let mut archive = zip::ZipArchive::new(package.archive.reopen().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        archive
+            .by_name("new")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"pinned");
+        assert!(package.identity.jj_commit_id.is_some());
+
+        assert!(package_update_source_cancellable(
+            root.path(),
+            root.path(),
+            &[],
+            &["new".into()],
+            output.path(),
+            &SourceCancellation::new(),
+        )
+        .is_err());
+    }
 
     #[test]
     fn safe_and_unsafe_symlink_targets() {
