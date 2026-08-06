@@ -19,7 +19,7 @@ Do not use the ambiguous `booted` selector. Every wrapper reads the one explicit
 Example operator configuration:
 
 ```toml
-schema_version = "11"
+schema_version = "12"
 
 [build]
 workspace_root = "/var/db/indentured-server/workspaces"

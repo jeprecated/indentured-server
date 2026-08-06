@@ -1,4 +1,4 @@
-schema_version = "11"
+schema_version = "12"
 
 [service]
 # Immediate admission control; excess authenticated requests receive HTTP 503.

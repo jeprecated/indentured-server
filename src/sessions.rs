@@ -22,18 +22,20 @@ use crate::build::{
     CancellationFlag, ValidatedRequest,
 };
 use crate::config::{
-    Config, SessionActionConfig, SourceUpdatesConfig, TaskConfig, MAX_SESSION_LIFETIME_SEC,
+    Config, SessionActionConfig, SourceUpdatesConfig, TaskConfig, TaskSessionConfig,
+    MAX_SESSION_LIFETIME_SEC,
 };
 use crate::protocol::{
     SessionActionDispatchInput, SessionActionEvent, SessionActionStatus, SessionActionStreamItem,
-    SessionStartEvent, SessionStopResponse, SessionTeardownResult, SessionUpdateResponse,
-    SESSION_ACTION_DISPATCH_SCHEMA_VERSION,
+    SessionStartEvent, SessionStartStatus, SessionStopResponse, SessionTeardownResult,
+    SessionUpdateResponse, SESSION_ACTION_DISPATCH_SCHEMA_VERSION,
 };
+use crate::services::{DurableServiceProcess, RunningService};
 use crate::source_updates::{
     apply_update, PreparedUpdate, UpdateError as SourceUpdateError, UpdateErrorKind,
 };
 
-const METADATA_VERSION: u8 = 2;
+const METADATA_VERSION: u8 = 3;
 const METADATA_DIRECTORY: &str = ".sessions";
 
 #[derive(Clone)]
@@ -153,6 +155,8 @@ struct SessionEntry {
     permit: Mutex<Option<OwnedSemaphorePermit>>,
     timers: Mutex<Vec<AbortHandle>>,
     update_data: Mutex<SessionUpdateData>,
+    services: Mutex<Vec<RunningService>>,
+    retaining_service_output: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct SessionUpdateData {
@@ -207,6 +211,24 @@ struct DurableSessionMetadata {
     session_id: String,
     task_id: String,
     workspace_revision: u64,
+    #[serde(default, skip_serializing_if = "DurableSessionState::is_ready")]
+    state: DurableSessionState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    services: Vec<DurableServiceProcess>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DurableSessionState {
+    StartingServices,
+    #[default]
+    Ready,
+}
+
+impl DurableSessionState {
+    fn is_ready(&self) -> bool {
+        *self == Self::Ready
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,6 +343,8 @@ impl SessionManager {
                 revision: 0,
                 last_success: None,
             }),
+            services: Mutex::new(Vec::new()),
+            retaining_service_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         #[cfg(test)]
         if let Some((checkpoint, hook)) = self
@@ -455,6 +479,28 @@ impl SessionManager {
             return;
         }
 
+        if let Err(err) = self.start_configured_services(&entry, &sender) {
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Error {
+                    code: err.code.to_string(),
+                    message: Some(err.message),
+                    phase: None,
+                },
+            );
+            send_best_effort(
+                &sender,
+                SessionStartEvent::Exit {
+                    code: 1,
+                    timed_out: Instant::now() >= entry.deadline,
+                    failed_phase: None,
+                    phases: outcome.phases,
+                },
+            );
+            self.initializer_cleanup(&entry, false);
+            return;
+        }
+
         #[cfg(test)]
         self.wait_at_hook(HookKind::BeforeCommit);
 
@@ -477,10 +523,12 @@ impl SessionManager {
         }
 
         let metadata = DurableSessionMetadata {
-            version: METADATA_VERSION,
+            version: self.metadata_version(&entry),
             session_id: entry.id.clone(),
             task_id: entry.task_id.clone(),
             workspace_revision: 0,
+            state: DurableSessionState::Ready,
+            services: self.durable_services(&entry),
         };
         if let Err(err) = self.write_metadata(&metadata) {
             error!(
@@ -531,6 +579,12 @@ impl SessionManager {
             *state = SessionState::Ready {
                 last_activity: Instant::now(),
             };
+            entry
+                .retaining_service_output
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            for service in entry.services.lock().expect("session services lock").iter() {
+                service.retain_output();
+            }
             self.spawn_idle_timer(&entry);
             send_best_effort(
                 &sender,
@@ -565,6 +619,187 @@ impl SessionManager {
             },
         );
         self.initializer_cleanup(&entry, false);
+    }
+
+    fn start_configured_services(
+        &self,
+        entry: &Arc<SessionEntry>,
+        sender: &Sender<SessionStartEvent>,
+    ) -> Result<(), crate::build::BuildError> {
+        let Some(session) = entry.task.session.as_ref() else {
+            return Ok(());
+        };
+        if session.services.is_empty() {
+            return Ok(());
+        }
+
+        send_best_effort(
+            sender,
+            SessionStartEvent::Session {
+                id: entry.id.clone(),
+                status: SessionStartStatus::StartingServices,
+                phase: None,
+                duration_ms: None,
+                exit_code: None,
+                timed_out: None,
+            },
+        );
+        self.write_metadata(&DurableSessionMetadata {
+            version: METADATA_VERSION,
+            session_id: entry.id.clone(),
+            task_id: entry.task_id.clone(),
+            workspace_revision: 0,
+            state: DurableSessionState::StartingServices,
+            services: Vec::new(),
+        })
+        .map_err(|err| {
+            crate::build::BuildError::new(
+                "session_commit_failed",
+                format!("failed to record service startup: {err}"),
+            )
+        })?;
+
+        for name in sorted_service_names(session) {
+            if entry.initialization_cancellation.is_cancelled() || Instant::now() >= entry.deadline
+            {
+                return Err(crate::build::BuildError::new(
+                    "service_start_cancelled",
+                    "service startup was cancelled",
+                ));
+            }
+            let service = session
+                .services
+                .get(&name)
+                .expect("name collected from service map");
+            let startup_deadline = (Instant::now()
+                + Duration::from_secs(service.startup_timeout_sec))
+            .min(entry.deadline);
+            let manager = self.clone();
+            let callback_entry = Arc::clone(entry);
+            let callback = Arc::new(move |detail: String| {
+                manager.service_failed(&callback_entry, &detail);
+            });
+            let running = crate::services::spawn_service(
+                &name,
+                service,
+                &entry.task,
+                &self.inner.config,
+                &entry.workspace,
+                sender,
+                &entry.initialization_cancellation,
+                startup_deadline,
+                entry.deadline,
+                Arc::clone(&entry.retaining_service_output),
+                callback,
+            )?;
+            entry
+                .services
+                .lock()
+                .expect("session services lock")
+                .push(running);
+
+            self.write_metadata(&DurableSessionMetadata {
+                version: METADATA_VERSION,
+                session_id: entry.id.clone(),
+                task_id: entry.task_id.clone(),
+                workspace_revision: 0,
+                state: DurableSessionState::StartingServices,
+                services: self.durable_services(entry),
+            })
+            .map_err(|err| {
+                crate::build::BuildError::new(
+                    "session_commit_failed",
+                    format!("failed to record spawned service: {err}"),
+                )
+            })?;
+
+            entry
+                .services
+                .lock()
+                .expect("session services lock")
+                .last_mut()
+                .expect("service just inserted")
+                .wait_ready(
+                    startup_deadline,
+                    entry.deadline,
+                    &entry.initialization_cancellation,
+                )?;
+        }
+        Ok(())
+    }
+
+    fn metadata_version(&self, entry: &SessionEntry) -> u8 {
+        if entry
+            .task
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.services.is_empty())
+        {
+            METADATA_VERSION
+        } else {
+            2
+        }
+    }
+
+    fn durable_services(&self, entry: &SessionEntry) -> Vec<DurableServiceProcess> {
+        entry
+            .services
+            .lock()
+            .expect("session services lock")
+            .iter()
+            .map(|service| service.process.clone())
+            .collect()
+    }
+
+    fn service_failed(&self, entry: &Arc<SessionEntry>, detail: &str) {
+        warn!(
+            "managed session service failed session_id={} detail={detail}",
+            entry.id
+        );
+        let mut state = entry.state.lock().expect("session state lock");
+        let cleanup = match &*state {
+            SessionState::Initializing { .. } => {
+                entry.initialization_cancellation.cancel();
+                entry.cancellation_notify.notify_waiters();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Initializer,
+                });
+                entry.completion.notify_all();
+                false
+            }
+            SessionState::Ready { .. } => {
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                true
+            }
+            SessionState::Action { cancellation, .. } => {
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+                false
+            }
+            SessionState::Updating { cancellation, .. } => {
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Update,
+                });
+                entry.completion.notify_all();
+                false
+            }
+            SessionState::Terminating(_) | SessionState::Terminated(_) => false,
+        };
+        drop(state);
+        if cleanup {
+            self.cleanup_entry(entry, false);
+        }
     }
 
     pub(crate) fn disconnect(&self, session_id: &str) {
@@ -749,10 +984,12 @@ impl SessionManager {
             }
         };
         let metadata = DurableSessionMetadata {
-            version: METADATA_VERSION,
+            version: self.metadata_version(&entry),
             session_id: entry.id.clone(),
             task_id: entry.task_id.clone(),
             workspace_revision: next_revision,
+            state: DurableSessionState::Ready,
+            services: self.durable_services(&entry),
         };
         #[cfg(test)]
         {
@@ -1412,6 +1649,22 @@ impl SessionManager {
 
     fn cleanup_entry(&self, entry: &Arc<SessionEntry>, explicit: bool) -> SessionStopResponse {
         self.abort_timers(entry);
+        entry
+            .retaining_service_output
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let services = std::mem::take(&mut *entry.services.lock().expect("session services lock"));
+        let mut service_cleanup_failed = false;
+        let mut service_identity_cleanup_unproven = false;
+        for service in services.into_iter().rev() {
+            if let Err(err) = service.stop() {
+                service_cleanup_failed = true;
+                service_identity_cleanup_unproven |= err.cleanup_unproven();
+                warn!(
+                    "retained service cleanup was not proven session_id={}: {err}",
+                    entry.id
+                );
+            }
+        }
         let mut teardown = if entry.workspace.is_dir() {
             run_session_teardown(
                 &entry.task_id,
@@ -1428,6 +1681,9 @@ impl SessionManager {
                 error_code: Some("workspace_missing".to_string()),
             }
         };
+        if service_cleanup_failed && teardown.error_code.is_none() {
+            teardown.error_code = Some("service_cleanup_failed".to_string());
+        }
         let (artifacts, artifact_restrictions) = if explicit && entry.workspace.is_dir() {
             let archive_id = format!("bld_{}", Uuid::new_v4().simple());
             match collect_artifacts_zip(
@@ -1458,7 +1714,15 @@ impl SessionManager {
             artifact_restrictions,
         };
 
-        self.remove_session_files(&entry.id, &entry.workspace);
+        remove_path(&entry.workspace);
+        if service_identity_cleanup_unproven {
+            warn!(
+                "preserving protected session metadata for fail-closed stale reconciliation session_id={}",
+                entry.id
+            );
+        } else {
+            self.remove_metadata(&entry.id);
+        }
         self.inner
             .sessions
             .lock()
@@ -1652,9 +1916,11 @@ impl SessionManager {
                     };
                     let workspace = self.session_workspace(&session_id);
                     let metadata = read_metadata(&path).ok().filter(|metadata| {
-                        metadata.version == METADATA_VERSION && metadata.session_id == session_id
+                        (metadata.version == 2 || metadata.version == METADATA_VERSION)
+                            && metadata.session_id == session_id
                     });
                     if let Some(metadata) = metadata {
+                        self.await_stale_service_shutdown(&metadata)?;
                         if let Some(task) = self
                             .inner
                             .config
@@ -1700,6 +1966,38 @@ impl SessionManager {
                     );
                     remove_path(&entry.path());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn await_stale_service_shutdown(&self, metadata: &DurableSessionMetadata) -> io::Result<()> {
+        for service in metadata.services.iter().rev() {
+            let deadline = Instant::now()
+                + Duration::from_secs(service.shutdown_timeout_sec)
+                + Duration::from_secs(6);
+            while process_exists(service.supervisor_pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if process_exists(service.supervisor_pid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "recorded service supervisor {} is still live; refusing unsafe stale cleanup",
+                        service.supervisor_pid
+                    ),
+                ));
+            }
+            let group_live =
+                crate::build::process_group_exists(service.service_pgid).unwrap_or(true);
+            if process_exists(service.service_pid) || group_live {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "recorded service {} survived its supervisor; refusing PID-reuse-unsafe stale cleanup",
+                        service.name
+                    ),
+                ));
             }
         }
         Ok(())
@@ -1969,6 +2267,12 @@ impl SessionManager {
     }
 }
 
+fn sorted_service_names(session: &TaskSessionConfig) -> Vec<String> {
+    let mut names: Vec<_> = session.services.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 fn send_best_effort(sender: &Sender<SessionStartEvent>, event: SessionStartEvent) {
     if let Err(err) = sender.try_send(event) {
         warn!("dropping undeliverable session event: {err}");
@@ -2035,6 +2339,16 @@ fn read_metadata(path: &Path) -> io::Result<DurableSessionMetadata> {
     serde_json::from_reader(file).map_err(io::Error::other)
 }
 
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM))
+}
+
 fn remove_path(path: &Path) {
     let result = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -2055,10 +2369,12 @@ mod tests {
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, LoggingConfig, ServiceConfig,
         SessionActionConfig, SessionActionDispatcherConfig, SessionActionPolicyOverride,
-        SessionTeardownConfig, SourcesConfig, TaskSessionConfig, WorkspacePolicy,
-        CONFIG_SCHEMA_VERSION,
+        SessionServiceConfig, SessionTeardownConfig, SourcesConfig, TaskSessionConfig,
+        WorkspacePolicy, CONFIG_SCHEMA_VERSION,
     };
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn test_config(root: &Path, executable: &Path) -> Config {
@@ -2076,6 +2392,7 @@ mod tests {
                     args: vec!["teardown".to_string()],
                     timeout_sec: 1,
                 },
+                services: HashMap::new(),
                 actions: HashMap::from([(
                     "observe".to_string(),
                     SessionActionConfig {
@@ -2115,6 +2432,168 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unexpected_service_exit_elects_ready_action_and_update_termination() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config = Arc::new(test_config(temp.path(), &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new_disabled(Arc::clone(&config));
+
+        let reserve = || async {
+            let permit = Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap();
+            manager.reserve(
+                ValidatedRequest {
+                    request_id: None,
+                    task_id: "managed".to_string(),
+                    task: config.tasks["managed"].clone(),
+                },
+                permit,
+            )
+        };
+
+        let ready = reserve().await;
+        *ready.entry.state.lock().unwrap() = SessionState::Ready {
+            last_activity: Instant::now(),
+        };
+        manager.service_failed(&ready.entry, "ready exit");
+        assert_eq!(manager.active_count(), 0);
+
+        let action = reserve().await;
+        let action_cancel = CancellationFlag::default();
+        *action.entry.state.lock().unwrap() = SessionState::Action {
+            action_id: "act_test".to_string(),
+            cancellation: action_cancel.clone(),
+        };
+        manager.service_failed(&action.entry, "action exit");
+        assert!(action_cancel.is_cancelled());
+        assert!(matches!(
+            *action.entry.state.lock().unwrap(),
+            SessionState::Terminating(Termination {
+                owner: CleanupOwner::Action,
+                ..
+            })
+        ));
+        manager.cleanup_entry(&action.entry, false);
+
+        let update = reserve().await;
+        let update_cancel = CancellationFlag::default();
+        *update.entry.state.lock().unwrap() = SessionState::Updating {
+            update_id: "upd_test".to_string(),
+            cancellation: update_cancel.clone(),
+        };
+        manager.service_failed(&update.entry, "update exit");
+        assert!(update_cancel.is_cancelled());
+        assert!(matches!(
+            *update.entry.state.lock().unwrap(),
+            SessionState::Terminating(Termination {
+                owner: CleanupOwner::Update,
+                ..
+            })
+        ));
+        manager.cleanup_entry(&update.entry, false);
+    }
+
+    #[test]
+    fn no_services_metadata_keeps_legacy_shape() {
+        let metadata = DurableSessionMetadata {
+            version: 2,
+            session_id: "ses_legacy".to_string(),
+            task_id: "managed".to_string(),
+            workspace_revision: 0,
+            state: DurableSessionState::Ready,
+            services: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({
+                "version": 2,
+                "session_id": "ses_legacy",
+                "task_id": "managed",
+                "workspace_revision": 0
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pathological_service_cleanup_is_bounded_and_releases_permit() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config = Arc::new(test_config(temp.path(), &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new_disabled(Arc::clone(&config));
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let reservation = manager.reserve(
+            ValidatedRequest {
+                request_id: None,
+                task_id: "managed".to_string(),
+                task: config.tasks["managed"].clone(),
+            },
+            permit,
+        );
+        fs::create_dir(&reservation.entry.workspace).unwrap();
+        *reservation.entry.state.lock().unwrap() = SessionState::Ready {
+            last_activity: Instant::now(),
+        };
+        reservation
+            .entry
+            .services
+            .lock()
+            .unwrap()
+            .push(RunningService::pathological_for_test("pathological"));
+        manager
+            .write_metadata(&DurableSessionMetadata {
+                version: METADATA_VERSION,
+                session_id: reservation.entry.id.clone(),
+                task_id: reservation.entry.task_id.clone(),
+                workspace_revision: 0,
+                state: DurableSessionState::Ready,
+                services: manager.durable_services(&reservation.entry),
+            })
+            .unwrap();
+
+        let started = Instant::now();
+        manager.service_failed(&reservation.entry, "forced failure");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(manager.active_count(), 0);
+        assert_eq!(slots.available_permits(), 1);
+        assert!(!reservation.entry.workspace.exists());
+        assert!(manager.metadata_path(&reservation.entry.id).is_file());
+        let response = match &*reservation.entry.state.lock().unwrap() {
+            SessionState::Terminated(response) => response.clone(),
+            _ => panic!("session cleanup did not terminate"),
+        };
+        assert_eq!(
+            response.teardown.error_code.as_deref(),
+            Some("service_cleanup_failed")
+        );
+    }
+
+    #[test]
+    fn retained_service_start_order_is_name_sorted() {
+        let executable = std::env::current_exe().unwrap();
+        let service = || SessionServiceConfig {
+            script: None,
+            executable: Some(executable.clone()),
+            args: Vec::new(),
+            startup_timeout_sec: 1,
+            shutdown_timeout_sec: 1,
+            diagnostic_tail_bytes: 1,
+        };
+        let mut session = test_config(Path::new("/tmp"), &executable).tasks["managed"]
+            .session
+            .clone()
+            .unwrap();
+        session.services.insert("zeta".to_string(), service());
+        session.services.insert("alpha".to_string(), service());
+        session.services.insert("middle".to_string(), service());
+        assert_eq!(sorted_service_names(&session), ["alpha", "middle", "zeta"]);
+    }
+
     #[test]
     fn startup_reconciliation_tears_down_known_sessions_and_root_cleans_drift() {
         let temp = tempdir().unwrap();
@@ -2144,6 +2623,8 @@ mod tests {
                     session_id: id.to_string(),
                     task_id: task.to_string(),
                     workspace_revision: 0,
+                    state: DurableSessionState::Ready,
+                    services: Vec::new(),
                 })
                 .unwrap();
         }
@@ -2316,6 +2797,58 @@ mod tests {
         assert_eq!(action.action.timeout_sec, 2);
         assert!(action.action.artifacts.include.is_empty());
         assert!(action.action.artifacts.exclude.is_empty());
+    }
+
+    #[test]
+    fn stale_reconciliation_refuses_a_service_that_survived_its_supervisor() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config = Arc::new(test_config(temp.path(), &executable));
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new_disabled(Arc::clone(&config));
+        prepare_protected_directory(manager.metadata_root()).unwrap();
+        let workspace = manager.session_workspace("ses_survivor");
+        fs::create_dir(&workspace).unwrap();
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do :; done"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut service = command.spawn().unwrap();
+        let pid = service.id();
+        manager
+            .write_metadata(&DurableSessionMetadata {
+                version: METADATA_VERSION,
+                session_id: "ses_survivor".to_string(),
+                task_id: "managed".to_string(),
+                workspace_revision: 0,
+                state: DurableSessionState::StartingServices,
+                services: vec![DurableServiceProcess {
+                    name: "survivor".to_string(),
+                    supervisor_pid: u32::MAX,
+                    service_pid: pid,
+                    service_pgid: pid as i32,
+                    shutdown_timeout_sec: 1,
+                }],
+            })
+            .unwrap();
+        drop(manager);
+
+        let error = SessionManager::new(config)
+            .err()
+            .expect("unsafe cleanup refused");
+        assert!(error.to_string().contains("survived its supervisor"));
+        assert!(workspace.exists());
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+
+        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        service.wait().unwrap();
     }
 
     #[test]

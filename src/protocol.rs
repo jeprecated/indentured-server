@@ -382,6 +382,7 @@ pub enum SessionStartStatus {
     Started,
     PhaseStarted,
     PhaseFinished,
+    StartingServices,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

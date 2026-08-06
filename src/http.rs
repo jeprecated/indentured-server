@@ -3982,6 +3982,7 @@ mod tests {
                         args: vec!["teardown".to_string()],
                         timeout_sec: 3,
                     },
+                    services: HashMap::new(),
                     actions: HashMap::from([
                         (
                             "observe".to_string(),

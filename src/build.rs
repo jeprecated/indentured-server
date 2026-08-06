@@ -6,11 +6,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +33,7 @@ const TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TIMEOUT_KILL_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_CHUNK_SIZE: usize = 4096;
+pub(crate) static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(not(test))]
 const OUTPUT_FORWARD_GRACE: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -163,7 +162,7 @@ pub struct BuildError {
 }
 
 impl BuildError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -925,7 +924,7 @@ pub(crate) fn run_session_teardown(
     }
 }
 
-fn send_session_response(
+pub(crate) fn send_session_response(
     sender: &Sender<SessionStartEvent>,
     event: SessionStartEvent,
     cancellation: &CancellationFlag,
@@ -1019,7 +1018,7 @@ fn run_phase(
     }
     configure_command(&mut command, run_as).map_err(|err| err.in_phase(phase))?;
 
-    let mut child = command.spawn().map_err(|err| {
+    let mut child = spawn_command(&mut command).map_err(|err| {
         BuildError::new(
             "spawn_failed",
             format!("failed to spawn {} phase: {err}", phase.as_str()),
@@ -1241,7 +1240,7 @@ fn finish_build(
     Ok(())
 }
 
-fn resolve_cwd(root: &Path, cwd: Option<&str>) -> Result<PathBuf, BuildError> {
+pub(crate) fn resolve_cwd(root: &Path, cwd: Option<&str>) -> Result<PathBuf, BuildError> {
     let candidate = match cwd {
         None => root.to_path_buf(),
         Some(value) if value.trim().is_empty() => root.to_path_buf(),
@@ -1694,10 +1693,10 @@ fn validate_zip_type(mode: Option<u32>, is_dir: bool, is_symlink: bool) -> Resul
     Ok(())
 }
 
-struct RunAs {
-    user: UserInfo,
-    gid: u32,
-    set_ids: bool,
+pub(crate) struct RunAs {
+    pub(crate) user: UserInfo,
+    pub(crate) gid: u32,
+    pub(crate) set_ids: bool,
 }
 
 pub fn preflight_run_as(config: &Config) -> Result<(), BuildError> {
@@ -1710,6 +1709,19 @@ fn preflight_run_as_with_effective_uid(
 ) -> Result<(), BuildError> {
     let run_as = resolve_run_as(config)?;
     let transport_enabled = config.service.socket.enabled || config.service.http.enabled;
+    let has_session_services = config.tasks.values().any(|task| {
+        task.session
+            .as_ref()
+            .is_some_and(|session| !session.services.is_empty())
+    });
+    if has_session_services
+        && (effective_uid != 0 || !run_as.set_ids || run_as.user.uid == effective_uid)
+    {
+        return Err(BuildError::new(
+            "run_as_user",
+            "managed session services require a configured task identity distinct from the daemon effective UID",
+        ));
+    }
     if effective_uid == 0
         && transport_enabled
         && (!run_as.set_ids || run_as.user.uid == 0 || run_as.user.uid == effective_uid)
@@ -1782,7 +1794,7 @@ pub fn resolved_run_as_identity(config: &Config) -> Result<Option<(u32, String, 
     Ok(Some((run_as.user.uid, run_as.user.username, run_as.gid)))
 }
 
-fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
+pub(crate) fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
     let set_ids = config.build.run_as_user.is_some() || config.build.run_as_group.is_some();
 
     let user = if let Some(user) = &config.build.run_as_user {
@@ -1816,7 +1828,7 @@ fn resolve_run_as(config: &Config) -> Result<RunAs, BuildError> {
     Ok(RunAs { user, gid, set_ids })
 }
 
-fn validate_run_as_uid(run_as: &RunAs, effective_uid: u32) -> Result<(), BuildError> {
+pub(crate) fn validate_run_as_uid(run_as: &RunAs, effective_uid: u32) -> Result<(), BuildError> {
     if effective_uid == 0 && run_as.user.uid == 0 {
         return Err(BuildError::new(
             "run_as_user",
@@ -1826,7 +1838,7 @@ fn validate_run_as_uid(run_as: &RunAs, effective_uid: u32) -> Result<(), BuildEr
     Ok(())
 }
 
-fn build_env(task: &TaskConfig, user: &UserInfo) -> Vec<(String, String)> {
+pub(crate) fn build_env(task: &TaskConfig, user: &UserInfo) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = task
         .environment
         .iter()
@@ -1886,7 +1898,12 @@ fn apply_privilege_drop(
     ops.setuid(uid)
 }
 
-fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildError> {
+pub(crate) fn spawn_command(command: &mut Command) -> io::Result<Child> {
+    let _spawn_guard = PROCESS_SPAWN_LOCK.lock().expect("process spawn lock");
+    command.spawn()
+}
+
+pub(crate) fn configure_command(command: &mut Command, run_as: &RunAs) -> Result<(), BuildError> {
     validate_run_as_uid(run_as, unsafe { libc::geteuid() })?;
     let should_set_ids = run_as.set_ids;
     let username = run_as.user.username.clone();
@@ -2138,7 +2155,7 @@ fn terminate_process(child: &mut Child, reason: TerminationReason) -> io::Result
     Ok(code.unwrap_or(TIMEOUT_EXIT_CODE))
 }
 
-fn terminate_remaining_group(pgid: i32) -> io::Result<()> {
+pub(crate) fn terminate_remaining_group(pgid: i32) -> io::Result<()> {
     if !process_group_exists(pgid)? {
         return Ok(());
     }
@@ -2186,7 +2203,7 @@ fn wait_for_group_and_exit(
     }
 }
 
-fn process_group_exists(pgid: i32) -> io::Result<bool> {
+pub(crate) fn process_group_exists(pgid: i32) -> io::Result<bool> {
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return Ok(true);
     }
@@ -2198,7 +2215,7 @@ fn process_group_exists(pgid: i32) -> io::Result<bool> {
     }
 }
 
-fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
+pub(crate) fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
     if unsafe { libc::killpg(pgid, signal) } == 0 {
         return Ok(());
     }
@@ -2263,7 +2280,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "11"
+schema_version = "12"
 tasks = {}
 [service.http]
 enabled = true
@@ -2283,6 +2300,42 @@ required = false
             preflight_run_as_with_effective_uid(&config, 0)
                 .expect("simulated root daemon accepts a configured non-root identity");
         }
+    }
+
+    #[test]
+    fn retained_services_reject_same_daemon_identity_during_preflight() {
+        let raw = r#"
+schema_version = "12"
+[service.http]
+enabled = true
+[tasks.managed]
+executable = "/bin/sh"
+cwd = "."
+timeout_sec = 1
+environment = {}
+workspace = "fresh"
+[tasks.managed.artifacts]
+[tasks.managed.session]
+idle_timeout_sec = 1
+max_lifetime_sec = 2
+[tasks.managed.session.teardown]
+executable = "/bin/sh"
+timeout_sec = 1
+[tasks.managed.session.services.service]
+executable = "/bin/sh"
+startup_timeout_sec = 1
+shutdown_timeout_sec = 1
+diagnostic_tail_bytes = 1
+[tasks.managed.session.actions.observe]
+executable = "/bin/sh"
+timeout_sec = 1
+"#;
+        let mut config: Config = toml::from_str(raw).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let current = lookup_user(uid).unwrap();
+        config.build.run_as_user = Some(current.username);
+        let error = preflight_run_as_with_effective_uid(&config, uid).unwrap_err();
+        assert!(error.message.contains("distinct from the daemon"));
     }
 
     #[test]
@@ -2493,6 +2546,7 @@ required = false
                     args: vec![],
                     timeout_sec: 1,
                 },
+                services: HashMap::new(),
                 actions: HashMap::from([("forced".to_string(), action)]),
                 action_dispatcher: None,
                 source_updates: None,

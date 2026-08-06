@@ -180,8 +180,21 @@ LANG = "C"
 include = ["final/**"]
 exclude = ["final/.keep"]
 [tasks.session_probe.session]
-idle_timeout_sec = 2
+idle_timeout_sec = 4
 max_lifetime_sec = 15
+[tasks.session_probe.session.services.fake]
+script = '''
+ready_fd=${{INDENTURED_SERVICE_READY_FD:?}}
+unset INDENTURED_SERVICE_READY_FD
+eval "printf 'service-starting\\n'"
+eval "printf 'ready\\n' >&$ready_fd"
+eval "exec $ready_fd>&-"
+# Block without consuming a CPU. SIGSTOP deliberately exercises KILL escalation.
+kill -STOP $$
+'''
+startup_timeout_sec = 2
+shutdown_timeout_sec = 1
+diagnostic_tail_bytes = 128
 [tasks.session_probe.session.teardown]
 script = '''
 name=${{PWD##*/}}
@@ -294,7 +307,7 @@ timeout_sec = 3
     fs::write(
         &config,
         format!(
-            r#"schema_version = "11"
+            r#"schema_version = "12"
 [service]
 max_concurrent_builds = 1
 [service.socket]
@@ -850,6 +863,103 @@ fn metadata_count(server_root: &Path) -> usize {
     fs::read_dir(root).unwrap().filter_map(Result::ok).count()
 }
 
+#[derive(Debug)]
+struct RecordedServiceProcess {
+    supervisor_pid: libc::pid_t,
+    service_pgid: libc::pid_t,
+    shutdown_timeout_sec: u64,
+}
+
+fn assert_no_service_metadata(server_root: &Path, session_id: &str) {
+    let path = server_root
+        .join("workspaces/.sessions")
+        .join(format!("{session_id}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(value["version"], 2);
+    assert!(
+        value.get("services").is_none() && value.get("state").is_none(),
+        "a no-services session gained retained-service metadata: {value}"
+    );
+}
+
+fn recorded_service_processes(server_root: &Path) -> Vec<RecordedServiceProcess> {
+    let root = server_root.join("workspaces/.sessions");
+    let mut recorded = Vec::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        for service in value["services"].as_array().unwrap() {
+            recorded.push(RecordedServiceProcess {
+                supervisor_pid: service["supervisor_pid"].as_i64().unwrap() as libc::pid_t,
+                service_pgid: service["service_pgid"].as_i64().unwrap() as libc::pid_t,
+                shutdown_timeout_sec: service["shutdown_timeout_sec"].as_u64().unwrap(),
+            });
+        }
+    }
+    assert!(
+        !recorded.is_empty(),
+        "service metadata was not durably recorded"
+    );
+    recorded
+}
+
+#[cfg(target_os = "linux")]
+fn become_test_subreaper() {
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0,
+        "failed to make the isolated harness the service-supervisor subreaper"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn become_test_subreaper() {
+    panic!("packaged retained-service lifecycle requires Linux subreaper support");
+}
+
+fn reap_recorded_supervisors(processes: &[RecordedServiceProcess]) {
+    for process in processes {
+        let deadline = Instant::now()
+            + Duration::from_secs(process.shutdown_timeout_sec)
+            + Duration::from_secs(6);
+        loop {
+            let result = unsafe {
+                libc::waitpid(process.supervisor_pid, std::ptr::null_mut(), libc::WNOHANG)
+            };
+            if result == process.supervisor_pid {
+                break;
+            }
+            if result < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD),
+                    "failed to reap recorded service supervisor {}",
+                    process.supervisor_pid
+                );
+                assert_eq!(unsafe { libc::kill(process.supervisor_pid, 0) }, -1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recorded service supervisor {} did not exit after daemon control EOF",
+                process.supervisor_pid
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            unsafe { libc::killpg(process.service_pgid, 0) },
+            -1,
+            "service process group {} survived its supervisor",
+            process.service_pgid
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "service process group lookup failed unexpectedly"
+        );
+    }
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !predicate() {
@@ -1006,6 +1116,7 @@ fn assert_result_artifact(results: &Path, suffix: &Path, expected: &str) {
 #[test]
 #[ignore = "run through scripts/check-packaged-local-integration.sh with Nix package paths"]
 fn packaged_managed_session_flow() {
+    become_test_subreaper();
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -1045,6 +1156,7 @@ fn packaged_managed_session_flow() {
         &task_state,
         "dispatch_probe",
     );
+    assert_no_service_metadata(&server_root, &dispatched);
     let observed = session_action(
         &client_bin,
         &source,
@@ -1340,7 +1452,9 @@ fn packaged_managed_session_flow() {
     let (restart, restart_status) =
         start_session_with_state(&client_bin, &source, &state, &results, &task_state);
     assert!(restart.starts_with("ses_"));
+    let restart_services = recorded_service_processes(&server_root);
     server.terminate();
+    reap_recorded_supervisors(&restart_services);
     let restarted = start_packaged_server(&server_bin, &server_root, ServerConfigMode::Full);
     endpoint = restarted.0;
     server = restarted.1;
@@ -1359,7 +1473,9 @@ fn packaged_managed_session_flow() {
     let (drift_available, drift_available_status) =
         start_session_with_state(&client_bin, &source, &state, &results, &task_state);
     assert!(drift_available.starts_with("ses_"));
+    let drift_available_services = recorded_service_processes(&server_root);
     server.terminate();
+    reap_recorded_supervisors(&drift_available_services);
     let changed_server = start_packaged_server(
         &server_bin,
         &server_root,
@@ -1382,7 +1498,9 @@ fn packaged_managed_session_flow() {
     let (drifted, drifted_status) =
         start_session_with_state(&client_bin, &source, &state, &results, &task_state);
     assert!(drifted.starts_with("ses_"));
+    let drifted_services = recorded_service_processes(&server_root);
     server.terminate();
+    reap_recorded_supervisors(&drifted_services);
     let drifted_server = start_packaged_server(
         &server_bin,
         &server_root,

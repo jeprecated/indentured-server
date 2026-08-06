@@ -14,11 +14,33 @@ use indentured_server::logging::LoggingSettings;
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    service_supervisor: bool,
+    #[arg(long, hide = true, requires = "service_supervisor")]
+    control_fd: Option<i32>,
+    #[arg(long, hide = true, requires = "service_supervisor")]
+    status_fd: Option<i32>,
+    #[arg(long, hide = true, requires = "service_supervisor")]
+    readiness_fd: Option<i32>,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+
+    if args.service_supervisor {
+        let result = indentured_server::services::run_supervisor(
+            args.control_fd.expect("required supervisor control FD"),
+            args.status_fd.expect("required supervisor status FD"),
+            args.readiness_fd.expect("required supervisor readiness FD"),
+        );
+        if let Err(err) = result {
+            eprintln!("service supervisor failed: {err}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let config = match Config::load_from_sources(args.config.as_deref()) {
         Ok(config) => config,

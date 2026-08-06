@@ -3861,6 +3861,9 @@ async fn read_session_start_response(
                                 );
                             }
                         }
+                        SessionStartStatus::StartingServices => {
+                            eprintln!("{OUTPUT_PREFIX} session {id} starting services");
+                        }
                     }
                 }
                 SessionStartEvent::Stdout { data } => logs

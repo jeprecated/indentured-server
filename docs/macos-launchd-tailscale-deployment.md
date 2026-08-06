@@ -75,13 +75,46 @@ Initial throughput is exactly one active operation: `service.max_concurrent_buil
 
 Every accepted request gets a new unpredictable workspace. The server-owned `sources.upload_timeout_sec` deadline covers source chunks and multipart trailer consumption; timeout returns stable HTTP `408 source_upload_timeout`, removes the partial file, and releases the single-run permit. Upload and complete archive preflight/extraction finish before the fixed server-owned task starts. A root daemon refuses every enabled transport unless a distinct non-root run-as identity is configured. The daemon calls `initgroups`, `setgid`, and `setuid` for that identity, clears inherited environment, and retains ownership of credentials, logs, artifacts, and control paths. Only the fresh workspace transfers to the task identity.
 
-The one-shot lifecycle is synchronous. Client SIGINT or response disconnect closes the request and cancels the remote process group. Managed sessions use separate start/action/stop requests: setup+run initialize once, one named action or one fixed dispatcher runs at a time with bounded JSON on stdin, and configured idempotent teardown owns cleanup. The session retains only workspace files and operator-owned external state identifiers. Initialization, each action, and teardown still reap their process groups; an external service that must persist between commands must be handed to its supported launchd/CoreSimulator service context, never daemonized merely to evade cleanup.
+The one-shot lifecycle is synchronous. Client SIGINT or response disconnect closes the request and cancels the remote process group. Managed sessions use separate start/action/stop requests: setup+run initialize once, optional operator-owned retained services start next in sorted-name order, one named action or one fixed dispatcher runs at a time with bounded JSON on stdin, and configured idempotent teardown owns cleanup. Initialization phases, each service, action, and teardown have separate reaped process groups under the fixed task identity.
+
+A retained service is configured only by deployment policy: fixed script or absolute executable/fixed args, bounded startup/shutdown timeouts, and a bounded diagnostic tail. Enabling any retained service requires the root daemon to use an explicit task identity distinct from its own effective UID; startup rejects same-identity configurations. The daemon injects the reserved `INDENTURED_SERVICE_READY_FD` into that service only. The wrapper must wait for the real dependency, write exactly `ready\n`, and close the FD. Startup output is streamed; after Ready only the fixed tail remains in memory. Unexpected exit destroys the session. Cleanup stops services in reverse order with TERM, the configured bound, KILL escalation, and bounded reap proof before teardown. A pathological survivor cannot hold the session permit forever: cleanup records `service_cleanup_failed`, logs the missing proof, and continues permit/workspace cleanup while retaining protected metadata for fail-closed startup reconciliation. An Indentured-owned per-service supervisor watches a daemon control pipe and holds an armed child/group cleanup guard so daemon death or any unfinished supervisor return performs bounded service-group cleanup; daemon-side stop also terminates and verifies the recorded group independently; protected durable metadata is written before spawning, and startup reconciliation verifies that recorded supervisor, leader, and group identities are gone before destroying rather than recovering a stale session; PID-reuse ambiguity refuses cleanup. There is no reconnect or generic service control/list API.
 
 A Ready session is destroyed by explicit stop, idle expiry, maximum lifetime, unsafe action failure/disconnect, or daemon-start reconciliation. A daemon restart destroys rather than resumes durable sessions. If task configuration drifted away, the daemon can remove protected metadata/workspace but cannot reconstruct removed operator teardown authority, so wrappers must be idempotent and deployment changes must drain sessions first. Reuse of bearer authentication is unchanged; there is no new session-specific auth model.
 
 Timeout and output exhaustion use bounded SIGTERM-then-SIGKILL escalation and require group disappearance before artifact collection and cleanup. Process groups are cleanup, not a sandbox against a deliberately escaped `setsid` process; account/VM isolation remains required for untrusted uploaded code.
 
 Client run/session evidence remains private and non-destructive in its XDG result directory until client-side policy removes it. Server artifact archives remain until operator-selected `artifacts.ttl_sec` and/or `artifacts.max_bytes` GC bounds remove them; when both are unset, no finite server retention period is implied. Automatic session cleanup does not publish unreachable final archives; only explicit stop may return the configured final snapshot.
+
+### Retained Metro wrapper example
+
+The wrapper is operator-installed, absolute, and non-writable by the task identity. It starts only fixed Metro authority, waits for the actual fixed port, then writes and closes the readiness channel. The FD value is daemon-generated data, not caller configuration:
+
+```sh
+#!/bin/sh
+set -eu
+: "${INDENTURED_SERVICE_READY_FD:?}"
+ready_fd=$INDENTURED_SERVICE_READY_FD
+unset INDENTURED_SERVICE_READY_FD
+
+# Fixed operator policy; no request field becomes argv, environment, or port.
+/usr/local/bin/node /usr/local/libexec/metro/cli.js start --port 8081 &
+metro_pid=$!
+trap 'kill -TERM "$metro_pid" 2>/dev/null || :; wait "$metro_pid" 2>/dev/null || :' TERM INT EXIT
+
+attempt=0
+while ! /usr/bin/nc -z 127.0.0.1 8081; do
+  kill -0 "$metro_pid" 2>/dev/null || { wait "$metro_pid"; exit $?; }
+  attempt=$((attempt + 1))
+  test "$attempt" -lt 600 || exit 1
+  sleep 0.1
+done
+
+eval "printf 'ready\\n' >&$ready_fd"
+eval "exec $ready_fd>&-"
+wait "$metro_pid"
+```
+
+The service `startup_timeout_sec` remains the authoritative bound; the loop's local bound is defense in depth. Production policy should use a port probe available at an absolute immutable path and verify the expected protocol when a bare TCP accept is insufficient.
 
 ## Local packaged integration evidence
 
@@ -101,7 +134,7 @@ This is package/protocol evidence, not a production security bypass or a native 
 
 ## Reusable repository capability profiles
 
-Deploy schema 10 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:
+Deploy schema 12 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:
 
 ```toml
 [tasks.repo_check]
@@ -198,6 +231,7 @@ Deployment automation/operator policy must block live-service acceptance until t
 - **Immediate busy behavior:** while one run is active, a second request gets stable immediate 503 busy before source persistence; the permit is released after every completion/error path.
 - **Edge topology:** Tailscale HTTPS plus a valid bearer reaches the loopback origin; no daemon listener is exposed on a non-loopback address; UDS and built-in rustls are disabled; Serve state is reconciled after reboot and deliberate drift.
 - **Managed-session identity:** a root daemon and distinct non-root task identity preserve the protected metadata boundary; a Ready session retains the one global permit; named input or the dispatcher envelope reaches only stdin; caller data cannot select process authority; and another action conflicts rather than queues.
+- **Retained-service lifecycle:** configured services start only after run reaping and in sorted order; exact readiness, never-ready, extra readiness, early exit, output flood/tail bounds, TERM-ignore/KILL, partial startup rollback, Ready/action/update exit, stop/idle/lifetime races, daemon-control EOF, and stale-metadata reconciliation all leave no service descendant; readiness FD authority is daemon-only and no service endpoint exists.
 - **CoreSimulator context:** the exact task UID/GID/supplementary groups can reach the intended per-user launchd/bootstrap context using pinned `DEVELOPER_DIR`, runtime, and device type. Every operation uses the recorded explicit UDID, never `booted`.
 - **Simulator lifecycle:** initialization builds once and creates/boots/installs/launches once; separate observe/act invocations reuse it; observe returns a screenshot; explicit stop, idle/lifetime expiry, disconnect, failure, and restart cleanup delete the recorded simulator. `simctl list devices -j` confirms the UDID is absent after every cleanup case.
 - **Simulator authority separation:** the simulator task cannot read or modify bearer credentials, daemon config/logs/artifacts, launchd policy, control paths, or other users' simulator state. Signing and unrelated deployment credentials are absent.

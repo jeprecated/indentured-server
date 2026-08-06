@@ -11,7 +11,8 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "11";
+pub const CONFIG_SCHEMA_VERSION: &str = "12";
+pub(crate) const SERVICE_READY_FD_ENV: &str = "INDENTURED_SERVICE_READY_FD";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
 pub(crate) const MAX_SESSION_LIFETIME_SEC: u64 = u32::MAX as u64;
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
@@ -276,7 +277,12 @@ impl Config {
 
         let mut has_script_task = false;
         for (name, task) in &self.tasks {
-            task.validate(name, self.build.max_timeout_sec, &self.sources)?;
+            task.validate(
+                name,
+                self.build.max_timeout_sec,
+                self.build.max_output_bytes,
+                &self.sources,
+            )?;
             has_script_task |= task.uses_script();
         }
         if has_script_task {
@@ -588,6 +594,8 @@ pub struct TaskSessionConfig {
     pub max_lifetime_sec: u64,
     pub teardown: SessionTeardownConfig,
     #[serde(default)]
+    pub services: HashMap<String, SessionServiceConfig>,
+    #[serde(default)]
     pub actions: HashMap<String, SessionActionConfig>,
     #[serde(default)]
     pub action_dispatcher: Option<SessionActionDispatcherConfig>,
@@ -618,6 +626,20 @@ pub struct SessionTeardownConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub timeout_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionServiceConfig {
+    #[serde(default)]
+    pub script: Option<ScriptText>,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub startup_timeout_sec: u64,
+    pub shutdown_timeout_sec: u64,
+    pub diagnostic_tail_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -688,6 +710,12 @@ impl SessionTeardownConfig {
     }
 }
 
+impl SessionServiceConfig {
+    pub(crate) fn execution(&self) -> TaskExecution<'_> {
+        execution(&self.script, &self.executable, &self.args)
+    }
+}
+
 impl SessionActionConfig {
     pub(crate) fn execution(&self) -> TaskExecution<'_> {
         execution(&self.script, &self.executable, &self.args)
@@ -728,6 +756,10 @@ impl TaskConfig {
             || self.session.as_ref().is_some_and(|session| {
                 session.teardown.script.is_some()
                     || session
+                        .services
+                        .values()
+                        .any(|service| service.script.is_some())
+                    || session
                         .actions
                         .values()
                         .any(|action| action.script.is_some())
@@ -742,6 +774,7 @@ impl TaskConfig {
         &self,
         name: &str,
         max_timeout_sec: u64,
+        max_output_bytes: u64,
         sources: &SourcesConfig,
     ) -> Result<(), ConfigError> {
         if !valid_task_id(name) {
@@ -800,9 +833,20 @@ impl TaskConfig {
             return Err(ConfigError::Invalid(message));
         }
         if let Some(session) = &self.session {
-            session.validate(name, &self.environment, max_timeout_sec, sources)?;
+            session.validate(
+                name,
+                &self.environment,
+                max_timeout_sec,
+                max_output_bytes,
+                sources,
+            )?;
         }
         for (key, value) in &self.environment {
+            if key == SERVICE_READY_FD_ENV {
+                return Err(ConfigError::Invalid(format!(
+                    "tasks.{name}.environment.{SERVICE_READY_FD_ENV} is reserved for managed services"
+                )));
+            }
             if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
                 return Err(ConfigError::Invalid(format!(
                     "tasks.{name}.environment contains an invalid key or value"
@@ -875,6 +919,7 @@ impl TaskSessionConfig {
         task_name: &str,
         environment: &HashMap<String, String>,
         max_timeout_sec: u64,
+        max_output_bytes: u64,
         sources: &SourcesConfig,
     ) -> Result<(), ConfigError> {
         let field = format!("tasks.{task_name}.session");
@@ -897,6 +942,40 @@ impl TaskSessionConfig {
             return Err(ConfigError::Invalid(format!(
                 "{field}.idle_timeout_sec must be less than {field}.max_lifetime_sec"
             )));
+        }
+
+        for (service_name, service) in &self.services {
+            if !valid_task_id(service_name) {
+                return Err(ConfigError::Invalid(format!(
+                    "service name {service_name:?} in {field}.services must match [A-Za-z0-9_-]+ and be at most 64 bytes"
+                )));
+            }
+            let service_field = format!("{field}.services.{service_name}");
+            validate_execution(
+                &service.script,
+                &service.executable,
+                &service.args,
+                &service_field,
+                environment,
+            )?;
+            validate_args(&service.args, &format!("{service_field}.args"))?;
+            for (name, value) in [
+                ("startup_timeout_sec", service.startup_timeout_sec),
+                ("shutdown_timeout_sec", service.shutdown_timeout_sec),
+            ] {
+                if value == 0 || value > max_timeout_sec {
+                    return Err(ConfigError::Invalid(format!(
+                        "{service_field}.{name} must be between 1 and build.max_timeout_sec ({max_timeout_sec})"
+                    )));
+                }
+            }
+            if service.diagnostic_tail_bytes == 0
+                || service.diagnostic_tail_bytes > max_output_bytes
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{service_field}.diagnostic_tail_bytes must be between 1 and build.max_output_bytes ({max_output_bytes})"
+                )));
+            }
         }
 
         validate_session_execution(
@@ -1409,6 +1488,7 @@ mod tests {
                 args: vec!["teardown".to_string()],
                 timeout_sec: 30,
             },
+            services: HashMap::new(),
             actions: HashMap::from([(
                 "observe".to_string(),
                 SessionActionConfig {
@@ -1471,7 +1551,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "11"
+schema_version = "12"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1482,7 +1562,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "11"
+schema_version = "12"
 tasks = {}
 [service.http]
 enabled = true
@@ -1961,16 +2041,96 @@ timeout_sec = 30
     }
 
     #[test]
-    fn schema_ten_migrates_by_version_only() {
+    fn session_services_are_operator_owned_strict_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = valid_config(temp.path());
+        let mut managed = session(executable.clone());
+        managed.services.insert(
+            "metro".to_string(),
+            SessionServiceConfig {
+                script: None,
+                executable: Some(executable),
+                args: vec!["serve".to_string()],
+                startup_timeout_sec: 10,
+                shutdown_timeout_sec: 10,
+                diagnostic_tail_bytes: 1024,
+            },
+        );
+        config.tasks.get_mut("build").unwrap().session = Some(managed);
+        config.validate().expect("valid retained service");
+
+        for mutation in [
+            |service: &mut SessionServiceConfig| service.startup_timeout_sec = 0,
+            |service: &mut SessionServiceConfig| service.shutdown_timeout_sec = 0,
+            |service: &mut SessionServiceConfig| service.diagnostic_tail_bytes = 0,
+        ] {
+            let mut invalid = config.clone();
+            mutation(
+                invalid
+                    .tasks
+                    .get_mut("build")
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .services
+                    .get_mut("metro")
+                    .unwrap(),
+            );
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = config.clone();
+        invalid
+            .tasks
+            .get_mut("build")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap()
+            .services
+            .get_mut("metro")
+            .unwrap()
+            .diagnostic_tail_bytes = invalid.build.max_output_bytes + 1;
+        assert!(invalid.validate().is_err());
+
+        let unknown = r#"script = "true"
+startup_timeout_sec = 1
+shutdown_timeout_sec = 1
+diagnostic_tail_bytes = 1
+caller_args = ["no"]
+"#;
+        assert!(toml::from_str::<SessionServiceConfig>(unknown).is_err());
+    }
+
+    #[test]
+    fn task_environment_rejects_reserved_service_readiness_fd() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = valid_config(temp.path());
+        config
+            .tasks
+            .get_mut("build")
+            .unwrap()
+            .environment
+            .insert(SERVICE_READY_FD_ENV.to_string(), "99".to_string());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("reserved"));
+    }
+
+    #[test]
+    fn schema_eleven_migrates_by_version_only() {
         let temp = tempfile::tempdir().unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut legacy = valid_config(temp.path());
         legacy.tasks.get_mut("build").unwrap().session = Some(session(executable));
-        legacy.schema_version = "10".to_string();
+        legacy.schema_version = "11".to_string();
         assert!(legacy.validate().is_err());
         let legacy_toml = toml::to_string(&legacy).unwrap();
         let migrated_toml =
-            legacy_toml.replacen("schema_version = \"10\"", "schema_version = \"11\"", 1);
+            legacy_toml.replacen("schema_version = \"11\"", "schema_version = \"12\"", 1);
         let migrated: Config = toml::from_str(&migrated_toml).unwrap();
         migrated.validate().expect("version-only migration");
         let session = migrated.tasks["build"].session.as_ref().unwrap();
@@ -1992,7 +2152,7 @@ timeout_sec = 30
         }
 
         let legacy = r#"
-schema_version = "11"
+schema_version = "12"
 tasks = {}
 [service.http]
 enabled = true
@@ -2040,10 +2200,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_eleven_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_twelve_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "11"
+            r#"schema_version = "12"
 [service.http]
 enabled = true
 [build]
@@ -2098,7 +2258,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["10", "12"] {
+        for version in ["11", "13"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config

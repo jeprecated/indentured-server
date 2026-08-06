@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `11`; request protocol versions are separate. Schema 10 configurations migrate by changing only their schema version; source updates remain disabled unless their table is added. Older and future schemas fail closed.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `12`; request protocol versions are separate. Schema 11 configurations migrate by changing only their schema version; retained services remain disabled unless their table is added. Older and future schemas fail closed.
 
 ```toml
-schema_version = "11"
+schema_version = "12"
 
 [service]
 max_concurrent_builds = 1
@@ -151,6 +151,15 @@ max_depth = 64
 include = ["src/**", "Cargo.*"]
 exclude = ["src/private/**"]
 
+# Optional operator-owned retained service. Services start after run, in sorted
+# name order, and must close the injected readiness FD after the exact message.
+[tasks.build.session.services.metro]
+executable = "/usr/local/libexec/indentured/metro-wrapper"
+args = ["--fixed-operator-mode"]
+startup_timeout_sec = 60
+shutdown_timeout_sec = 30
+diagnostic_tail_bytes = 65536
+
 # Must be safe to call repeatedly after partial failures.
 [tasks.build.session.teardown]
 script = "./scripts/session-teardown"
@@ -198,6 +207,7 @@ Task validation occurs at daemon startup:
 - a task may also define one optional server-owned `setup` command using the same script/executable shape;
 - an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and exactly one action mode: a nonempty named `actions` map or one fixed `action_dispatcher`;
 - optional `session.source_updates` requires positive timeout, transfer, uncompressed-size, file-count, and depth limits no greater than the global source/build limits, plus a nonempty operator-owned relative-glob `include`; `exclude` is optional, and `.indentured/**` and protected session metadata are always reserved;
+- optional `session.services` names use the task-name rules; each service defines exactly one fixed script or absolute executable plus fixed args, positive startup/shutdown timeouts no greater than `build.max_timeout_sec`, and positive `diagnostic_tail_bytes` no greater than `build.max_output_bytes`;
 - session action names, including dispatcher policy keys, use the task-name rules; action, teardown, and optional dispatcher override timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
 - actions and teardown inherit the task's fixed `cwd`, environment, and identity; named actions may each define an artifact allowlist, while dispatcher policy entries may override only its timeout and artifacts; the top-level task artifact policy controls the final explicit-stop snapshot;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
@@ -233,7 +243,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "11"
+schema_version = "12"
 
 [tasks.ci]
 script = '''
@@ -430,7 +440,13 @@ A nonzero configured action exit is reported in the final event and leaves the s
 {"session_id":"ses_123","teardown":{"duration_ms":40,"exit_code":0,"timed_out":false},"artifacts":{"path":"/v1/builds/bld_790/artifacts.zip","size":4321}}
 ```
 
-Initialization, actions, and teardown retain the existing whole-process-group termination and reaping behavior. A service that must outlive one configured command has to be handed to an external OS supervisor outside that child process group; ordinary persistent files may remain in the managed session workspace. The contract adds no session list, reset, arbitrary-command, workspace, or filesystem endpoint.
+Initialization runs setup, then run, then configured retained services in stable sorted-name order. Run's entire process group is reaped before the first service starts. Any configured service requires a root daemon and an explicit run-as identity distinct from the daemon effective UID. Each service inherits the task's fixed cwd, cleared/fixed environment, and that run-as identity, but runs in its own process group under an Indentured-owned supervisor. The daemon injects only `INDENTURED_SERVICE_READY_FD`; configuration cannot set that reserved key. The wrapper must write exactly `ready\n` to that numeric FD and close it only after its actual dependency (for example, Metro's listening port) is usable. EOF before the exact message, extra bytes, timeout, early exit, or output-drain failure aborts initialization.
+
+Service stdout/stderr is drained continuously. Startup bytes remain part of the session-start stream; after Ready the daemon discards oldest bytes and retains only each configured diagnostic tail, without applying a cumulative lifetime output quota. No log or service-control endpoint is exposed. Unexpected service exit during Ready, Action, or Updating cancels the active operation and destroys the session.
+
+Before the first service spawn the daemon durably records `starting_services` metadata in protected storage, then fsyncs recorded supervisor/service identities after every spawn. The daemon-control channel is established with close-on-exec protection before spawning; until `RunningService` owns it, an RAII guard closes control and performs bounded supervisor termination/reaping on every setup or status error, so the metadata write-after-spawn interval cannot orphan the service. Each supervisor owns the actual service group behind an armed RAII guard and watches a daemon control pipe; every unfinished supervisor exit closes control and performs bounded TERM, configured shutdown wait, KILL escalation, and reap verification. Daemon-side stop independently terminates and verifies the recorded service group after bounded supervisor handling, so a dead or wedged supervisor is never trusted as the sole cleanup owner. Normal cleanup first cancels/joins the active operation, then stops services in reverse start order before idempotent teardown, workspace removal, and permit release. A pathological survivor records `service_cleanup_failed` without retaining the admission permit forever. If supervisor or service-group disappearance cannot be proven within the bound, protected metadata is deliberately retained for fail-closed startup reconciliation even though the workspace, in-memory session, and permit are released. Startup reconciliation never recovers a session: it waits conservatively for every recorded supervisor to disappear before teardown/removal, verifies that the recorded service leader and group are gone, and refuses unsafe cleanup rather than signaling a possibly reused PID.
+
+Initialization, actions, teardown, and services retain bounded whole-process-group termination and reaping behavior. Process groups are cleanup rather than a sandbox against deliberate escape. The contract adds no session list, reset, reconnect, generic service-control, arbitrary-command, workspace, or filesystem endpoint.
 
 ## macOS launchd and Tailscale deployment
 
