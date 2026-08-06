@@ -726,6 +726,7 @@ pub(crate) fn run_session_action(
     session_id: &str,
     action_id: &str,
     action_name: &str,
+    workspace_revision: &str,
     input: &[u8],
     sender: &Sender<SessionActionStreamItem>,
     cancellation: &CancellationFlag,
@@ -736,6 +737,7 @@ pub(crate) fn run_session_action(
             session_id: session_id.to_string(),
             action_id: action_id.to_string(),
             action: action_name.to_string(),
+            workspace_revision: workspace_revision.to_string(),
             status: SessionActionStatus::Started,
         },
         cancellation,
@@ -2261,7 +2263,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "10"
+schema_version = "11"
 tasks = {}
 [service.http]
 enabled = true
@@ -2493,6 +2495,7 @@ required = false
                 },
                 actions: HashMap::from([("forced".to_string(), action)]),
                 action_dispatcher: None,
+                source_updates: None,
             }),
             cwd: ".".to_string(),
             timeout_sec: 30,
@@ -2535,6 +2538,7 @@ required = false
             "ses_forced",
             "act_forced",
             "forced",
+            "rev_0",
             br#"{}"#,
             &sender,
             &cancellation,
@@ -2570,6 +2574,7 @@ required = false
             "ses_blocked_stdin",
             "act_blocked_stdin",
             "forced",
+            "rev_0",
             &vec![b'x'; crate::protocol::MAX_SESSION_ACTION_BODY_BYTES],
             &sender,
             &cancellation,

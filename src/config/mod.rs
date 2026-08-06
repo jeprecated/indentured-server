@@ -11,7 +11,7 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "10";
+pub const CONFIG_SCHEMA_VERSION: &str = "11";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
 pub(crate) const MAX_SESSION_LIFETIME_SEC: u64 = u32::MAX as u64;
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
@@ -276,7 +276,7 @@ impl Config {
 
         let mut has_script_task = false;
         for (name, task) in &self.tasks {
-            task.validate(name, self.build.max_timeout_sec)?;
+            task.validate(name, self.build.max_timeout_sec, &self.sources)?;
             has_script_task |= task.uses_script();
         }
         if has_script_task {
@@ -591,6 +591,21 @@ pub struct TaskSessionConfig {
     pub actions: HashMap<String, SessionActionConfig>,
     #[serde(default)]
     pub action_dispatcher: Option<SessionActionDispatcherConfig>,
+    #[serde(default)]
+    pub source_updates: Option<SourceUpdatesConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceUpdatesConfig {
+    pub timeout_sec: u64,
+    pub max_transfer_bytes: u64,
+    pub max_uncompressed_bytes: u64,
+    pub max_files: usize,
+    pub max_depth: usize,
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,7 +738,12 @@ impl TaskConfig {
             })
     }
 
-    fn validate(&self, name: &str, max_timeout_sec: u64) -> Result<(), ConfigError> {
+    fn validate(
+        &self,
+        name: &str,
+        max_timeout_sec: u64,
+        sources: &SourcesConfig,
+    ) -> Result<(), ConfigError> {
         if !valid_task_id(name) {
             return Err(ConfigError::Invalid(format!(
                 "task name {name:?} must match [A-Za-z0-9_-]+ and be at most 64 bytes"
@@ -780,7 +800,7 @@ impl TaskConfig {
             return Err(ConfigError::Invalid(message));
         }
         if let Some(session) = &self.session {
-            session.validate(name, &self.environment, max_timeout_sec)?;
+            session.validate(name, &self.environment, max_timeout_sec, sources)?;
         }
         for (key, value) in &self.environment {
             if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
@@ -794,12 +814,68 @@ impl TaskConfig {
     }
 }
 
+impl SourceUpdatesConfig {
+    fn validate(
+        &self,
+        field: &str,
+        max_timeout_sec: u64,
+        sources: &SourcesConfig,
+    ) -> Result<(), ConfigError> {
+        if self.timeout_sec == 0
+            || self.timeout_sec > max_timeout_sec
+            || self.timeout_sec > sources.upload_timeout_sec
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.timeout_sec must be between 1 and both build.max_timeout_sec ({max_timeout_sec}) and sources.upload_timeout_sec ({})",
+                sources.upload_timeout_sec
+            )));
+        }
+        for (name, value, maximum) in [
+            (
+                "max_transfer_bytes",
+                self.max_transfer_bytes,
+                sources.max_transfer_bytes,
+            ),
+            (
+                "max_uncompressed_bytes",
+                self.max_uncompressed_bytes,
+                sources.max_uncompressed_bytes,
+            ),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(ConfigError::Invalid(format!(
+                    "{field}.{name} must be between 1 and the global sources.{name} ({maximum})"
+                )));
+            }
+        }
+        for (name, value, maximum) in [
+            ("max_files", self.max_files, sources.max_files),
+            ("max_depth", self.max_depth, sources.max_depth),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(ConfigError::Invalid(format!(
+                    "{field}.{name} must be between 1 and the global sources.{name} ({maximum})"
+                )));
+            }
+        }
+        if self.include.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{field}.include must not be empty"
+            )));
+        }
+        validate_patterns(&self.include, &format!("{field}.include"))?;
+        validate_patterns(&self.exclude, &format!("{field}.exclude"))?;
+        Ok(())
+    }
+}
+
 impl TaskSessionConfig {
     fn validate(
         &self,
         task_name: &str,
         environment: &HashMap<String, String>,
         max_timeout_sec: u64,
+        sources: &SourcesConfig,
     ) -> Result<(), ConfigError> {
         let field = format!("tasks.{task_name}.session");
         if self.idle_timeout_sec == 0 {
@@ -855,6 +931,9 @@ impl TaskSessionConfig {
                 max_timeout_sec,
             )?;
             validate_artifact_spec(&action.artifacts, &format!("{action_field}.artifacts"))?;
+        }
+        if let Some(updates) = &self.source_updates {
+            updates.validate(&format!("{field}.source_updates"), max_timeout_sec, sources)?;
         }
         if let Some(dispatcher) = &self.action_dispatcher {
             let dispatcher_field = format!("{field}.action_dispatcher");
@@ -935,14 +1014,17 @@ fn validate_args(args: &[String], field: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_artifact_spec(spec: &ArtifactSpec, field: &str) -> Result<(), ConfigError> {
-    for (name, patterns) in [("include", &spec.include), ("exclude", &spec.exclude)] {
-        for pattern in patterns {
-            validate_relative_pattern(pattern, &format!("{field}.{name}"))
-                .map_err(|err| ConfigError::Invalid(err.to_string()))?;
-            glob::Pattern::new(pattern).map_err(|err| {
-                ConfigError::Invalid(format!("invalid glob in {field}.{name} {pattern:?}: {err}"))
-            })?;
-        }
+    validate_patterns(&spec.include, &format!("{field}.include"))?;
+    validate_patterns(&spec.exclude, &format!("{field}.exclude"))
+}
+
+fn validate_patterns(patterns: &[String], field: &str) -> Result<(), ConfigError> {
+    for pattern in patterns {
+        validate_relative_pattern(pattern, field)
+            .map_err(|err| ConfigError::Invalid(err.to_string()))?;
+        glob::Pattern::new(pattern).map_err(|err| {
+            ConfigError::Invalid(format!("invalid glob in {field} {pattern:?}: {err}"))
+        })?;
     }
     Ok(())
 }
@@ -1341,6 +1423,7 @@ mod tests {
                 },
             )]),
             action_dispatcher: None,
+            source_updates: None,
         }
     }
 
@@ -1388,7 +1471,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "10"
+schema_version = "11"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1399,7 +1482,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "10"
+schema_version = "11"
 tasks = {}
 [service.http]
 enabled = true
@@ -1555,6 +1638,60 @@ tokens = ["secret"]
                     .as_mut()
                     .unwrap(),
                 max_timeout,
+            );
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn source_update_policy_is_optional_and_bounded_by_global_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = valid_config(temp.path());
+        let mut managed = session(executable);
+        managed.source_updates = Some(SourceUpdatesConfig {
+            timeout_sec: 30,
+            max_transfer_bytes: 1024,
+            max_uncompressed_bytes: 2048,
+            max_files: 10,
+            max_depth: 4,
+            include: vec!["src/**".to_string()],
+            exclude: vec!["src/private/**".to_string()],
+        });
+        config.tasks.get_mut("build").unwrap().session = Some(managed);
+        config.validate().expect("bounded update policy");
+
+        type Mutation = Box<dyn Fn(&mut SourceUpdatesConfig, &SourcesConfig)>;
+        let mutations: Vec<Mutation> = vec![
+            Box::new(|updates, _| updates.timeout_sec = 0),
+            Box::new(|updates, sources| updates.timeout_sec = sources.upload_timeout_sec + 1),
+            Box::new(|updates, sources| {
+                updates.max_transfer_bytes = sources.max_transfer_bytes + 1
+            }),
+            Box::new(|updates, sources| {
+                updates.max_uncompressed_bytes = sources.max_uncompressed_bytes + 1
+            }),
+            Box::new(|updates, sources| updates.max_files = sources.max_files + 1),
+            Box::new(|updates, sources| updates.max_depth = sources.max_depth + 1),
+            Box::new(|updates, _| updates.include.clear()),
+            Box::new(|updates, _| updates.include = vec!["../outside".to_string()]),
+            Box::new(|updates, _| updates.exclude = vec!["[".to_string()]),
+        ];
+        for mutation in mutations {
+            let mut invalid = config.clone();
+            let sources = invalid.sources.clone();
+            mutation(
+                invalid
+                    .tasks
+                    .get_mut("build")
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .source_updates
+                    .as_mut()
+                    .unwrap(),
+                &sources,
             );
             assert!(invalid.validate().is_err());
         }
@@ -1824,16 +1961,16 @@ timeout_sec = 30
     }
 
     #[test]
-    fn schema_nine_named_actions_migrate_by_version_only() {
+    fn schema_ten_migrates_by_version_only() {
         let temp = tempfile::tempdir().unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut legacy = valid_config(temp.path());
         legacy.tasks.get_mut("build").unwrap().session = Some(session(executable));
-        legacy.schema_version = "9".to_string();
+        legacy.schema_version = "10".to_string();
         assert!(legacy.validate().is_err());
         let legacy_toml = toml::to_string(&legacy).unwrap();
         let migrated_toml =
-            legacy_toml.replacen("schema_version = \"9\"", "schema_version = \"10\"", 1);
+            legacy_toml.replacen("schema_version = \"10\"", "schema_version = \"11\"", 1);
         let migrated: Config = toml::from_str(&migrated_toml).unwrap();
         migrated.validate().expect("version-only migration");
         let session = migrated.tasks["build"].session.as_ref().unwrap();
@@ -1855,7 +1992,7 @@ timeout_sec = 30
         }
 
         let legacy = r#"
-schema_version = "10"
+schema_version = "11"
 tasks = {}
 [service.http]
 enabled = true
@@ -1903,10 +2040,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_ten_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_eleven_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "10"
+            r#"schema_version = "11"
 [service.http]
 enabled = true
 [build]
@@ -1961,7 +2098,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["9", "11"] {
+        for version in ["10", "12"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config

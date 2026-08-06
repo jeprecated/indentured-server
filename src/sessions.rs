@@ -21,14 +21,19 @@ use crate::build::{
     initialize_session, run_session_action, run_session_teardown, send_action_response,
     CancellationFlag, ValidatedRequest,
 };
-use crate::config::{Config, SessionActionConfig, TaskConfig, MAX_SESSION_LIFETIME_SEC};
+use crate::config::{
+    Config, SessionActionConfig, SourceUpdatesConfig, TaskConfig, MAX_SESSION_LIFETIME_SEC,
+};
 use crate::protocol::{
     SessionActionDispatchInput, SessionActionEvent, SessionActionStatus, SessionActionStreamItem,
-    SessionStartEvent, SessionStopResponse, SessionTeardownResult,
+    SessionStartEvent, SessionStopResponse, SessionTeardownResult, SessionUpdateResponse,
     SESSION_ACTION_DISPATCH_SCHEMA_VERSION,
 };
+use crate::source_updates::{
+    apply_update, PreparedUpdate, UpdateError as SourceUpdateError, UpdateErrorKind,
+};
 
-const METADATA_VERSION: u8 = 1;
+const METADATA_VERSION: u8 = 2;
 const METADATA_DIRECTORY: &str = ".sessions";
 
 #[derive(Clone)]
@@ -54,7 +59,28 @@ pub(crate) struct SessionActionReservation {
     action_name: String,
     action: SessionActionConfig,
     mode: SessionActionMode,
+    workspace_revision: String,
     cancellation: CancellationFlag,
+}
+
+pub(crate) struct SessionUpdateReservation {
+    entry: Arc<SessionEntry>,
+    update_id: String,
+    request_id: String,
+    request_digest: [u8; 32],
+    base_revision: u64,
+    cancellation: CancellationFlag,
+}
+
+pub(crate) enum SessionUpdateAdmission {
+    Start(SessionUpdateReservation),
+    Retry(SessionUpdateResponse),
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionUpdateUploadContext {
+    pub(crate) policy: SourceUpdatesConfig,
+    pub(crate) remaining_lifetime: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +152,18 @@ struct SessionEntry {
     cancellation_notify: Notify,
     permit: Mutex<Option<OwnedSemaphorePermit>>,
     timers: Mutex<Vec<AbortHandle>>,
+    update_data: Mutex<SessionUpdateData>,
+}
+
+struct SessionUpdateData {
+    revision: u64,
+    last_success: Option<SuccessfulUpdate>,
+}
+
+struct SuccessfulUpdate {
+    request_id: String,
+    request_digest: [u8; 32],
+    response: SessionUpdateResponse,
 }
 
 #[derive(Clone)]
@@ -138,6 +176,10 @@ enum SessionState {
     },
     Action {
         action_id: String,
+        cancellation: CancellationFlag,
+    },
+    Updating {
+        update_id: String,
         cancellation: CancellationFlag,
     },
     Terminating(Termination),
@@ -154,6 +196,7 @@ struct Termination {
 enum CleanupOwner {
     Initializer,
     Action,
+    Update,
     Requester,
 }
 
@@ -163,6 +206,7 @@ struct DurableSessionMetadata {
     version: u8,
     session_id: String,
     task_id: String,
+    workspace_revision: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +227,18 @@ pub(crate) enum ActionError {
     Conflict,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UpdateAdmissionError {
+    #[error("session not found, expired, or does not support source updates")]
+    NotFound,
+    #[error("session operation already in progress")]
+    OperationConflict,
+    #[error("base revision does not match")]
+    RevisionConflict { current_revision: String },
+    #[error("request_id was already used with different content")]
+    RequestConflict,
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct LifecycleHooks {
@@ -194,6 +250,8 @@ struct LifecycleHooks {
     automatic_cleanup: Option<BarrierHook>,
     artifact_snapshot: Option<(ArtifactSnapshotCheckpoint, BarrierHook)>,
     final_enqueued: Option<BarrierHook>,
+    update_apply: Option<BarrierHook>,
+    panic_update_worker: bool,
     force_action_setup_failure: bool,
 }
 
@@ -259,6 +317,10 @@ impl SessionManager {
             cancellation_notify: Notify::new(),
             permit: Mutex::new(Some(permit)),
             timers: Mutex::new(Vec::new()),
+            update_data: Mutex::new(SessionUpdateData {
+                revision: 0,
+                last_success: None,
+            }),
         });
         #[cfg(test)]
         if let Some((checkpoint, hook)) = self
@@ -418,6 +480,7 @@ impl SessionManager {
             version: METADATA_VERSION,
             session_id: entry.id.clone(),
             task_id: entry.task_id.clone(),
+            workspace_revision: 0,
         };
         if let Err(err) = self.write_metadata(&metadata) {
             error!(
@@ -473,6 +536,7 @@ impl SessionManager {
                 &sender,
                 SessionStartEvent::Ready {
                     session_id: entry.id.clone(),
+                    workspace_revision: "rev_0".to_string(),
                     phases: outcome.phases,
                 },
             );
@@ -535,8 +599,333 @@ impl SessionManager {
             }
             SessionState::Ready { .. }
             | SessionState::Action { .. }
+            | SessionState::Updating { .. }
             | SessionState::Terminating(_)
             | SessionState::Terminated(_) => {}
+        }
+    }
+
+    pub(crate) fn update_upload_context(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionUpdateUploadContext, UpdateAdmissionError> {
+        let entry = self
+            .lookup(session_id)
+            .ok_or(UpdateAdmissionError::NotFound)?;
+        let policy = entry
+            .task
+            .session
+            .as_ref()
+            .and_then(|session| session.source_updates.clone())
+            .ok_or(UpdateAdmissionError::NotFound)?;
+        let state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Ready { .. }
+            | SessionState::Action { .. }
+            | SessionState::Updating { .. }
+                if Instant::now() < entry.deadline =>
+            {
+                Ok(SessionUpdateUploadContext {
+                    policy,
+                    remaining_lifetime: entry.deadline.saturating_duration_since(Instant::now()),
+                })
+            }
+            _ => Err(UpdateAdmissionError::NotFound),
+        }
+    }
+
+    pub(crate) fn start_update(
+        &self,
+        session_id: &str,
+        request_id: String,
+        request_digest: [u8; 32],
+        base_revision: u64,
+    ) -> Result<SessionUpdateAdmission, UpdateAdmissionError> {
+        let entry = self
+            .lookup(session_id)
+            .ok_or(UpdateAdmissionError::NotFound)?;
+        if entry
+            .task
+            .session
+            .as_ref()
+            .and_then(|session| session.source_updates.as_ref())
+            .is_none()
+        {
+            return Err(UpdateAdmissionError::NotFound);
+        }
+        let update_id = format!("upd_{}", Uuid::new_v4().simple());
+        let cancellation = CancellationFlag::default();
+        let mut state = entry.state.lock().expect("session state lock");
+        match &*state {
+            SessionState::Ready { .. } if Instant::now() < entry.deadline => {
+                let update_data = entry.update_data.lock().expect("session update data lock");
+                if let Some(last) = &update_data.last_success {
+                    if last.request_id == request_id {
+                        if last.request_digest == request_digest {
+                            return Ok(SessionUpdateAdmission::Retry(last.response.clone()));
+                        }
+                        return Err(UpdateAdmissionError::RequestConflict);
+                    }
+                }
+                if update_data.revision != base_revision {
+                    return Err(UpdateAdmissionError::RevisionConflict {
+                        current_revision: format!("rev_{}", update_data.revision),
+                    });
+                }
+                drop(update_data);
+                *state = SessionState::Updating {
+                    update_id: update_id.clone(),
+                    cancellation: cancellation.clone(),
+                };
+                entry.completion.notify_all();
+                drop(state);
+                Ok(SessionUpdateAdmission::Start(SessionUpdateReservation {
+                    entry,
+                    update_id,
+                    request_id,
+                    request_digest,
+                    base_revision,
+                    cancellation,
+                }))
+            }
+            SessionState::Ready { .. }
+            | SessionState::Terminating(_)
+            | SessionState::Terminated(_) => Err(UpdateAdmissionError::NotFound),
+            SessionState::Initializing { .. }
+            | SessionState::Action { .. }
+            | SessionState::Updating { .. } => Err(UpdateAdmissionError::OperationConflict),
+        }
+    }
+
+    pub(crate) fn execute_update(
+        &self,
+        reservation: SessionUpdateReservation,
+        prepared: PreparedUpdate,
+    ) -> Result<SessionUpdateResponse, SourceUpdateError> {
+        let entry = reservation.entry;
+        let next_revision = match reservation.base_revision.checked_add(1) {
+            Some(revision) => revision,
+            None => {
+                let err = SourceUpdateError {
+                    kind: UpdateErrorKind::Internal,
+                    message: "workspace revision overflow".to_string(),
+                    rollback_proven: false,
+                };
+                self.finish_update_error(&entry, &reservation.update_id, &err);
+                return Err(err);
+            }
+        };
+        let identity = match crate::build::resolved_run_as_identity(&self.inner.config) {
+            Ok(identity) => identity,
+            Err(identity_error) => {
+                let err = SourceUpdateError {
+                    kind: UpdateErrorKind::Internal,
+                    message: identity_error.message,
+                    rollback_proven: false,
+                };
+                self.finish_update_error(&entry, &reservation.update_id, &err);
+                return Err(err);
+            }
+        };
+        #[cfg(test)]
+        let identity = identity.unwrap_or_else(|| {
+            (
+                unsafe { libc::geteuid() },
+                "test-task".to_string(),
+                unsafe { libc::getegid() },
+            )
+        });
+        #[cfg(not(test))]
+        let identity = match identity {
+            Some(identity) => identity,
+            None => {
+                let err = SourceUpdateError {
+                    kind: UpdateErrorKind::Internal,
+                    message: "managed source updates require a task identity".to_string(),
+                    rollback_proven: false,
+                };
+                self.finish_update_error(&entry, &reservation.update_id, &err);
+                return Err(err);
+            }
+        };
+        let metadata = DurableSessionMetadata {
+            version: METADATA_VERSION,
+            session_id: entry.id.clone(),
+            task_id: entry.task_id.clone(),
+            workspace_revision: next_revision,
+        };
+        #[cfg(test)]
+        {
+            let hook = self
+                .inner
+                .hooks
+                .lock()
+                .expect("lifecycle hooks lock")
+                .update_apply
+                .take();
+            if let Some(hook) = hook {
+                hook.arrived.wait();
+                hook.release.wait();
+            }
+            if std::mem::take(
+                &mut self
+                    .inner
+                    .hooks
+                    .lock()
+                    .expect("lifecycle hooks lock")
+                    .panic_update_worker,
+            ) {
+                panic!("forced source update worker panic");
+            }
+        }
+        let result = apply_update(
+            prepared,
+            &entry.workspace,
+            identity.0,
+            identity.2,
+            &reservation.cancellation,
+            || self.write_metadata(&metadata),
+        );
+        match result {
+            Ok(evidence) => {
+                let response = SessionUpdateResponse {
+                    session_id: entry.id.clone(),
+                    update_id: reservation.update_id.clone(),
+                    request_id: reservation.request_id.clone(),
+                    base_revision: format!("rev_{}", reservation.base_revision),
+                    workspace_revision: format!("rev_{next_revision}"),
+                    changed: evidence.changed,
+                    deleted: evidence.deleted,
+                };
+                let mut state = entry.state.lock().expect("session state lock");
+                match &*state {
+                    SessionState::Updating {
+                        update_id,
+                        cancellation,
+                    } if update_id == &reservation.update_id
+                        && !cancellation.is_cancelled()
+                        && Instant::now() < entry.deadline =>
+                    {
+                        let mut update_data =
+                            entry.update_data.lock().expect("session update data lock");
+                        update_data.revision = next_revision;
+                        update_data.last_success = Some(SuccessfulUpdate {
+                            request_id: reservation.request_id,
+                            request_digest: reservation.request_digest,
+                            response: response.clone(),
+                        });
+                        *state = SessionState::Ready {
+                            last_activity: Instant::now(),
+                        };
+                        entry.completion.notify_all();
+                        drop(update_data);
+                        drop(state);
+                        self.spawn_idle_timer(&entry);
+                        Ok(response)
+                    }
+                    SessionState::Updating { .. } => {
+                        *state = SessionState::Terminating(Termination {
+                            explicit: false,
+                            owner: CleanupOwner::Update,
+                        });
+                        entry.completion.notify_all();
+                        drop(state);
+                        self.cleanup_entry(&entry, false);
+                        Err(SourceUpdateError {
+                            kind: UpdateErrorKind::Cancelled,
+                            message: "update exceeded session lifetime".to_string(),
+                            rollback_proven: true,
+                        })
+                    }
+                    SessionState::Terminating(termination)
+                        if termination.owner == CleanupOwner::Update =>
+                    {
+                        let explicit = termination.explicit;
+                        drop(state);
+                        self.cleanup_entry(&entry, explicit);
+                        Err(SourceUpdateError {
+                            kind: UpdateErrorKind::Cancelled,
+                            message: "update cancelled".to_string(),
+                            rollback_proven: true,
+                        })
+                    }
+                    _ => Err(SourceUpdateError {
+                        kind: UpdateErrorKind::Internal,
+                        message: "update lost session ownership".to_string(),
+                        rollback_proven: false,
+                    }),
+                }
+            }
+            Err(err) => {
+                self.finish_update_error(&entry, &reservation.update_id, &err);
+                Err(err)
+            }
+        }
+    }
+
+    fn finish_update_error(
+        &self,
+        entry: &Arc<SessionEntry>,
+        update_id: &str,
+        err: &SourceUpdateError,
+    ) {
+        let mut state = entry.state.lock().expect("session state lock");
+        let (cleanup, ready) = match &*state {
+            SessionState::Terminating(termination) if termination.owner == CleanupOwner::Update => {
+                (Some(termination.explicit), false)
+            }
+            SessionState::Updating {
+                update_id: active, ..
+            } if active == update_id && !err.rollback_proven => {
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Update,
+                });
+                entry.completion.notify_all();
+                (Some(false), false)
+            }
+            SessionState::Updating {
+                update_id: active, ..
+            } if active == update_id => {
+                *state = SessionState::Ready {
+                    last_activity: Instant::now(),
+                };
+                entry.completion.notify_all();
+                (None, true)
+            }
+            _ => (None, false),
+        };
+        drop(state);
+        if let Some(explicit) = cleanup {
+            self.cleanup_entry(entry, explicit);
+        } else if ready {
+            self.spawn_idle_timer(entry);
+        }
+    }
+
+    pub(crate) fn update_worker_panicked(&self, session_id: &str) {
+        let Some(entry) = self.lookup(session_id) else {
+            return;
+        };
+        let mut state = entry.state.lock().expect("session state lock");
+        let explicit = match &*state {
+            SessionState::Updating { cancellation, .. } => {
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Requester,
+                });
+                entry.completion.notify_all();
+                Some(false)
+            }
+            SessionState::Terminating(termination) if termination.owner == CleanupOwner::Update => {
+                Some(termination.explicit)
+            }
+            _ => None,
+        };
+        drop(state);
+        if let Some(explicit) = explicit {
+            self.cleanup_entry(&entry, explicit);
         }
     }
 
@@ -572,6 +961,14 @@ impl SessionManager {
         let mut state = entry.state.lock().expect("session state lock");
         match &*state {
             SessionState::Ready { .. } if Instant::now() < entry.deadline => {
+                let workspace_revision = format!(
+                    "rev_{}",
+                    entry
+                        .update_data
+                        .lock()
+                        .expect("session update data lock")
+                        .revision
+                );
                 *state = SessionState::Action {
                     action_id: action_id.clone(),
                     cancellation: cancellation.clone(),
@@ -584,15 +981,16 @@ impl SessionManager {
                     action_name: action_name.to_string(),
                     action,
                     mode,
+                    workspace_revision,
                     cancellation,
                 })
             }
             SessionState::Ready { .. }
             | SessionState::Terminating(_)
             | SessionState::Terminated(_) => Err(ActionError::NotFound),
-            SessionState::Initializing { .. } | SessionState::Action { .. } => {
-                Err(ActionError::Conflict)
-            }
+            SessionState::Initializing { .. }
+            | SessionState::Action { .. }
+            | SessionState::Updating { .. } => Err(ActionError::Conflict),
         }
     }
 
@@ -606,6 +1004,7 @@ impl SessionManager {
         let action_id = reservation.action_id;
         let action_name = reservation.action_name;
         let action = reservation.action;
+        let workspace_revision = reservation.workspace_revision;
         let cancellation = reservation.cancellation;
         let outcome = run_session_action(
             &entry.task_id,
@@ -616,6 +1015,7 @@ impl SessionManager {
             &entry.id,
             &action_id,
             &action_name,
+            &workspace_revision,
             &input,
             &sender,
             &cancellation,
@@ -630,6 +1030,7 @@ impl SessionManager {
                         session_id: entry.id.clone(),
                         action_id: action_id.clone(),
                         action: action_name.clone(),
+                        workspace_revision: workspace_revision.clone(),
                         code: outcome.code,
                         timed_out: true,
                         artifacts: None,
@@ -654,6 +1055,7 @@ impl SessionManager {
                             session_id: entry.id.clone(),
                             action_id: action_id.clone(),
                             action: action_name.clone(),
+                            workspace_revision: workspace_revision.clone(),
                             code: 1,
                             timed_out: false,
                             artifacts: None,
@@ -672,6 +1074,7 @@ impl SessionManager {
                 session_id: entry.id.clone(),
                 action_id: action_id.clone(),
                 action: action_name.clone(),
+                workspace_revision: workspace_revision.clone(),
                 status: SessionActionStatus::Snapshotting,
             },
             &cancellation,
@@ -716,6 +1119,7 @@ impl SessionManager {
                             session_id: entry.id.clone(),
                             action_id: action_id.clone(),
                             action: action_name.clone(),
+                            workspace_revision: workspace_revision.clone(),
                             code: if outcome.code == 0 { 1 } else { outcome.code },
                             timed_out: false,
                             artifacts: None,
@@ -738,6 +1142,7 @@ impl SessionManager {
             session_id: entry.id.clone(),
             action_id: action_id.clone(),
             action: action_name,
+            workspace_revision,
             code: outcome.code,
             timed_out: false,
             artifacts: collection.archive,
@@ -943,6 +1348,21 @@ impl SessionManager {
                     }
                 }
             }
+            SessionState::Updating { cancellation, .. } => {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: true,
+                    owner: CleanupOwner::Update,
+                });
+                entry.completion.notify_all();
+                loop {
+                    state = entry.completion.wait(state).expect("session state lock");
+                    if let SessionState::Terminated(response) = &*state {
+                        return Ok(response.clone());
+                    }
+                }
+            }
             SessionState::Initializing {
                 worker_started: false,
             }
@@ -982,7 +1402,8 @@ impl SessionManager {
                 }
                 SessionState::Terminating(_)
                 | SessionState::Ready { .. }
-                | SessionState::Action { .. } => return,
+                | SessionState::Action { .. }
+                | SessionState::Updating { .. } => return,
                 SessionState::Terminated(_) => return,
             }
         };
@@ -1132,6 +1553,15 @@ impl SessionManager {
                 *state = SessionState::Terminating(Termination {
                     explicit: false,
                     owner: CleanupOwner::Action,
+                });
+                entry.completion.notify_all();
+            }
+            SessionState::Updating { cancellation, .. } => {
+                let cancellation = cancellation.clone();
+                cancellation.cancel();
+                *state = SessionState::Terminating(Termination {
+                    explicit: false,
+                    owner: CleanupOwner::Update,
                 });
                 entry.completion.notify_all();
             }
@@ -1342,7 +1772,6 @@ impl SessionManager {
         self.inner.sessions.lock().unwrap().len()
     }
 
-    #[cfg(test)]
     pub(crate) fn metadata_root(&self) -> &Path {
         &self.inner.metadata_root
     }
@@ -1372,6 +1801,20 @@ impl SessionManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn install_update_apply_hook(
+        &self,
+        arrived: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.inner.hooks.lock().unwrap().update_apply = Some(BarrierHook { arrived, release });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_update_worker(&self) {
+        self.inner.hooks.lock().unwrap().panic_update_worker = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn force_lifetime_for_test(&self, session_id: &str) {
         self.expire_lifetime(session_id);
     }
@@ -1379,6 +1822,16 @@ impl SessionManager {
     #[cfg(test)]
     pub(crate) fn force_idle_for_test(&self, session_id: &str) {
         self.expire_idle(session_id, Duration::ZERO);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_revision_for_test(&self, session_id: &str) -> u64 {
+        self.lookup(session_id)
+            .expect("test session")
+            .update_data
+            .lock()
+            .unwrap()
+            .revision
     }
 
     #[cfg(test)]
@@ -1634,6 +2087,7 @@ mod tests {
                     },
                 )]),
                 action_dispatcher: None,
+                source_updates: None,
             }),
             cwd: ".".to_string(),
             timeout_sec: 1,
@@ -1689,6 +2143,7 @@ mod tests {
                     version: METADATA_VERSION,
                     session_id: id.to_string(),
                     task_id: task.to_string(),
+                    workspace_revision: 0,
                 })
                 .unwrap();
         }

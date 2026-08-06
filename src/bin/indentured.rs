@@ -3456,7 +3456,9 @@ async fn read_session_start_response(
                     eprintln!("{message}");
                     stream_errors.push(message);
                 }
-                SessionStartEvent::Ready { session_id, phases } => {
+                SessionStartEvent::Ready {
+                    session_id, phases, ..
+                } => {
                     if !valid_session_id(&session_id)
                         || started_id.as_deref() != Some(session_id.as_str())
                     {
@@ -3612,6 +3614,7 @@ async fn read_session_action_response(
                     action_id,
                     action,
                     status,
+                    ..
                 } => {
                     if session_id != expected_session
                         || action != expected_action
@@ -3660,6 +3663,7 @@ async fn read_session_action_response(
                     timed_out,
                     artifacts,
                     artifact_restrictions,
+                    ..
                 } => {
                     if session_id != expected_session
                         || action != expected_action

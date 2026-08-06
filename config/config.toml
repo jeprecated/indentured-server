@@ -1,4 +1,4 @@
-schema_version = "10"
+schema_version = "11"
 
 [service]
 # Immediate admission control; excess authenticated requests receive HTTP 503.
@@ -95,6 +95,16 @@ exclude = []
 [tasks.repo_session.session]
 idle_timeout_sec = 900
 max_lifetime_sec = 14400
+
+# Optional bounded authority to replace/delete only operator-allowed regular files.
+[tasks.repo_session.session.source_updates]
+timeout_sec = 120
+max_transfer_bytes = 67108864
+max_uncompressed_bytes = 268435456
+max_files = 10000
+max_depth = 64
+include = ["**"]
+exclude = [".indentured/**", ".indentured-output/**"]
 
 [tasks.repo_session.session.teardown]
 script = "exec devenv tasks run indentured:session:stop"

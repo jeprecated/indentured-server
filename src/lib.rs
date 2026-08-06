@@ -7,5 +7,6 @@ pub mod http;
 pub mod logging;
 pub mod protocol;
 mod sessions;
+mod source_updates;
 pub mod user;
 pub mod validation;

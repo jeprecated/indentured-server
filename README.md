@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `10`; request protocol versions are separate. Schema 9 configurations migrate by changing only their schema version; dispatchers default to their compatible open-name policy. Older and future schemas fail closed.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `11`; request protocol versions are separate. Schema 10 configurations migrate by changing only their schema version; source updates remain disabled unless their table is added. Older and future schemas fail closed.
 
 ```toml
-schema_version = "10"
+schema_version = "11"
 
 [service]
 max_concurrent_builds = 1
@@ -141,6 +141,16 @@ exclude = ["out/**/*.tmp"]
 idle_timeout_sec = 900
 max_lifetime_sec = 14400
 
+# Optional bounded source-update authority; omitted means updates return 404.
+[tasks.build.session.source_updates]
+timeout_sec = 120
+max_transfer_bytes = 67108864
+max_uncompressed_bytes = 268435456
+max_files = 10000
+max_depth = 64
+include = ["src/**", "Cargo.*"]
+exclude = ["src/private/**"]
+
 # Must be safe to call repeatedly after partial failures.
 [tasks.build.session.teardown]
 script = "./scripts/session-teardown"
@@ -187,6 +197,7 @@ Task validation occurs at daemon startup:
 - each task defines exactly one server-owned run `script` or absolute run `executable`; executable mode retains optional fixed `args` compatibility;
 - a task may also define one optional server-owned `setup` command using the same script/executable shape;
 - an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and exactly one action mode: a nonempty named `actions` map or one fixed `action_dispatcher`;
+- optional `session.source_updates` requires positive timeout, transfer, uncompressed-size, file-count, and depth limits no greater than the global source/build limits, plus a nonempty operator-owned relative-glob `include`; `exclude` is optional, and `.indentured/**` and protected session metadata are always reserved;
 - session action names, including dispatcher policy keys, use the task-name rules; action, teardown, and optional dispatcher override timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
 - actions and teardown inherit the task's fixed `cwd`, environment, and identity; named actions may each define an artifact allowlist, while dispatcher policy entries may override only its timeout and artifacts; the top-level task artifact policy controls the final explicit-stop snapshot;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
@@ -222,7 +233,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "10"
+schema_version = "11"
 
 [tasks.ci]
 script = '''
@@ -300,7 +311,7 @@ indentured session action "$session_id" observe --input ./observe.json
 indentured session stop "$session_id"
 ```
 
-Only `session start` packages and uploads source; stdout contains exactly the opaque session ID line. That pinned source remains in use for the session lifetime, so stop and start a new session to pick up repository changes. Initialization output and human diagnostics go to stderr while stdout/stderr evidence logs retain their original streams. `session action` accepts one JSON object from a file or `-` (stdin), wraps it in the fixed HTTP request, streams configured action output, and extracts advertised evidence into that invocation's result directory. `session stop` waits for teardown and downloads any configured final archive. Session/action identifiers are explicit; the client stores no hidden current-session state. There are no list, reset, arbitrary-command, workspace, or filesystem subcommands, and no remote cwd/environment/timeout/artifact flags. Artifact selection remains server-owned.
+Only `session start` in the current CLI packages and uploads source; stdout contains exactly the opaque session ID line. The initial source is pinned unless the selected task configures `session.source_updates`. The server-only `POST /v1/sessions/:session_id/updates` protocol can then replace or delete only declared, hashed, regular non-executable files matched by the operator allowlist. It serializes with actions, uses workspace revisions beginning at `rev_0`, rolls failures back or destroys the session, and grants no generic filesystem authority. No CLI update command is included in this phase; without the policy table the endpoint returns 404. Initialization output and human diagnostics go to stderr while stdout/stderr evidence logs retain their original streams. `session action` accepts one JSON object from a file or `-` (stdin), wraps it in the fixed HTTP request, streams configured action output, and extracts advertised evidence into that invocation's result directory. `session stop` waits for teardown and downloads any configured final archive. Session/action identifiers are explicit; the client stores no hidden current-session state. There are no list, reset, arbitrary-command, workspace, or filesystem subcommands, and no remote cwd/environment/timeout/artifact flags. Artifact selection remains server-owned.
 
 Reusable deployments may expose `repo_check` and `repo_session` host profiles. Repositories then own conventional Devenv tasks named `indentured:check`, `indentured:session:setup`, `indentured:session:start`, `indentured:session:action`, and `indentured:session:stop`; see the [macOS deployment guide](docs/macos-launchd-tailscale-deployment.md#reusable-repository-capability-profiles). These hooks are arbitrary uploaded code under the configured task identity, not a security boundary created by the profile name. Separate profiles are warranted only for different identity, permissions, limits, lifecycle, artifact policy, or operator-owned capability. This repository's `indentured:check` intentionally runs the Apple-silicon-Darwin-only `scripts/check-darwin.sh` because its target profile is Quartz, not every development host.
 
@@ -368,7 +379,7 @@ Unknown metadata fields and invalid task/request identifiers fail closed. Initia
 {"type":"session","id":"ses_123","status":"phase_started","phase":"setup"}
 {"type":"stdout","data":"initializing...\n"}
 {"type":"session","id":"ses_123","status":"phase_finished","phase":"setup","duration_ms":25,"exit_code":0,"timed_out":false}
-{"type":"ready","session_id":"ses_123","phases":[{"phase":"setup","duration_ms":25,"exit_code":0,"timed_out":false},{"phase":"run","duration_ms":50,"exit_code":0,"timed_out":false}]}
+{"type":"ready","session_id":"ses_123","workspace_revision":"rev_0","phases":[{"phase":"setup","duration_ms":25,"exit_code":0,"timed_out":false},{"phase":"run","duration_ms":50,"exit_code":0,"timed_out":false}]}
 ```
 
 The Ready commit point is the durable write of protected, daemon-owned mode-`0700`/`0600` session metadata under the protected workspace root followed by the serialized `Initializing` → `Ready` election, before the `ready` event is sent. Commit, disconnect, explicit stop, and lifetime expiry contend on the same state lock, so only one can win while the session is Initializing. The metadata authority is separate from the task-owned session workspace. Disconnect before that commit cancels initialization—including bounded archive preflight, extraction, and recursive ownership preparation—and performs best-effort teardown and cleanup. Disconnect after commit does not undo the session; idle expiry handles a committed session whose caller did not receive its ID.
@@ -376,6 +387,8 @@ The Ready commit point is the durable write of protected, daemon-owned mode-`070
 After authentication and metadata/task validation, a session acquires the same global admission permit as a one-shot build and immediately records its `Initializing` reservation before reading the source field. Its absolute maximum-lifetime deadline therefore includes a slow or blocked upload as well as filesystem preparation and configured initialization. `max_lifetime_sec` is capped at 4,294,967,295 seconds so every accepted deadline is representable by the supported monotonic clocks. With the default `service.max_concurrent_builds = 1`, one reserved or Ready session makes new builds/session starts return immediate `503 busy` until it stops or expires. The started event exposes the already-registered ID, so `DELETE` during configured initialization cancels its process group, joins the single cleanup path, and waits for teardown instead of returning a transient `404`. Idle time begins at Ready and is suspended during lifecycle work. Explicit stop, idle expiry, maximum lifetime, initialization failure, and competing cleanup triggers elect one terminating owner under the lifecycle state lock, so the configured idempotent teardown runs at most once and the workspace and permit are released once. If explicit stop wins that lock it returns `200` with explicit final-artifact semantics; if automatic cleanup already won, stop returns `409 session_conflict` and never returns an automatic result as an explicit success. A missing or already removed ID receives `404`.
 
 Automatic cleanup runs teardown without publishing an unreachable final archive. Explicit `DELETE` alone collects the task's top-level final artifact snapshot. On daemon startup, durable Ready sessions are destroyed rather than resumed: current task configuration is used for best-effort teardown when available, while removed/renamed task configuration, invalid metadata, and pre-commit orphan workspaces receive logged root cleanup. Operators must keep teardown idempotent and preserve sufficient external-state identifiers in the workspace; configuration drift can prevent the operator teardown command from being recovered.
+
+When configured, `POST /v1/sessions/{session_id}/updates` accepts ordered multipart `metadata` then `source` fields using the task-specific timeout and bounds. Metadata schema v1 contains a required request ID, the current opaque `rev_<decimal>` base, ZIP format, and exact file/delete declarations; file declarations carry lowercase SHA-256 and no mode authority. The ZIP must contain exactly the declared regular non-executable file entries. Paths are ASCII relative paths, case-unique, allowlisted, and may not target `.indentured/**` or protected metadata. Verification and protected same-filesystem staging complete before operation reservation; actions and updates then serialize. A stale revision, concurrent operation, or reused request ID with different bytes returns `409`; the session caches only its most recent successful update, and an exact retry means byte-identical metadata and archive bytes for that cached request ID. That one exact retry returns its original response without reapplying. Success durably advances the revision and returns only IDs, revisions, paths, and hashes. Mutation validates no-follow ancestors, backs up existing regular files, uses same-directory atomic replacement, and rolls the full update back on any observed error or cancellation; an unprovable rollback destroys the session. Idle expiry is suspended while Updating, while stop and hard lifetime cancel it and join normal cleanup.
 
 `POST /v1/sessions/{session_id}/actions/{action}` accepts an `application/json` body of at most 65,536 bytes with exactly this authority envelope:
 
@@ -392,10 +405,10 @@ The `input` value must be an object. Names such as `argv` nested inside it are d
 The external encoded request remains bounded to 65,536 bytes. Dispatcher stdin is bounded by that request plus the fixed envelope and an action name of at most 64 bytes. The dispatcher must treat the name and input as data, reject unsupported names promptly with a nonzero exit, and avoid task dependencies that compete to read the inherited stdin. Each accepted name uses the dispatcher timeout and artifact allowlist unless its policy-only entry overrides either value; an explicitly empty artifacts table selects no artifacts. Action streams carry stable session, action-execution, and action-name identity:
 
 ```json
-{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"started"}
+{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","workspace_revision":"rev_1","status":"started"}
 {"type":"stdout","data":"observed\n"}
-{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"snapshotting"}
-{"type":"exit","session_id":"ses_123","action_id":"act_456","action":"observe","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_789/artifacts.zip","size":1234}}
+{"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","workspace_revision":"rev_1","status":"snapshotting"}
+{"type":"exit","session_id":"ses_123","action_id":"act_456","action":"observe","workspace_revision":"rev_1","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_789/artifacts.zip","size":1234}}
 ```
 
 Each child receives only its mode's serialized JSON on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each named or resolved dispatcher action and teardown has its configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.

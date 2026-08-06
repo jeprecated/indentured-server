@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUEST_SCHEMA_VERSION: &str = "1";
 pub const SESSION_REQUEST_SCHEMA_VERSION: &str = "1";
+pub const SESSION_UPDATE_SCHEMA_VERSION: &str = "1";
 pub(crate) const SESSION_ACTION_DISPATCH_SCHEMA_VERSION: &str = "1";
 pub const MAX_REQUEST_ID_LEN: usize = 128;
 pub const MAX_TASK_ID_LEN: usize = 64;
@@ -40,6 +41,48 @@ pub struct SessionStartRequest {
 pub struct SessionActionRequest {
     pub schema_version: String,
     pub input: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionUpdateRequest {
+    pub schema_version: String,
+    pub request_id: String,
+    pub base_revision: String,
+    pub source: SourceMetadata,
+    pub changes: Vec<SessionUpdateChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum SessionUpdateChange {
+    File { path: String, sha256: String },
+    Delete { path: String },
+}
+
+impl SessionUpdateChange {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Delete { path } => path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdateEvidence {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdateResponse {
+    pub session_id: String,
+    pub update_id: String,
+    pub request_id: String,
+    pub base_revision: String,
+    pub workspace_revision: String,
+    pub changed: Vec<SessionUpdateEvidence>,
+    pub deleted: Vec<SessionUpdateEvidence>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +138,101 @@ pub fn parse_request_metadata(data: &[u8]) -> Result<Request, RequestError> {
             .map_err(|_| RequestError::InvalidRequestId)?;
     }
     Ok(request)
+}
+
+pub fn parse_session_update_metadata(
+    data: &[u8],
+    max_files: usize,
+    max_depth: usize,
+) -> Result<SessionUpdateRequest, RequestError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(data).map_err(|err| RequestError::InvalidJson(err.to_string()))?;
+    let object = value.as_object().ok_or(RequestError::NotObject)?;
+    let version = object
+        .get("schema_version")
+        .ok_or(RequestError::MissingSchemaVersion)?
+        .as_str()
+        .ok_or(RequestError::InvalidSchemaVersionType)?;
+    if version != SESSION_UPDATE_SCHEMA_VERSION {
+        return Err(RequestError::UnsupportedSchemaVersion(version.to_string()));
+    }
+    let request: SessionUpdateRequest =
+        serde_json::from_value(value).map_err(|err| RequestError::InvalidJson(err.to_string()))?;
+    validate_identifier(&request.request_id, MAX_REQUEST_ID_LEN, true)
+        .map_err(|_| RequestError::InvalidRequestId)?;
+    parse_revision(&request.base_revision)
+        .ok_or_else(|| RequestError::InvalidJson("base_revision must be rev_<decimal>".into()))?;
+    if request.changes.is_empty() {
+        return Err(RequestError::InvalidJson(
+            "changes must not be empty".to_string(),
+        ));
+    }
+    if request.changes.len() > max_files {
+        return Err(RequestError::InvalidJson(format!(
+            "changes exceeds configured max_files ({max_files})"
+        )));
+    }
+    let mut exact = std::collections::HashSet::new();
+    let mut folded = std::collections::HashSet::new();
+    for change in &request.changes {
+        let path = change.path();
+        validate_update_path(path, max_depth)?;
+        if !exact.insert(path) || !folded.insert(path.to_ascii_lowercase()) {
+            return Err(RequestError::InvalidJson(
+                "changes contains duplicate or case-colliding paths".into(),
+            ));
+        }
+        if let SessionUpdateChange::File { sha256, .. } = change {
+            if sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(RequestError::InvalidJson(
+                    "sha256 must be 64 lowercase hexadecimal characters".into(),
+                ));
+            }
+        }
+    }
+    Ok(request)
+}
+
+pub fn parse_revision(value: &str) -> Option<u64> {
+    let decimal = value.strip_prefix("rev_")?;
+    if decimal.is_empty()
+        || (decimal.len() > 1 && decimal.starts_with('0'))
+        || !decimal.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let revision = decimal.parse::<u64>().ok()?;
+    (format!("rev_{revision}") == value).then_some(revision)
+}
+
+fn validate_update_path(path: &str, max_depth: usize) -> Result<(), RequestError> {
+    if path.is_empty()
+        || !path.is_ascii()
+        || path.contains(['\\', '\0'])
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(RequestError::InvalidJson("change path is invalid".into()));
+    }
+    if path.split('/').count() > max_depth {
+        return Err(RequestError::InvalidJson(format!(
+            "change path exceeds configured max_depth ({max_depth})"
+        )));
+    }
+    let first = path.split('/').next().expect("nonempty path");
+    if first.eq_ignore_ascii_case(".indentured") || first.eq_ignore_ascii_case(".sessions") {
+        return Err(RequestError::InvalidJson(
+            "change path targets reserved session storage".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_session_start_metadata(data: &[u8]) -> Result<SessionStartRequest, RequestError> {
@@ -271,6 +409,8 @@ pub enum SessionStartEvent {
     },
     Ready {
         session_id: String,
+        #[serde(default)]
+        workspace_revision: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         phases: Vec<PhaseResult>,
     },
@@ -298,6 +438,8 @@ pub enum SessionActionEvent {
         session_id: String,
         action_id: String,
         action: String,
+        #[serde(default)]
+        workspace_revision: String,
         status: SessionActionStatus,
     },
     Stdout {
@@ -315,6 +457,8 @@ pub enum SessionActionEvent {
         session_id: String,
         action_id: String,
         action: String,
+        #[serde(default)]
+        workspace_revision: String,
         code: i32,
         timed_out: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -644,6 +788,83 @@ mod tests {
     }
 
     #[test]
+    fn strict_session_update_metadata_enforces_revision_paths_hashes_and_declarations() {
+        let valid = serde_json::json!({
+            "schema_version": "1",
+            "request_id": "update.1",
+            "base_revision": "rev_0",
+            "source": {"format": "zip"},
+            "changes": [
+                {"path": "src/file.rs", "kind": "file", "sha256": "a".repeat(64)},
+                {"path": "old.txt", "kind": "delete"}
+            ]
+        });
+        assert_eq!(
+            parse_session_update_metadata(&serde_json::to_vec(&valid).unwrap(), 2, 3)
+                .unwrap()
+                .changes
+                .len(),
+            2
+        );
+        for revision in ["0", "rev_", "rev_00", "rev_-1", "rev_18446744073709551616"] {
+            let mut value = valid.clone();
+            value["base_revision"] = serde_json::json!(revision);
+            assert!(
+                parse_session_update_metadata(&serde_json::to_vec(&value).unwrap(), 2, 3).is_err()
+            );
+        }
+        for path in [
+            "../file",
+            "/file",
+            "./file",
+            "a//file",
+            "non-ascii-é",
+            ".indentured/state",
+            ".SESSIONS/state",
+        ] {
+            let mut value = valid.clone();
+            value["changes"] = serde_json::json!([
+                {"path": path, "kind": "delete"}
+            ]);
+            assert!(
+                parse_session_update_metadata(&serde_json::to_vec(&value).unwrap(), 2, 3).is_err(),
+                "{path}"
+            );
+        }
+        for changes in [
+            serde_json::json!([
+                {"path": "same", "kind": "delete"},
+                {"path": "same", "kind": "delete"}
+            ]),
+            serde_json::json!([
+                {"path": "Same", "kind": "delete"},
+                {"path": "same", "kind": "delete"}
+            ]),
+        ] {
+            let mut value = valid.clone();
+            value["changes"] = changes;
+            assert!(
+                parse_session_update_metadata(&serde_json::to_vec(&value).unwrap(), 2, 3).is_err()
+            );
+        }
+        let mut unknown = valid.clone();
+        unknown["changes"][0]["mode"] = serde_json::json!(0o644);
+        assert!(
+            parse_session_update_metadata(&serde_json::to_vec(&unknown).unwrap(), 2, 3).is_err()
+        );
+        let mut too_many = valid;
+        assert!(
+            parse_session_update_metadata(&serde_json::to_vec(&too_many).unwrap(), 1, 3).is_err()
+        );
+        too_many["changes"] = serde_json::json!([
+            {"path": "a/b/c/d", "kind": "delete"}
+        ]);
+        assert!(
+            parse_session_update_metadata(&serde_json::to_vec(&too_many).unwrap(), 2, 3).is_err()
+        );
+    }
+
+    #[test]
     fn opaque_session_and_action_identifiers_are_bounded() {
         assert!(valid_session_id("ses_123"));
         assert!(valid_action_id("act-123"));
@@ -663,11 +884,12 @@ mod tests {
             session_id: "ses_1".to_string(),
             action_id: "act_1".to_string(),
             action: "observe".to_string(),
+            workspace_revision: "rev_0".to_string(),
             status: SessionActionStatus::Started,
         };
         assert_eq!(
             serde_json::to_string(&action).unwrap(),
-            r#"{"type":"action","session_id":"ses_1","action_id":"act_1","action":"observe","status":"started"}"#
+            r#"{"type":"action","session_id":"ses_1","action_id":"act_1","action":"observe","workspace_revision":"rev_0","status":"started"}"#
         );
 
         let stop = SessionStopResponse {

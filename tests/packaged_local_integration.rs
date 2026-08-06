@@ -294,7 +294,7 @@ timeout_sec = 3
     fs::write(
         &config,
         format!(
-            r#"schema_version = "10"
+            r#"schema_version = "11"
 [service]
 max_concurrent_builds = 1
 [service.socket]

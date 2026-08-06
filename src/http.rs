@@ -34,10 +34,14 @@ use crate::bearer_token::{BearerToken, MAX_BEARER_TOKEN_FILE_BYTES};
 use crate::build::{execute_build, validate_request, CancellationFlag};
 use crate::config::{Config, SocketModeError};
 use crate::protocol::{
-    parse_request_metadata, parse_session_action_request, parse_session_start_metadata,
-    valid_session_id, valid_task_id, MAX_SESSION_ACTION_BODY_BYTES,
+    parse_request_metadata, parse_revision, parse_session_action_request,
+    parse_session_start_metadata, parse_session_update_metadata, valid_session_id, valid_task_id,
+    MAX_SESSION_ACTION_BODY_BYTES,
 };
-use crate::sessions::{ActionError, SessionManager, StopError};
+use crate::sessions::{
+    ActionError, SessionManager, SessionUpdateAdmission, StopError, UpdateAdmissionError,
+};
+use crate::source_updates::{prepare_update, UpdateErrorKind};
 use crate::user::UserError;
 
 #[derive(Debug, thiserror::Error)]
@@ -521,6 +525,10 @@ fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
         .route("/v1/sessions", post(start_session))
         .route("/v1/sessions/:session_id", delete(stop_session))
         .route(
+            "/v1/sessions/:session_id/updates",
+            post(update_session_source),
+        )
+        .route(
             "/v1/sessions/:session_id/actions/:action",
             post(run_session_action),
         )
@@ -718,6 +726,174 @@ async fn start_session(
     response
 }
 
+async fn update_session_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+    mut multipart: Multipart,
+) -> Response {
+    if let Some(response) = authorize(&headers, &state.auth, state.auth_required) {
+        return response;
+    }
+    if !state.managed_sessions_enabled || !valid_session_id(&session_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let context = match state.sessions.update_upload_context(&session_id) {
+        Ok(context) => context,
+        Err(UpdateAdmissionError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => unreachable!("upload context only reports unsupported sessions"),
+    };
+
+    let mut metadata_field = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("metadata") => field,
+        Ok(Some(_)) => return bad_request("metadata must be the first multipart field"),
+        Ok(None) => return bad_request("missing metadata field"),
+        Err(err) => return bad_request(&format!("invalid multipart metadata field: {err}")),
+    };
+    let mut metadata_bytes = Vec::new();
+    loop {
+        match metadata_field.chunk().await {
+            Ok(Some(chunk)) => {
+                if metadata_bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return payload_too_large("metadata exceeds 65536 bytes");
+                }
+                metadata_bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => return bad_request(&format!("failed to read metadata: {err}")),
+        }
+    }
+    drop(metadata_field);
+    let request = match parse_session_update_metadata(
+        &metadata_bytes,
+        context.policy.max_files,
+        context.policy.max_depth,
+    ) {
+        Ok(request) => request,
+        Err(err) if err.to_string().contains("exceeds configured") => {
+            return payload_too_large(&err.to_string())
+        }
+        Err(err) => return bad_request(&err.to_string()),
+    };
+
+    let upload_deadline = Duration::from_secs(context.policy.timeout_sec);
+    let lifetime_limits_upload = context.remaining_lifetime <= upload_deadline;
+    let upload = tokio::time::timeout(
+        upload_deadline.min(context.remaining_lifetime),
+        receive_update_upload(&state, multipart, context.policy.max_transfer_bytes),
+    )
+    .await;
+    let (archive, archive_digest) = match upload {
+        Ok(Ok(upload)) => upload,
+        Ok(Err(response)) => return response,
+        Err(_) if lifetime_limits_upload => return session_lifetime_timeout(),
+        Err(_) => return source_upload_timeout(),
+    };
+    let mut digest = Sha256::new();
+    digest.update(Sha256::digest(&metadata_bytes));
+    digest.update(archive_digest);
+    let request_digest: [u8; 32] = digest.finalize().into();
+
+    let archive_path = archive.to_path_buf();
+    let metadata_root = state.sessions.metadata_root().to_path_buf();
+    let prepare_session_id = session_id.clone();
+    let prepare_request = request.clone();
+    let prepare_policy = context.policy.clone();
+    let prepared = match tokio::task::spawn_blocking(move || {
+        prepare_update(
+            &archive_path,
+            &metadata_root,
+            &prepare_session_id,
+            &prepare_request,
+            &prepare_policy,
+        )
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(err)) if err.kind == UpdateErrorKind::Limit => {
+            return payload_too_large(&err.message)
+        }
+        Ok(Err(err)) if err.kind == UpdateErrorKind::BadRequest => {
+            return bad_request(&err.message)
+        }
+        Ok(Err(err)) => return server_error(&err.message),
+        Err(err) => return server_error(&format!("update verification task failed: {err}")),
+    };
+
+    let base_revision =
+        parse_revision(&request.base_revision).expect("validated update metadata revision");
+    let admission = match state.sessions.start_update(
+        &session_id,
+        request.request_id,
+        request_digest,
+        base_revision,
+    ) {
+        Ok(admission) => admission,
+        Err(UpdateAdmissionError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(UpdateAdmissionError::OperationConflict) => {
+            return conflict_response("session_conflict", None)
+        }
+        Err(UpdateAdmissionError::RequestConflict) => {
+            return conflict_response("request_conflict", None)
+        }
+        Err(UpdateAdmissionError::RevisionConflict { current_revision }) => {
+            return conflict_response("revision_conflict", Some(current_revision))
+        }
+    };
+    match admission {
+        SessionUpdateAdmission::Retry(response) => Json(response).into_response(),
+        SessionUpdateAdmission::Start(reservation) => {
+            let sessions = state.sessions.clone();
+            let panic_session_id = session_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sessions.execute_update(reservation, prepared)
+                })) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        sessions.update_worker_panicked(&panic_session_id);
+                        Err(crate::source_updates::UpdateError::worker_panicked())
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Ok(response)) => Json(response).into_response(),
+                Ok(Err(err)) if err.kind == UpdateErrorKind::BadRequest => {
+                    bad_request(&err.message)
+                }
+                Ok(Err(err)) if err.kind == UpdateErrorKind::Limit => {
+                    payload_too_large(&err.message)
+                }
+                Ok(Err(err)) if err.kind == UpdateErrorKind::Cancelled => {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+                Ok(Err(err)) => server_error(&err.message),
+                Err(err) => server_error(&format!("source update task failed: {err}")),
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ConflictResponse {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_revision: Option<String>,
+}
+
+fn conflict_response(error: &str, current_revision: Option<String>) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ConflictResponse {
+            error: error.to_string(),
+            current_revision,
+        }),
+    )
+        .into_response()
+}
+
 async fn run_session_action(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -893,6 +1069,64 @@ async fn receive_source_upload(
     }
 
     Ok(source_temp.into_temp_path())
+}
+
+async fn receive_update_upload(
+    state: &AppState,
+    mut multipart: Multipart,
+    max_transfer_bytes: u64,
+) -> Result<(tempfile::TempPath, [u8; 32]), Response> {
+    let mut source_field = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("source") => field,
+        Ok(Some(_)) => return Err(bad_request("source must follow metadata")),
+        Ok(None) => return Err(bad_request("missing source field")),
+        Err(err) => {
+            return Err(bad_request(&format!(
+                "invalid multipart source field: {err}"
+            )))
+        }
+    };
+    if let Err(err) = std::fs::create_dir_all(&state.config.build.workspace_root) {
+        return Err(server_error(&format!(
+            "failed to create workspace root: {err}"
+        )));
+    }
+    let mut temp = tempfile::Builder::new()
+        .prefix("indentured-server-update-")
+        .suffix(".zip")
+        .tempfile_in(&state.config.build.workspace_root)
+        .map_err(|err| server_error(&format!("failed to create update temp file: {err}")))?;
+    let mut bytes = 0u64;
+    let mut digest = Sha256::new();
+    loop {
+        match source_field.chunk().await {
+            Ok(Some(chunk)) => {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+                if bytes > max_transfer_bytes {
+                    return Err(payload_too_large(
+                        "update archive exceeds configured max_transfer_bytes",
+                    ));
+                }
+                digest.update(&chunk);
+                temp.write_all(&chunk)
+                    .map_err(|err| server_error(&format!("failed to write update: {err}")))?;
+            }
+            Ok(None) => break,
+            Err(err) => return Err(bad_request(&format!("failed to read update: {err}"))),
+        }
+    }
+    drop(source_field);
+    match multipart.next_field().await {
+        Ok(None) => {}
+        Ok(Some(field)) => {
+            return Err(bad_request(&format!(
+                "unexpected or duplicate multipart field {}",
+                field.name().unwrap_or("unnamed")
+            )))
+        }
+        Err(err) => return Err(bad_request(&format!("invalid multipart trailer: {err}"))),
+    }
+    Ok((temp.into_temp_path(), digest.finalize().into()))
 }
 
 async fn get_artifact(
@@ -1118,8 +1352,8 @@ mod tests {
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, Config, LoggingConfig, ScriptText,
         ServiceConfig, SessionActionConfig, SessionActionDispatcherConfig, SessionTeardownConfig,
-        SourcesConfig, TaskConfig, TaskSessionConfig, TaskSetupConfig, WorkspacePolicy,
-        CONFIG_SCHEMA_VERSION,
+        SourceUpdatesConfig, SourcesConfig, TaskConfig, TaskSessionConfig, TaskSetupConfig,
+        WorkspacePolicy, CONFIG_SCHEMA_VERSION,
     };
     use crate::protocol::{
         BuildPhase, Request, ResponseEvent, SessionActionEvent, SessionStartEvent,
@@ -1128,6 +1362,7 @@ mod tests {
     use reqwest::blocking::multipart::{Form, Part};
     use reqwest::blocking::Client;
     use std::collections::HashMap;
+    use std::fs;
     use std::io::{BufRead, BufReader, Cursor, Read, Write};
     use std::net::SocketAddr;
     use std::os::unix::fs::PermissionsExt;
@@ -2550,6 +2785,7 @@ mod tests {
                     timed_out: false,
                     artifacts: Some(archive),
                     artifact_restrictions: Some(restrictions),
+                    ..
                 } => {
                     assert_eq!(id, &session_id);
                     assert!(action_id.starts_with("act_"));
@@ -3175,6 +3411,426 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn source_update_http_success_revisions_idempotency_and_conflicts() {
+        let env = setup_env_with_session_lifetime(60);
+        let (addr, server) = start_http_server(env.app.clone()).await;
+        let base = format!("http://{addr}");
+        tokio::task::spawn_blocking(move || {
+            let client = bounded_lifecycle_client();
+
+            let unsupported = start_managed_session(&client, &base, "managed-no-updates");
+            assert_eq!(
+                client
+                    .post(format!("{base}/v1/sessions/{unsupported}/updates"))
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=unsupported",
+                    )
+                    .body("--unsupported--\r\n")
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                client
+                    .delete(format!("{base}/v1/sessions/{unsupported}"))
+                    .send()
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+
+            let session_id = start_managed_session(&client, &base, "managed");
+            let archive = update_zip(&[("work/input.txt", b"updated", 0o644)]);
+            let metadata = update_metadata("update-1", "rev_0", "work/input.txt", b"updated");
+            let response = post_update(&client, &base, &session_id, &metadata, archive.path());
+            assert_eq!(response.status(), StatusCode::OK);
+            let first: crate::protocol::SessionUpdateResponse = response.json().unwrap();
+            assert_eq!(first.base_revision, "rev_0");
+            assert_eq!(first.workspace_revision, "rev_1");
+            assert_eq!(first.changed[0].path, "work/input.txt");
+
+            let retry = post_update(&client, &base, &session_id, &metadata, archive.path());
+            assert_eq!(retry.status(), StatusCode::OK);
+            assert_eq!(
+                retry
+                    .json::<crate::protocol::SessionUpdateResponse>()
+                    .unwrap(),
+                first
+            );
+
+            let stale_archive = update_zip(&[("work/input.txt", b"stale", 0o644)]);
+            let stale = update_metadata("update-2", "rev_0", "work/input.txt", b"stale");
+            let response = post_update(&client, &base, &session_id, &stale, stale_archive.path());
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.json::<serde_json::Value>().unwrap()["current_revision"],
+                "rev_1"
+            );
+
+            let conflict_archive = update_zip(&[("work/input.txt", b"different", 0o644)]);
+            let conflict = update_metadata("update-1", "rev_1", "work/input.txt", b"different");
+            assert_eq!(
+                post_update(
+                    &client,
+                    &base,
+                    &session_id,
+                    &conflict,
+                    conflict_archive.path(),
+                )
+                .status(),
+                StatusCode::CONFLICT
+            );
+
+            let action_events = run_action_events(
+                &client,
+                &base,
+                &session_id,
+                "observe",
+                serde_json::json!({}),
+            );
+            assert!(action_events.iter().all(|event| match event {
+                SessionActionEvent::Action {
+                    workspace_revision, ..
+                }
+                | SessionActionEvent::Exit {
+                    workspace_revision, ..
+                } => workspace_revision == "rev_1",
+                _ => true,
+            }));
+
+            let blocking = post_action(
+                &client,
+                &base,
+                &session_id,
+                "block",
+                serde_json::json!({"schema_version": "1", "input": {}}),
+            );
+            assert_eq!(blocking.status(), StatusCode::OK);
+            let busy_archive = update_zip(&[("work/input.txt", b"busy", 0o644)]);
+            let busy = update_metadata("update-3", "rev_1", "work/input.txt", b"busy");
+            assert_eq!(
+                post_update(&client, &base, &session_id, &busy, busy_archive.path()).status(),
+                StatusCode::CONFLICT
+            );
+            drop(blocking);
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn updating_suspends_idle_expiry_until_revision_commit() {
+        let env = setup_env_with_session_lifetime(60);
+        let (session_id, mut events, initializer) = spawn_direct_session(&env, "managed", 128);
+        while let Some(event) = events.recv().await {
+            if matches!(event, SessionStartEvent::Ready { .. }) {
+                break;
+            }
+        }
+        initializer.await.unwrap();
+        let archive = update_zip(&[("work/input.txt", b"updated", 0o644)]);
+        let request = crate::protocol::SessionUpdateRequest {
+            schema_version: "1".to_string(),
+            request_id: "idle-race".to_string(),
+            base_revision: "rev_0".to_string(),
+            source: SourceMetadata {
+                format: SourceFormat::Zip,
+            },
+            changes: vec![crate::protocol::SessionUpdateChange::File {
+                path: "work/input.txt".to_string(),
+                sha256: format!("{:x}", Sha256::digest(b"updated")),
+            }],
+        };
+        let prepared = prepare_update(
+            archive.path(),
+            env.sessions.metadata_root(),
+            &session_id,
+            &request,
+            env.config.tasks["managed"]
+                .session
+                .as_ref()
+                .unwrap()
+                .source_updates
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let reservation = match env
+            .sessions
+            .start_update(&session_id, request.request_id, [2; 32], 0)
+            .unwrap()
+        {
+            SessionUpdateAdmission::Start(reservation) => reservation,
+            SessionUpdateAdmission::Retry(_) => panic!("unexpected retry"),
+        };
+        env.sessions.force_idle_for_test(&session_id);
+        assert_eq!(env.sessions.active_count(), 1);
+        let response = env.sessions.execute_update(reservation, prepared).unwrap();
+        assert_eq!(response.workspace_revision, "rev_1");
+        assert_eq!(env.sessions.workspace_revision_for_test(&session_id), 1);
+        assert!(env.sessions.stop(&session_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_workspace_type_does_not_increment_revision() {
+        let env = setup_env_with_session_lifetime(60);
+        let (session_id, mut events, initializer) = spawn_direct_session(&env, "managed", 128);
+        while let Some(event) = events.recv().await {
+            if matches!(event, SessionStartEvent::Ready { .. }) {
+                break;
+            }
+        }
+        initializer.await.unwrap();
+        let archive = update_zip(&[("work/input.txt", b"updated", 0o644)]);
+        let request = crate::protocol::SessionUpdateRequest {
+            schema_version: "1".to_string(),
+            request_id: "reject-symlink".to_string(),
+            base_revision: "rev_0".to_string(),
+            source: SourceMetadata {
+                format: SourceFormat::Zip,
+            },
+            changes: vec![crate::protocol::SessionUpdateChange::File {
+                path: "work/input.txt".to_string(),
+                sha256: format!("{:x}", Sha256::digest(b"updated")),
+            }],
+        };
+        let prepared = prepare_update(
+            archive.path(),
+            env.sessions.metadata_root(),
+            &session_id,
+            &request,
+            env.config.tasks["managed"]
+                .session
+                .as_ref()
+                .unwrap()
+                .source_updates
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let reservation = match env
+            .sessions
+            .start_update(&session_id, request.request_id, [3; 32], 0)
+            .unwrap()
+        {
+            SessionUpdateAdmission::Start(reservation) => reservation,
+            SessionUpdateAdmission::Retry(_) => panic!("unexpected retry"),
+        };
+        let target = env
+            .workspace_root
+            .join(format!("session-{session_id}/work/input.txt"));
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(env.temp.path(), &target).unwrap();
+        assert_eq!(
+            env.sessions
+                .execute_update(reservation, prepared)
+                .unwrap_err()
+                .kind,
+            UpdateErrorKind::BadRequest
+        );
+        assert_eq!(env.sessions.workspace_revision_for_test(&session_id), 0);
+        assert!(env.sessions.stop(&session_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stop_and_lifetime_preempt_updating_before_mutation() {
+        for explicit in [true, false] {
+            let env = setup_env_with_session_lifetime(60);
+            let (session_id, mut events, initializer) = spawn_direct_session(&env, "managed", 128);
+            while let Some(event) = events.recv().await {
+                if matches!(event, SessionStartEvent::Ready { .. }) {
+                    break;
+                }
+            }
+            initializer.await.unwrap();
+
+            let archive = update_zip(&[("work/input.txt", b"updated", 0o644)]);
+            let request = crate::protocol::SessionUpdateRequest {
+                schema_version: "1".to_string(),
+                request_id: format!("preempt-{explicit}"),
+                base_revision: "rev_0".to_string(),
+                source: SourceMetadata {
+                    format: SourceFormat::Zip,
+                },
+                changes: vec![crate::protocol::SessionUpdateChange::File {
+                    path: "work/input.txt".to_string(),
+                    sha256: format!("{:x}", Sha256::digest(b"updated")),
+                }],
+            };
+            let policy = env.config.tasks["managed"]
+                .session
+                .as_ref()
+                .unwrap()
+                .source_updates
+                .as_ref()
+                .unwrap();
+            let prepared = prepare_update(
+                archive.path(),
+                env.sessions.metadata_root(),
+                &session_id,
+                &request,
+                policy,
+            )
+            .unwrap();
+            let reservation = match env
+                .sessions
+                .start_update(&session_id, request.request_id, [7; 32], 0)
+                .unwrap()
+            {
+                SessionUpdateAdmission::Start(reservation) => reservation,
+                SessionUpdateAdmission::Retry(_) => panic!("unexpected retry"),
+            };
+            let arrived = Arc::new(std::sync::Barrier::new(2));
+            let release = Arc::new(std::sync::Barrier::new(2));
+            env.sessions
+                .install_update_apply_hook(Arc::clone(&arrived), Arc::clone(&release));
+            let worker_sessions = env.sessions.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                worker_sessions.execute_update(reservation, prepared)
+            });
+            wait_barrier(arrived).await;
+
+            let stop = if explicit {
+                let sessions = env.sessions.clone();
+                let id = session_id.clone();
+                Some(tokio::task::spawn_blocking(move || sessions.stop(&id)))
+            } else {
+                env.sessions.force_lifetime_for_test(&session_id);
+                None
+            };
+            wait_barrier(release).await;
+            assert_eq!(
+                worker.await.unwrap().unwrap_err().kind,
+                UpdateErrorKind::Cancelled
+            );
+            if let Some(stop) = stop {
+                assert!(stop.await.unwrap().is_ok());
+            }
+            assert_eq!(env.sessions.active_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn panicked_update_worker_unblocks_preempting_stop_and_releases_permit() {
+        let env = setup_env_with_session_lifetime(60);
+        let (addr, server) = start_http_server(env.app.clone()).await;
+        let base = format!("http://{addr}");
+        let session_id = tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || start_managed_session(&bounded_lifecycle_client(), &base, "managed")
+        })
+        .await
+        .unwrap();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        env.sessions
+            .install_update_apply_hook(Arc::clone(&arrived), Arc::clone(&release));
+        env.sessions.panic_next_update_worker();
+        let update = tokio::task::spawn_blocking({
+            let base = base.clone();
+            let session_id = session_id.clone();
+            move || {
+                let archive = update_zip(&[("work/input.txt", b"panic", 0o644)]);
+                let metadata = update_metadata("panic-update", "rev_0", "work/input.txt", b"panic");
+                post_update(
+                    &bounded_lifecycle_client(),
+                    &base,
+                    &session_id,
+                    &metadata,
+                    archive.path(),
+                )
+                .status()
+            }
+        });
+        wait_barrier(arrived).await;
+        let stop = tokio::task::spawn_blocking({
+            let base = base.clone();
+            let session_id = session_id.clone();
+            move || {
+                bounded_lifecycle_client()
+                    .delete(format!("{base}/v1/sessions/{session_id}"))
+                    .send()
+                    .unwrap()
+                    .status()
+            }
+        });
+        let wait_sessions = env.sessions.clone();
+        let wait_id = session_id.clone();
+        tokio::task::spawn_blocking(move || wait_sessions.wait_for_terminating_for_test(&wait_id))
+            .await
+            .unwrap();
+        wait_barrier(release).await;
+        assert_eq!(update.await.unwrap(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(stop.await.unwrap(), StatusCode::OK);
+        assert_eq!(env.sessions.active_count(), 0);
+        assert_eq!(env.build_slots.available_permits(), 1);
+        server.abort();
+    }
+
+    fn update_metadata(
+        request_id: &str,
+        base_revision: &str,
+        path: &str,
+        contents: &[u8],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "1",
+            "request_id": request_id,
+            "base_revision": base_revision,
+            "source": {"format": "zip"},
+            "changes": [{
+                "path": path,
+                "kind": "file",
+                "sha256": format!("{:x}", Sha256::digest(contents))
+            }]
+        })
+    }
+
+    fn update_zip(entries: &[(&str, &[u8], u32)]) -> NamedTempFile {
+        let temp = NamedTempFile::new().unwrap();
+        let mut zip = ZipWriter::new(temp.reopen().unwrap());
+        for (path, contents, mode) in entries {
+            zip.start_file(*path, FileOptions::default().unix_permissions(*mode))
+                .unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        zip.finish().unwrap();
+        temp
+    }
+
+    fn post_update(
+        client: &Client,
+        base: &str,
+        session_id: &str,
+        metadata: &serde_json::Value,
+        archive: &Path,
+    ) -> reqwest::blocking::Response {
+        client
+            .post(format!("{base}/v1/sessions/{session_id}/updates"))
+            .multipart(
+                Form::new()
+                    .part(
+                        "metadata",
+                        Part::text(metadata.to_string())
+                            .mime_str("application/json")
+                            .unwrap(),
+                    )
+                    .part(
+                        "source",
+                        Part::file(archive)
+                            .unwrap()
+                            .mime_str("application/zip")
+                            .unwrap(),
+                    ),
+            )
+            .send()
+            .unwrap()
+    }
+
     fn setup_env() -> TestEnv {
         setup_env_with_options(SourcesConfig::default().upload_timeout_sec, true)
     }
@@ -3360,7 +4016,18 @@ mod tests {
                         ),
                     ]),
                     action_dispatcher: None,
+                    source_updates: Some(SourceUpdatesConfig {
+                        timeout_sec: upload_timeout_sec.min(10),
+                        max_transfer_bytes: 1024 * 1024,
+                        max_uncompressed_bytes: 1024 * 1024,
+                        max_files: 20,
+                        max_depth: 10,
+                        include: vec!["work/**".to_string()],
+                        exclude: vec!["work/private/**".to_string()],
+                    }),
                 });
+                let mut managed_no_updates = managed.clone();
+                managed_no_updates.session.as_mut().unwrap().source_updates = None;
                 let mut managed_dispatch = managed.clone();
                 let dispatch_session = managed_dispatch.session.as_mut().unwrap();
                 let dispatcher = dispatch_session.actions.remove("observe").unwrap();
@@ -3401,6 +4068,7 @@ mod tests {
                 HashMap::from([
                     ("build".to_string(), build_task.clone()),
                     ("managed".to_string(), managed),
+                    ("managed-no-updates".to_string(), managed_no_updates),
                     ("managed-dispatch".to_string(), managed_dispatch),
                     ("managed-phased".to_string(), managed_phased),
                     ("managed-failure".to_string(), managed_failure),
