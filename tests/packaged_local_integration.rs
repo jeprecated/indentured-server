@@ -282,16 +282,19 @@ case "$envelope" in
 esac
 '''
 timeout_sec = 2
+allow_unlisted = true
 [tasks.dispatch_probe.session.action_dispatcher.artifacts]
 include = ["evidence/**"]
 exclude = ["evidence/.keep"]
+[tasks.dispatch_probe.session.action_dispatcher.actions.observe-later]
+timeout_sec = 3
 "#,
         )
     });
     fs::write(
         &config,
         format!(
-            r#"schema_version = "9"
+            r#"schema_version = "10"
 [service]
 max_concurrent_builds = 1
 [service.socket]

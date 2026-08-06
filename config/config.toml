@@ -1,4 +1,4 @@
-schema_version = "9"
+schema_version = "10"
 
 [service]
 # Immediate admission control; excess authenticated requests receive HTTP 503.
@@ -103,10 +103,16 @@ timeout_sec = 120
 [tasks.repo_session.session.action_dispatcher]
 script = "exec devenv tasks run indentured:session:action"
 timeout_sec = 120
+# Compatibility default: arbitrary valid names use the dispatcher defaults.
+allow_unlisted = true
 
 [tasks.repo_session.session.action_dispatcher.artifacts]
 include = [".indentured-output/action/**"]
 exclude = []
+
+# Optional policy-only per-name overrides inherit omitted dispatcher defaults.
+[tasks.repo_session.session.action_dispatcher.actions.observe]
+timeout_sec = 60
 
 [sources]
 max_transfer_bytes = 134217728

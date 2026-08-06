@@ -101,7 +101,7 @@ This is package/protocol evidence, not a production security bypass or a native 
 
 ## Reusable repository capability profiles
 
-Deploy schema 9 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:
+Deploy schema 10 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:
 
 ```toml
 [tasks.repo_check]
@@ -150,10 +150,15 @@ timeout_sec = 120
 executable = "/run/current-system/sw/bin/devenv"
 args = ["tasks", "run", "indentured:session:action"]
 timeout_sec = 120
+allow_unlisted = true
 
 [tasks.repo_session.session.action_dispatcher.artifacts]
 include = [".indentured-output/action/**"]
 exclude = []
+
+# Optional policy-only override; artifacts still inherit the dispatcher default.
+[tasks.repo_session.session.action_dispatcher.actions.observe]
+timeout_sec = 60
 ```
 
 Use an absolute, operator-selected Devenv executable and adjust only deployment-owned paths and limits. Repository tasks are ordinary Devenv tasks:
@@ -164,7 +169,7 @@ Use an absolute, operator-selected Devenv executable and adjust only deployment-
 - `indentured:session:action` reads exactly one dispatcher envelope from inherited stdin;
 - `indentured:session:stop` performs idempotent cleanup and may populate `.indentured-output/final/`.
 
-The action task receives compact JSON with no trailing newline, such as `{"schema_version":"1","action":"observe","input":{}}`. A shell task can capture it with `IFS= read -r envelope || test -n "$envelope"`. It must validate schema and action, treat every input field as data, reject unsupported names promptly with a nonzero exit, and avoid Devenv task dependencies that compete for stdin. All names share the dispatcher's fixed 120-second example timeout and `.indentured-output/action/**` snapshot policy. Use strict named actions instead when implementations must remain operator-owned or need different limits or artifact allowlists.
+The action task receives compact JSON with no trailing newline, such as `{"schema_version":"1","action":"observe","input":{}}`. A shell task can capture it with `IFS= read -r envelope || test -n "$envelope"`. It must validate schema and action, treat every input field as data, reject unsupported names promptly with a nonzero exit, and avoid Devenv task dependencies that compete for stdin. Dispatcher `actions` entries may override only `timeout_sec` and `artifacts`; omitted values inherit the fixed defaults, and an explicitly empty artifacts table selects no artifacts. `allow_unlisted` defaults to `true` for schema-9 compatibility; set it to `false` to reject names absent from the policy map before spawn. Use strict named actions instead when implementations must remain operator-owned.
 
 Uploaded repository hooks are arbitrary code under the configured task identity. A fixed `repo_check` or `repo_session` name is not a per-script security boundary. Create a separate host profile only for a distinct identity, permission set, resource limit, lifecycle, artifact policy, or operator-owned capability. The source tree uploaded by `session start` remains pinned for that session; stop and start a new session to pick up repository changes.
 

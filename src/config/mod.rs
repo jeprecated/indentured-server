@@ -11,7 +11,7 @@ use crate::protocol::valid_task_id;
 use crate::validation::{validate_relative_path, validate_relative_pattern};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/indentured-server/config.toml";
-pub const CONFIG_SCHEMA_VERSION: &str = "9";
+pub const CONFIG_SCHEMA_VERSION: &str = "10";
 pub(crate) const SCRIPT_SHELL: &str = "/bin/sh";
 pub(crate) const MAX_SESSION_LIFETIME_SEC: u64 = u32::MAX as u64;
 const MAX_TASK_SCRIPT_BYTES: usize = 64 * 1024;
@@ -590,7 +590,7 @@ pub struct TaskSessionConfig {
     #[serde(default)]
     pub actions: HashMap<String, SessionActionConfig>,
     #[serde(default)]
-    pub action_dispatcher: Option<SessionActionConfig>,
+    pub action_dispatcher: Option<SessionActionDispatcherConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,6 +617,37 @@ pub struct SessionActionConfig {
     pub timeout_sec: u64,
     #[serde(default)]
     pub artifacts: ArtifactSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionActionDispatcherConfig {
+    #[serde(default)]
+    pub script: Option<ScriptText>,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_sec: u64,
+    #[serde(default)]
+    pub artifacts: ArtifactSpec,
+    #[serde(default = "default_allow_unlisted_actions")]
+    pub allow_unlisted: bool,
+    #[serde(default)]
+    pub actions: HashMap<String, SessionActionPolicyOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionActionPolicyOverride {
+    #[serde(default)]
+    pub timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub artifacts: Option<ArtifactSpec>,
+}
+
+fn default_allow_unlisted_actions() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +679,26 @@ impl SessionActionConfig {
     }
 }
 
+impl SessionActionDispatcherConfig {
+    pub(crate) fn resolve(&self, action_name: &str) -> Option<SessionActionConfig> {
+        let policy = self.actions.get(action_name);
+        if policy.is_none() && !self.allow_unlisted {
+            return None;
+        }
+        Some(SessionActionConfig {
+            script: self.script.clone(),
+            executable: self.executable.clone(),
+            args: self.args.clone(),
+            timeout_sec: policy
+                .and_then(|policy| policy.timeout_sec)
+                .unwrap_or(self.timeout_sec),
+            artifacts: policy
+                .and_then(|policy| policy.artifacts.clone())
+                .unwrap_or_else(|| self.artifacts.clone()),
+        })
+    }
+}
+
 impl TaskConfig {
     pub(crate) fn execution(&self) -> TaskExecution<'_> {
         execution(&self.script, &self.executable, &self.args)
@@ -668,7 +719,7 @@ impl TaskConfig {
                     || session
                         .action_dispatcher
                         .as_ref()
-                        .is_some_and(|action| action.script.is_some())
+                        .is_some_and(|dispatcher| dispatcher.script.is_some())
             })
     }
 
@@ -805,18 +856,39 @@ impl TaskSessionConfig {
             )?;
             validate_artifact_spec(&action.artifacts, &format!("{action_field}.artifacts"))?;
         }
-        if let Some(action) = &self.action_dispatcher {
-            let action_field = format!("{field}.action_dispatcher");
+        if let Some(dispatcher) = &self.action_dispatcher {
+            let dispatcher_field = format!("{field}.action_dispatcher");
             validate_session_execution(
-                &action.script,
-                &action.executable,
-                &action.args,
-                action.timeout_sec,
-                &action_field,
+                &dispatcher.script,
+                &dispatcher.executable,
+                &dispatcher.args,
+                dispatcher.timeout_sec,
+                &dispatcher_field,
                 environment,
                 max_timeout_sec,
             )?;
-            validate_artifact_spec(&action.artifacts, &format!("{action_field}.artifacts"))?;
+            validate_artifact_spec(
+                &dispatcher.artifacts,
+                &format!("{dispatcher_field}.artifacts"),
+            )?;
+            for (action_name, policy) in &dispatcher.actions {
+                if !valid_task_id(action_name) {
+                    return Err(ConfigError::Invalid(format!(
+                        "action name {action_name:?} in {dispatcher_field}.actions must match [A-Za-z0-9_-]+ and be at most 64 bytes"
+                    )));
+                }
+                let policy_field = format!("{dispatcher_field}.actions.{action_name}");
+                if let Some(timeout_sec) = policy.timeout_sec {
+                    if timeout_sec == 0 || timeout_sec > max_timeout_sec {
+                        return Err(ConfigError::Invalid(format!(
+                            "{policy_field}.timeout_sec must be between 1 and build.max_timeout_sec ({max_timeout_sec})"
+                        )));
+                    }
+                }
+                if let Some(artifacts) = &policy.artifacts {
+                    validate_artifact_spec(artifacts, &format!("{policy_field}.artifacts"))?;
+                }
+            }
         }
         Ok(())
     }
@@ -1272,6 +1344,18 @@ mod tests {
         }
     }
 
+    fn dispatcher(action: SessionActionConfig) -> SessionActionDispatcherConfig {
+        SessionActionDispatcherConfig {
+            script: action.script,
+            executable: action.executable,
+            args: action.args,
+            timeout_sec: action.timeout_sec,
+            artifacts: action.artifacts,
+            allow_unlisted: true,
+            actions: HashMap::new(),
+        }
+    }
+
     fn valid_config(temp: &Path) -> Config {
         let artifacts = ArtifactsConfig {
             storage_root: temp.join("artifacts"),
@@ -1304,7 +1388,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_legacy_authority_sections() {
         let raw = r#"
-schema_version = "9"
+schema_version = "10"
 tasks = {}
 [build]
 commands = { make = "/usr/bin/make" }
@@ -1315,7 +1399,7 @@ commands = { make = "/usr/bin/make" }
     #[test]
     fn strict_config_rejects_inline_tokens_and_enforces_hardening_defaults() {
         let raw = r#"
-schema_version = "9"
+schema_version = "10"
 tasks = {}
 [service.http]
 enabled = true
@@ -1483,7 +1567,7 @@ tokens = ["secret"]
         let mut config = valid_config(temp.path());
 
         let mut dispatched = session(executable.clone());
-        dispatched.action_dispatcher = dispatched.actions.remove("observe");
+        dispatched.action_dispatcher = dispatched.actions.remove("observe").map(dispatcher);
         config.tasks.get_mut("build").unwrap().session = Some(dispatched.clone());
         config.validate().expect("dispatcher-only session");
 
@@ -1511,10 +1595,10 @@ tokens = ["secret"]
         let executable = std::env::current_exe().unwrap();
         let mut config = valid_config(temp.path());
         let mut dispatched = session(executable);
-        dispatched.action_dispatcher = dispatched.actions.remove("observe");
+        dispatched.action_dispatcher = dispatched.actions.remove("observe").map(dispatcher);
         config.tasks.get_mut("build").unwrap().session = Some(dispatched);
 
-        type DispatcherMutation = Box<dyn Fn(&mut SessionActionConfig, u64)>;
+        type DispatcherMutation = Box<dyn Fn(&mut SessionActionDispatcherConfig, u64)>;
         let cases: Vec<DispatcherMutation> = vec![
             Box::new(|action, _| action.timeout_sec = 0),
             Box::new(|action, max| action.timeout_sec = max + 1),
@@ -1561,6 +1645,142 @@ tokens = ["secret"]
     }
 
     #[test]
+    fn dispatcher_policy_inherits_defaults_and_empty_artifacts_override() {
+        let executable = std::env::current_exe().unwrap();
+        let mut dispatcher = dispatcher(SessionActionConfig {
+            script: None,
+            executable: Some(executable),
+            args: vec!["dispatch".to_string()],
+            timeout_sec: 30,
+            artifacts: ArtifactSpec {
+                include: vec!["default/**".to_string()],
+                exclude: vec!["default/*.tmp".to_string()],
+            },
+        });
+        dispatcher.actions.insert(
+            "inherit".to_string(),
+            SessionActionPolicyOverride {
+                timeout_sec: Some(10),
+                artifacts: None,
+            },
+        );
+        dispatcher.actions.insert(
+            "empty".to_string(),
+            SessionActionPolicyOverride {
+                timeout_sec: None,
+                artifacts: Some(ArtifactSpec::default()),
+            },
+        );
+
+        let inherited = dispatcher.resolve("inherit").unwrap();
+        assert_eq!(inherited.timeout_sec, 10);
+        assert_eq!(inherited.artifacts, dispatcher.artifacts);
+        let empty = dispatcher.resolve("empty").unwrap();
+        assert_eq!(empty.timeout_sec, 30);
+        assert_eq!(empty.artifacts, ArtifactSpec::default());
+        let compatible = dispatcher.resolve("unlisted").unwrap();
+        assert_eq!(compatible.timeout_sec, 30);
+        assert_eq!(compatible.artifacts, dispatcher.artifacts);
+
+        dispatcher.allow_unlisted = false;
+        assert!(dispatcher.resolve("unlisted").is_none());
+
+        let parsed: SessionActionDispatcherConfig = toml::from_str(
+            r#"executable = "/bin/sh"
+timeout_sec = 30
+[actions.empty.artifacts]
+"#,
+        )
+        .unwrap();
+        assert!(parsed.allow_unlisted);
+        assert_eq!(
+            parsed.actions["empty"].artifacts,
+            Some(ArtifactSpec::default())
+        );
+    }
+
+    #[test]
+    fn dispatcher_policy_rejects_invalid_names_timeouts_and_globs() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = valid_config(temp.path());
+        let mut dispatched = session(executable);
+        dispatched.action_dispatcher = dispatched.actions.remove("observe").map(dispatcher);
+        let dispatcher = dispatched.action_dispatcher.as_mut().unwrap();
+        dispatcher.actions.insert(
+            "observe".to_string(),
+            SessionActionPolicyOverride::default(),
+        );
+        config.tasks.get_mut("build").unwrap().session = Some(dispatched);
+        config.validate().unwrap();
+
+        type PolicyMutation = fn(&mut SessionActionPolicyOverride, u64);
+        let cases: [PolicyMutation; 3] = [
+            |policy, _| policy.timeout_sec = Some(0),
+            |policy, max| policy.timeout_sec = Some(max + 1),
+            |policy, _| {
+                policy.artifacts = Some(ArtifactSpec {
+                    include: vec!["[".to_string()],
+                    exclude: Vec::new(),
+                })
+            },
+        ];
+        for mutate in cases {
+            let mut invalid = config.clone();
+            let max = invalid.build.max_timeout_sec;
+            let policy = invalid
+                .tasks
+                .get_mut("build")
+                .unwrap()
+                .session
+                .as_mut()
+                .unwrap()
+                .action_dispatcher
+                .as_mut()
+                .unwrap()
+                .actions
+                .get_mut("observe")
+                .unwrap();
+            mutate(policy, max);
+            assert!(invalid.validate().is_err());
+        }
+
+        let dispatcher = config
+            .tasks
+            .get_mut("build")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap()
+            .action_dispatcher
+            .as_mut()
+            .unwrap();
+        let policy = dispatcher.actions.remove("observe").unwrap();
+        dispatcher.actions.insert("bad action".to_string(), policy);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn dispatcher_policy_rejects_process_authority_fields() {
+        for authority in [
+            "script = \"true\"",
+            "executable = \"/bin/false\"",
+            "args = [\"owned\"]",
+            "cwd = \"elsewhere\"",
+            "environment = {}",
+            "run_as_user = \"root\"",
+        ] {
+            let raw = format!(
+                "executable = \"/bin/sh\"\ntimeout_sec = 30\nactions = {{ observe = {{ {authority} }} }}\n"
+            );
+            assert!(
+                toml::from_str::<SessionActionDispatcherConfig>(&raw).is_err(),
+                "accepted dispatcher override authority: {authority}"
+            );
+        }
+    }
+
+    #[test]
     fn managed_session_lifetime_has_a_representable_instant_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
         let executable = std::env::current_exe().expect("current executable");
@@ -1604,16 +1824,16 @@ timeout_sec = 30
     }
 
     #[test]
-    fn schema_eight_named_actions_migrate_by_version_only() {
+    fn schema_nine_named_actions_migrate_by_version_only() {
         let temp = tempfile::tempdir().unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut legacy = valid_config(temp.path());
         legacy.tasks.get_mut("build").unwrap().session = Some(session(executable));
-        legacy.schema_version = "8".to_string();
+        legacy.schema_version = "9".to_string();
         assert!(legacy.validate().is_err());
         let legacy_toml = toml::to_string(&legacy).unwrap();
         let migrated_toml =
-            legacy_toml.replacen("schema_version = \"8\"", "schema_version = \"9\"", 1);
+            legacy_toml.replacen("schema_version = \"9\"", "schema_version = \"10\"", 1);
         let migrated: Config = toml::from_str(&migrated_toml).unwrap();
         migrated.validate().expect("version-only migration");
         let session = migrated.tasks["build"].session.as_ref().unwrap();
@@ -1635,7 +1855,7 @@ timeout_sec = 30
         }
 
         let legacy = r#"
-schema_version = "9"
+schema_version = "10"
 tasks = {}
 [service.http]
 enabled = true
@@ -1683,10 +1903,10 @@ ca_path = "/etc/indentured-server/client-ca.pem"
     }
 
     #[test]
-    fn schema_nine_deserializes_multiline_scripts_and_both_legal_shapes() {
+    fn schema_ten_deserializes_multiline_scripts_and_both_legal_shapes() {
         let current_exe = std::env::current_exe().unwrap();
         let raw = format!(
-            r#"schema_version = "9"
+            r#"schema_version = "10"
 [service.http]
 enabled = true
 [build]
@@ -1741,7 +1961,7 @@ storage_root = "/tmp/artifacts"
     #[test]
     fn old_and_future_schema_versions_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        for version in ["8", "10"] {
+        for version in ["9", "11"] {
             let mut config = valid_config(temp.path());
             config.schema_version = version.to_string();
             assert!(config

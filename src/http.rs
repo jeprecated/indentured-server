@@ -1117,8 +1117,9 @@ mod tests {
     use crate::artifacts::ArtifactSnapshotCheckpoint;
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, Config, LoggingConfig, ScriptText,
-        ServiceConfig, SessionActionConfig, SessionTeardownConfig, SourcesConfig, TaskConfig,
-        TaskSessionConfig, TaskSetupConfig, WorkspacePolicy, CONFIG_SCHEMA_VERSION,
+        ServiceConfig, SessionActionConfig, SessionActionDispatcherConfig, SessionTeardownConfig,
+        SourcesConfig, TaskConfig, TaskSessionConfig, TaskSetupConfig, WorkspacePolicy,
+        CONFIG_SCHEMA_VERSION,
     };
     use crate::protocol::{
         BuildPhase, Request, ResponseEvent, SessionActionEvent, SessionStartEvent,
@@ -3362,10 +3363,17 @@ mod tests {
                 });
                 let mut managed_dispatch = managed.clone();
                 let dispatch_session = managed_dispatch.session.as_mut().unwrap();
-                let mut dispatcher = dispatch_session.actions.remove("observe").unwrap();
-                dispatcher.args = vec!["action-dispatch".to_string()];
+                let dispatcher = dispatch_session.actions.remove("observe").unwrap();
                 dispatch_session.actions.clear();
-                dispatch_session.action_dispatcher = Some(dispatcher);
+                dispatch_session.action_dispatcher = Some(SessionActionDispatcherConfig {
+                    script: dispatcher.script,
+                    executable: dispatcher.executable,
+                    args: vec!["action-dispatch".to_string()],
+                    timeout_sec: dispatcher.timeout_sec,
+                    artifacts: dispatcher.artifacts,
+                    allow_unlisted: true,
+                    actions: HashMap::new(),
+                });
                 let mut managed_phased = phased_task("managed-setup", 3);
                 managed_phased.session = managed.session.clone();
                 let mut managed_failure = process_task("error", 3);

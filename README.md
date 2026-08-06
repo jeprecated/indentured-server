@@ -80,10 +80,10 @@ The Cargo release build creates:
 
 ## Server configuration
 
-The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `9`; request protocol versions are separate. Schema 8 named-action configurations migrate by changing only their schema version; existing task and request behavior is unchanged. Older and future schemas fail closed.
+The daemon loads `/etc/indentured-server/config.toml` by default. Override it with `--config` or `INDENTURED_SERVER_CONFIG`. The current daemon configuration schema is `10`; request protocol versions are separate. Schema 9 configurations migrate by changing only their schema version; dispatchers default to their compatible open-name policy. Older and future schemas fail closed.
 
 ```toml
-schema_version = "9"
+schema_version = "10"
 
 [service]
 max_concurrent_builds = 1
@@ -187,8 +187,8 @@ Task validation occurs at daemon startup:
 - each task defines exactly one server-owned run `script` or absolute run `executable`; executable mode retains optional fixed `args` compatibility;
 - a task may also define one optional server-owned `setup` command using the same script/executable shape;
 - an optional `session` requires nonzero `idle_timeout_sec` and `max_lifetime_sec`, with idle strictly less than lifetime, one idempotent teardown command, and exactly one action mode: a nonempty named `actions` map or one fixed `action_dispatcher`;
-- session action names use the task-name rules; action and teardown timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
-- actions and teardown inherit the task's fixed `cwd`, environment, and identity; named actions may each define an artifact allowlist, while one dispatcher has one timeout and artifact policy shared by every accepted action name; the top-level task artifact policy controls the final explicit-stop snapshot;
+- session action names, including dispatcher policy keys, use the task-name rules; action, teardown, and optional dispatcher override timeouts are nonzero and individually no greater than `build.max_timeout_sec`;
+- actions and teardown inherit the task's fixed `cwd`, environment, and identity; named actions may each define an artifact allowlist, while dispatcher policy entries may override only its timeout and artifacts; the top-level task artifact policy controls the final explicit-stop snapshot;
 - scripts contain 1–65,536 UTF-8 bytes, include non-whitespace text, contain no NUL, and cannot be combined with `executable` or nonempty `args`;
 - scripts run exactly as `/bin/sh -eu -c SCRIPT`; `/bin/sh` and configured executables must be accessible executable regular files;
 - script tasks require an explicit nonempty `PATH` whose colon-separated components are all absolute and nonempty;
@@ -222,7 +222,7 @@ exclude = []
 A bare `devenv shell` line does **not** affect later script lines: it runs as a child process and cannot modify the outer `/bin/sh` environment (and may behave poorly when noninteractive). Keep dependent commands inside a server-owned wrapper, with `--` separating Devenv options:
 
 ```toml
-schema_version = "9"
+schema_version = "10"
 
 [tasks.ci]
 script = '''
@@ -252,13 +252,21 @@ A dispatcher is an alternative to the named `[tasks.<task>.session.actions.<name
 executable = "/run/current-system/sw/bin/devenv"
 args = ["tasks", "run", "indentured:session:action"]
 timeout_sec = 120
+allow_unlisted = false
 
 [tasks.build.session.action_dispatcher.artifacts]
 include = [".indentured-output/action/**"]
 exclude = []
+
+# Policy-only entries inherit omitted values from the dispatcher.
+[tasks.build.session.action_dispatcher.actions.observe]
+timeout_sec = 30
+
+# An explicitly empty artifacts table overrides the dispatcher to no artifacts.
+[tasks.build.session.action_dispatcher.actions.mutate.artifacts]
 ```
 
-The executable, arguments, timeout, working directory, environment, identity, and artifact allowlist remain server-owned. The repository dispatcher receives a versioned JSON envelope on stdin and must reject unsupported names promptly. Use named actions when the operator, rather than uploaded repository code, must own each action implementation or when actions need different limits.
+The executable, arguments, working directory, environment, and identity remain fixed for every dispatched name. Policy entries may contain only `timeout_sec` and `artifacts`; omitted values inherit the dispatcher defaults. `allow_unlisted = false` rejects names absent from `actions` before spawning, while the default `true` preserves schema-9 arbitrary-name behavior. The repository dispatcher receives the existing versioned JSON envelope on stdin and must still validate names and input. Use named actions when the operator, rather than uploaded repository code, must own each action implementation.
 
 ## Client configuration and use
 
@@ -375,13 +383,13 @@ Automatic cleanup runs teardown without publishing an unreachable final archive.
 {"schema_version":"1","input":{"operator_data":"value"}}
 ```
 
-The `input` value must be an object. Names such as `argv` nested inside it are data and never process authority. Unknown top-level fields—including `argv`, `environment`, `cwd`, `timeout_sec`, `artifacts`, and `path`—are rejected. Session IDs and action-execution IDs are opaque `[A-Za-z0-9_-]+` values bounded to 128 bytes; action names retain the 64-byte task-identifier rules. Named mode rejects an unconfigured name with `404 unknown_action` and supplies only the compact serialized `input` object to that action's stdin. Dispatcher mode accepts every syntactically valid name and supplies this compact internal envelope to the one fixed dispatcher command:
+The `input` value must be an object. Names such as `argv` nested inside it are data and never process authority. Unknown top-level fields—including `argv`, `environment`, `cwd`, `timeout_sec`, `artifacts`, and `path`—are rejected. Session IDs and action-execution IDs are opaque `[A-Za-z0-9_-]+` values bounded to 128 bytes; action names retain the 64-byte task-identifier rules. Named mode rejects an unconfigured name with `404 unknown_action` and supplies only the compact serialized `input` object to that action's stdin. Dispatcher mode accepts every syntactically valid name by default; with `allow_unlisted = false`, it accepts only names in the dispatcher's policy map. It supplies this compact internal envelope to the one fixed dispatcher command:
 
 ```json
 {"schema_version":"1","action":"observe","input":{"operator_data":"value"}}
 ```
 
-The external encoded request remains bounded to 65,536 bytes. Dispatcher stdin is bounded by that request plus the fixed envelope and an action name of at most 64 bytes. The dispatcher must treat the name and input as data, reject unsupported names promptly with a nonzero exit, and avoid task dependencies that compete to read the inherited stdin. All dispatcher names share its configured timeout and artifact allowlist. Action streams carry stable session, action-execution, and action-name identity:
+The external encoded request remains bounded to 65,536 bytes. Dispatcher stdin is bounded by that request plus the fixed envelope and an action name of at most 64 bytes. The dispatcher must treat the name and input as data, reject unsupported names promptly with a nonzero exit, and avoid task dependencies that compete to read the inherited stdin. Each accepted name uses the dispatcher timeout and artifact allowlist unless its policy-only entry overrides either value; an explicitly empty artifacts table selects no artifacts. Action streams carry stable session, action-execution, and action-name identity:
 
 ```json
 {"type":"action","session_id":"ses_123","action_id":"act_456","action":"observe","status":"started"}
@@ -390,7 +398,7 @@ The external encoded request remains bounded to 65,536 bytes. Dispatcher stdin i
 {"type":"exit","session_id":"ses_123","action_id":"act_456","action":"observe","code":0,"timed_out":false,"artifacts":{"path":"/v1/builds/bld_789/artifacts.zip","size":1234}}
 ```
 
-Each child receives only its mode's serialized JSON on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each named action, the shared dispatcher, and teardown has its configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.
+Each child receives only its mode's serialized JSON on stdin followed by EOF; stdin delivery is nonblocking with respect to the daemon runtime and an action that exits without reading it is handled normally. Each named or resolved dispatcher action and teardown has its configured deadline and fresh `build.max_output_bytes` accounting; output usage is not cumulative across the session. Action and final explicit-stop archives reuse the existing authenticated artifact path, storage limits, restricted patterns, TTL, and garbage collection.
 
 A Ready session admits one action at a time. The action process and its artifact snapshot form one serialized operation, so another action receives immediate `409 session_conflict` rather than queueing, including while snapshot publication is active. Idle expiry is suspended during the operation and restarts after a completed ordinary action. Snapshot traversal retains an open workspace-root descriptor, opens every path component relative to it with no-follow semantics, verifies the opened file identity against traversal, and archives from the already-open descriptor. A task-owned symlink or rename swap therefore fails the action rather than redirecting snapshot reads.
 

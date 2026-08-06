@@ -2261,7 +2261,7 @@ mod tests {
     #[test]
     fn root_http_daemon_requires_distinct_non_root_task_identity_even_without_auth() {
         let raw = r#"
-schema_version = "9"
+schema_version = "10"
 tasks = {}
 [service.http]
 enabled = true

@@ -549,8 +549,13 @@ impl SessionManager {
         let session = entry.task.session.as_ref().ok_or(ActionError::NotFound)?;
         let (action, mode) = if let Some(action) = session.actions.get(action_name) {
             (action.clone(), SessionActionMode::Named)
-        } else if let Some(action) = &session.action_dispatcher {
-            (action.clone(), SessionActionMode::Dispatcher)
+        } else if let Some(dispatcher) = &session.action_dispatcher {
+            (
+                dispatcher
+                    .resolve(action_name)
+                    .ok_or(ActionError::UnknownAction)?,
+                SessionActionMode::Dispatcher,
+            )
         } else {
             return Err(ActionError::UnknownAction);
         };
@@ -1596,8 +1601,9 @@ mod tests {
     use super::*;
     use crate::config::{
         ArtifactSpec, ArtifactsConfig, BuildConfig, LoggingConfig, ServiceConfig,
-        SessionActionConfig, SessionTeardownConfig, SourcesConfig, TaskSessionConfig,
-        WorkspacePolicy, CONFIG_SCHEMA_VERSION,
+        SessionActionConfig, SessionActionDispatcherConfig, SessionActionPolicyOverride,
+        SessionTeardownConfig, SourcesConfig, TaskSessionConfig, WorkspacePolicy,
+        CONFIG_SCHEMA_VERSION,
     };
     use std::os::unix::fs::{symlink, PermissionsExt};
     use tempfile::tempdir;
@@ -1748,7 +1754,16 @@ mod tests {
             .session
             .as_mut()
             .unwrap();
-        session.action_dispatcher = session.actions.remove("observe");
+        let action = session.actions.remove("observe").unwrap();
+        session.action_dispatcher = Some(SessionActionDispatcherConfig {
+            script: action.script,
+            executable: action.executable,
+            args: action.args,
+            timeout_sec: action.timeout_sec,
+            artifacts: action.artifacts,
+            allow_unlisted: true,
+            actions: HashMap::new(),
+        });
         config.validate().unwrap();
         let config = Arc::new(config);
         fs::create_dir_all(&config.build.workspace_root).unwrap();
@@ -1773,11 +1788,79 @@ mod tests {
             .start_action(reservation.id(), "observe-later")
             .unwrap();
         assert_eq!(action.action.args, vec!["observe".to_string()]);
+        assert_eq!(action.action.timeout_sec, 1);
         let input = serde_json::Map::from_iter([("count".to_string(), serde_json::Value::from(2))]);
         assert_eq!(
             action.encode_input(&input),
             br#"{"schema_version":"1","action":"observe-later","input":{"count":2}}"#
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_reservation_freezes_overrides_and_closed_allowlist_rejects_before_spawn() {
+        let temp = tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut config = test_config(temp.path(), &executable);
+        config.service.http.enabled = true;
+        let session = config
+            .tasks
+            .get_mut("managed")
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap();
+        let action = session.actions.remove("observe").unwrap();
+        session.action_dispatcher = Some(SessionActionDispatcherConfig {
+            script: action.script,
+            executable: action.executable,
+            args: action.args,
+            timeout_sec: 1,
+            artifacts: ArtifactSpec {
+                include: vec!["default/**".to_string()],
+                exclude: Vec::new(),
+            },
+            allow_unlisted: false,
+            actions: HashMap::from([(
+                "allowed".to_string(),
+                SessionActionPolicyOverride {
+                    timeout_sec: Some(2),
+                    artifacts: Some(ArtifactSpec::default()),
+                },
+            )]),
+        });
+        config.validate().unwrap();
+        let config = Arc::new(config);
+        fs::create_dir_all(&config.build.workspace_root).unwrap();
+        let manager = SessionManager::new(Arc::clone(&config)).unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let reservation = manager.reserve(
+            ValidatedRequest {
+                request_id: None,
+                task_id: "managed".to_string(),
+                task: config.tasks["managed"].clone(),
+            },
+            permit,
+        );
+        *reservation.entry.state.lock().unwrap() = SessionState::Ready {
+            last_activity: Instant::now(),
+        };
+
+        assert!(matches!(
+            manager.start_action(reservation.id(), "denied"),
+            Err(ActionError::UnknownAction)
+        ));
+        assert!(matches!(
+            *reservation.entry.state.lock().unwrap(),
+            SessionState::Ready { .. }
+        ));
+
+        let action = manager.start_action(reservation.id(), "allowed").unwrap();
+        assert_eq!(action.action.timeout_sec, 2);
+        assert!(action.action.artifacts.include.is_empty());
+        assert!(action.action.artifacts.exclude.is_empty());
     }
 
     #[test]
