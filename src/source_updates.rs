@@ -812,6 +812,8 @@ fn set_fd_owner_mode(fd: RawFd, uid: u32, gid: u32, mode: u32) -> io::Result<()>
     if unsafe { libc::fchown(fd, uid, gid) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    let mode = libc::mode_t::try_from(mode)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file mode is out of range"))?;
     if unsafe { libc::fchmod(fd, mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -846,6 +848,14 @@ mod tests {
                 path: path.into(),
                 sha256: format!("{:x}", Sha256::digest(contents)),
             }],
+        }
+    }
+
+    #[test]
+    fn platform_mode_conversion_is_checked() {
+        assert_eq!(libc::mode_t::try_from(0o100644_u32).unwrap(), 0o100644);
+        if std::mem::size_of::<libc::mode_t>() < std::mem::size_of::<u32>() {
+            assert!(libc::mode_t::try_from(u32::MAX).is_err());
         }
     }
 
