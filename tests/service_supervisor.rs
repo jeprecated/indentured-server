@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -25,6 +25,13 @@ fn pipe() -> (OwnedFd, OwnedFd) {
     })
 }
 
+fn process_exists(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn process_group_exists(pgid: i32) -> bool {
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return true;
@@ -32,8 +39,98 @@ fn process_group_exists(pgid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(target_os = "linux")]
+fn reap_adopted(pid: i32) {
+    while unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_adopted(_pid: i32) {}
+
 #[test]
-fn daemon_control_eof_kills_term_ignoring_service_group() {
+fn parent_group_death_reaps_term_ignoring_service_and_supervisor() {
+    if std::env::var_os("INDENTURED_SERVICE_TEST_HELPER").is_some() {
+        run_service_test_helper();
+    }
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+
+    let mut helper = Command::new(std::env::current_exe().unwrap());
+    helper
+        .args([
+            "--exact",
+            "parent_group_death_reaps_term_ignoring_service_and_supervisor",
+            "--nocapture",
+        ])
+        .env("INDENTURED_SERVICE_TEST_HELPER", "1")
+        .process_group(0)
+        .stdout(Stdio::piped());
+    let mut helper = helper.spawn().unwrap();
+    let helper_pgid = helper.id() as i32;
+    let mut output = BufReader::new(helper.stdout.take().unwrap());
+    let (supervisor_pid, service_pid, service_pgid) = loop {
+        let mut line = String::new();
+        assert_ne!(
+            output.read_line(&mut line).unwrap(),
+            0,
+            "helper exited early"
+        );
+        let Some(identity) = line.split("INDENTURED_FIXTURE ").nth(1) else {
+            continue;
+        };
+        let ids: Vec<i32> = identity
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        break (ids[0], ids[1], ids[2]);
+    };
+    assert!(process_exists(supervisor_pid));
+    assert!(process_exists(service_pid));
+    assert!(process_group_exists(service_pgid));
+
+    assert_eq!(unsafe { libc::killpg(helper_pgid, libc::SIGKILL) }, 0);
+    helper.wait().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let cleaned = loop {
+        reap_adopted(supervisor_pid);
+        reap_adopted(-service_pgid);
+        let cleaned = !process_exists(supervisor_pid)
+            && !process_exists(service_pid)
+            && !process_group_exists(service_pgid);
+        if cleaned || Instant::now() >= deadline {
+            break cleaned;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    if !cleaned {
+        unsafe {
+            libc::kill(supervisor_pid, libc::SIGKILL);
+            libc::killpg(service_pgid, libc::SIGKILL);
+        }
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < cleanup_deadline {
+            reap_adopted(supervisor_pid);
+            reap_adopted(-service_pgid);
+            if !process_exists(supervisor_pid) && !process_group_exists(service_pgid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(cleaned, "service or supervisor survived parent-group death");
+}
+
+#[allow(
+    clippy::zombie_processes,
+    reason = "the outer test reaps this supervisor after killing the helper"
+)]
+fn run_service_test_helper() -> ! {
     let (control_read, control_write) = pipe();
     let (status_read, status_write) = pipe();
     let (ready_read, ready_write) = pipe();
@@ -89,7 +186,8 @@ fn daemon_control_eof_kills_term_ignoring_service_group() {
     status.read_line(&mut line).unwrap();
     let spawned: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(spawned["status"], "spawned");
-    let pgid = spawned["pgid"].as_i64().unwrap() as i32;
+    let service_pid = spawned["pid"].as_i64().unwrap() as i32;
+    let service_pgid = spawned["pgid"].as_i64().unwrap() as i32;
 
     let mut ready = String::new();
     std::fs::File::from(ready_read)
@@ -97,18 +195,13 @@ fn daemon_control_eof_kills_term_ignoring_service_group() {
         .unwrap();
     assert_eq!(ready, "ready\n");
 
-    drop(control_write);
-    line.clear();
-    status.read_line(&mut line).unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&line).unwrap()["status"],
-        "stopped"
+    println!(
+        "INDENTURED_FIXTURE {} {service_pid} {service_pgid}",
+        supervisor.id()
     );
-    assert!(supervisor.wait().unwrap().success());
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while process_group_exists(pgid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+    std::io::stdout().flush().unwrap();
+    let _keep_control_open = control_write;
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
     }
-    assert!(!process_group_exists(pgid));
 }

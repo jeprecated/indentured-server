@@ -862,6 +862,10 @@ pub fn run_supervisor(control_fd: RawFd, status_fd: RawFd, readiness_fd: RawFd) 
     set_cloexec(control.as_raw_fd(), true)?;
 
     let result = (|| {
+        let pid = unsafe { libc::getpid() };
+        if unsafe { libc::getpgrp() } != pid && unsafe { libc::setpgid(0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         let spec: SupervisorSpec =
             serde_json::from_reader(io::stdin()).map_err(io::Error::other)?;
         if spec.readiness_fd != readiness_fd {
