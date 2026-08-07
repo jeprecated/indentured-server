@@ -206,12 +206,12 @@ The action task receives compact JSON with no trailing newline, such as `{"schem
 
 Uploaded repository hooks are arbitrary code under the configured task identity. A fixed `repo_check` or `repo_session` name is not a per-script security boundary. Create a separate host profile only for a distinct identity, permission set, resource limit, lifecycle, artifact policy, or operator-owned capability. The source tree uploaded by `session start` is initially pinned. It can change only through the bounded `session.source_updates` policy and authenticated revisioned update endpoint; without that operator-owned policy the endpoint is unsupported. This is not generic filesystem authority: updates are declared, hashed, allowlisted regular non-executable file replacements/deletions with rollback-or-destroy semantics.
 
-This repository defines `indentured:check` as `scripts/check-darwin.sh`. That convention means “this repository's check for the selected Quartz capability profile,” not a portable local check; it deliberately refuses non-Apple-silicon-Darwin execution. From a trusted client:
+This repository defines `indentured:check` as `scripts/check-darwin.sh`. That convention means “this repository's check for the selected Quartz capability profile,” not a portable local check; it deliberately refuses non-Apple-silicon-Darwin execution. Before publishing or pinning a candidate revision, `sd indentured-server check/darwin` uploads the current Jujutsu candidate through the already-deployed server and runs this native check. `sd indentured-server check` runs the complete local gate first and then that self-hosted Darwin gate. The project Final Review configuration invokes the same two tasks in order and feeds a failure back to the agent before review. From a trusted client:
 
 ```sh
 export INDENTURED_SERVER_ENDPOINT=https://mac-builder.example.ts.net
 export INDENTURED_SERVER_TOKEN_FILE=/absolute/operator-local/bearer-token
-indentured run repo_check
+sd indentured-server check/darwin
 session_id=$(indentured session start repo_session)
 indentured session action "$session_id" observe --input ./observe.json
 indentured session stop "$session_id"

@@ -73,6 +73,30 @@ cargo build --locked --offline --release --all-features
 
 The offline Cargo commands require the locked crates to be present in the local Cargo cache. Nix package builds vendor dependencies from `Cargo.lock` and are the clean-checkout reproducibility path.
 
+### Self-hosted Darwin gate
+
+The `sd` tasks make native Darwin compilation a pre-publication gate instead of
+a post-deployment discovery:
+
+```sh
+sd indentured-server check/local   # complete pinned local validation
+sd indentured-server check/darwin  # upload the current Jujutsu candidate through Quartz repo_check
+sd indentured-server check         # local first, then Darwin
+```
+
+`check/darwin` uses the configured `indentured` client and the currently deployed
+server to run this repository's `indentured:check` task on Apple-silicon Darwin.
+The candidate is the current explicit Jujutsu working-copy revision; the task
+publishes nothing and changes no server configuration. Run it before publishing
+or pinning a new server revision. The deployed server must already expose the
+`repo_check` capability, and the client must have its endpoint and bearer file
+configured outside the repository.
+
+Project `.pi/final-review.json` runs `check/local` followed by `check/darwin` as
+Final Review command gates after mutating agent turns. A failure is sent back to
+the agent and review is deferred until the candidate changes and both checks
+pass; automatic model review remains disabled by project configuration.
+
 The Cargo release build creates:
 
 - `target/release/indentured-server`

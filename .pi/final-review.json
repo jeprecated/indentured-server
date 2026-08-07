@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "autoReview": false,
+  "requireTurnChanges": true,
+  "requireAgentMutation": true,
+  "readOnlyTurnFinalization": "skip",
+  "skipDuplicateDiff": true,
+  "finalChecks": {
+    "enabled": true,
+    "commands": [
+      {
+        "name": "local validation",
+        "command": "sd indentured-server check/local",
+        "timeoutMs": 600000
+      },
+      {
+        "name": "native Darwin via deployed Quartz",
+        "command": "sd indentured-server check/darwin",
+        "timeoutMs": 1800000
+      }
+    ],
+    "timeoutMs": 600000,
+    "continueOnFailure": false,
+    "sendFollowUp": true
+  }
+}

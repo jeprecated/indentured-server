@@ -1,0 +1,42 @@
+version: 1
+
+project:
+  id: indentured-server
+  name: Indentured Server
+  aliases:
+    - indentured
+  workArea: Remote build execution
+  visibility: public-code / service and CLI
+  dir: .
+
+tasks:
+  check:
+    desc: Run local validation, then self-host the candidate on native Darwin through Quartz
+    run: |
+      set -euo pipefail
+      sd indentured-server check/local
+      sd indentured-server check/darwin
+
+  check/local:
+    desc: Run the complete pinned local validation gate
+    run: |
+      set -euo pipefail
+      devenv tasks run cargo:fmt
+      devenv tasks run cargo:clippy
+      devenv tasks run cargo:test
+      devenv tasks run cargo:release-build
+      devenv tasks run integration:packaged-local
+      devenv tasks run nix:flake-check
+
+  check/darwin:
+    desc: Upload the current candidate to the deployed Quartz server for native Apple-silicon Darwin checks
+    run: indentured run repo_check
+
+passthrough:
+  cargo:
+    desc: Run Cargo inside the pinned Devenv shell
+    run: devenv shell -- cargo "$@"
+
+  devenv:
+    desc: Run Devenv in the project
+    run: devenv "$@"
