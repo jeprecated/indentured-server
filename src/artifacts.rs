@@ -138,10 +138,25 @@ pub(crate) fn collect_artifacts_zip_controlled(
     let mut matched_files: HashMap<PathBuf, FileIdentity> = HashMap::new();
     let mut traversal = TraversalLimits::new(config.max_files, config.max_depth);
 
-    // Walk once and apply every server-owned pattern to each candidate. This keeps
-    // file-count/depth enforcement in front of recursive descent and accumulation;
-    // no glob implementation performs an independent unbounded recursive walk.
-    for entry in WalkDir::new(build_root).follow_links(false) {
+    // Walk from the already-opened workspace root, pruning branches outside the
+    // minimal literal prefixes named by the server-owned include patterns. This
+    // preserves WalkDir's no-symlink traversal while retained dependency trees
+    // unrelated to a small action artifact do not consume the artifact limit.
+    let walk_prefixes = artifact_walk_prefixes(&spec.include);
+    let walker = WalkDir::new(build_root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            let Ok(rel) = entry.path().strip_prefix(build_root) else {
+                return true;
+            };
+            rel.as_os_str().is_empty()
+                || walk_prefixes
+                    .iter()
+                    .any(|prefix| prefix.starts_with(rel) || rel.starts_with(prefix))
+        });
+    for entry in walker {
         check_cancelled(cancelled)?;
         let entry = entry.map_err(|source| ArtifactError::Io {
             context: "walk artifact root",
@@ -443,6 +458,40 @@ fn open_file_beneath(root_fd: RawFd, relative: &Path) -> Result<File, ArtifactEr
         }
     }
     unreachable!("nonempty path has final component")
+}
+
+fn artifact_walk_prefixes(include_patterns: &[String]) -> Vec<PathBuf> {
+    let mut prefixes = include_patterns
+        .iter()
+        .map(|pattern| {
+            let mut prefix = PathBuf::new();
+            for component in Path::new(pattern).components() {
+                let part = match component {
+                    std::path::Component::CurDir => continue,
+                    std::path::Component::Normal(part) => part,
+                    _ => break,
+                };
+                if part
+                    .as_bytes()
+                    .iter()
+                    .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+                {
+                    break;
+                }
+                prefix.push(part);
+            }
+            prefix
+        })
+        .collect::<Vec<_>>();
+    prefixes.sort_by_key(|prefix| prefix.components().count());
+
+    let mut minimal = Vec::<PathBuf>::new();
+    for prefix in prefixes {
+        if !minimal.iter().any(|ancestor| prefix.starts_with(ancestor)) {
+            minimal.push(prefix);
+        }
+    }
+    minimal
 }
 
 fn compile_patterns(patterns: &[String], field: &str) -> Result<Vec<glob::Pattern>, ArtifactError> {
@@ -945,6 +994,73 @@ mod tests {
         let zip_path = config.storage_root.join("bld").join("artifacts.zip");
         assert!(zip_path.exists());
         assert_eq!(archive.size, std::fs::metadata(zip_path).unwrap().len());
+    }
+
+    #[test]
+    fn collect_artifacts_skips_unrelated_retained_workspace_trees() {
+        let root = tempdir().expect("tempdir");
+        let action = root.path().join(".indentured-output/action");
+        let dependencies = root.path().join("node_modules/package");
+        std::fs::create_dir_all(&action).expect("mkdir action");
+        std::fs::create_dir_all(&dependencies).expect("mkdir dependencies");
+        std::fs::write(action.join("screen.png"), "png").expect("write screenshot");
+        for index in 0..3 {
+            std::fs::write(
+                dependencies.join(format!("dependency-{index}")),
+                "large tree",
+            )
+            .expect("write dependency");
+        }
+
+        let mut config = artifacts_config(root.path());
+        config.max_files = 3;
+        let spec = ArtifactSpec {
+            include: vec![
+                ".indentured-output/action/**".to_string(),
+                ".indentured-output/action/screen.png".to_string(),
+            ],
+            exclude: vec![],
+        };
+
+        let archive = collect_artifacts_zip(root.path(), &spec, &config, "bld")
+            .expect("collect")
+            .archive
+            .expect("archive");
+        assert!(archive.path.ends_with("artifacts.zip"));
+        assert_eq!(
+            zip_entry_names(&config.storage_root.join("bld").join("artifacts.zip")),
+            vec![".indentured-output/action/screen.png"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_artifacts_does_not_follow_an_include_root_symlink() {
+        let root = tempdir().expect("tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        std::fs::write(outside.path().join("one"), "one").expect("write one");
+        std::fs::write(outside.path().join("two"), "two").expect("write two");
+        symlink(outside.path(), root.path().join("action")).expect("symlink action");
+
+        let mut config = artifacts_config(root.path());
+        config.max_files = 1;
+        let spec = ArtifactSpec {
+            include: vec!["action".to_string()],
+            exclude: vec![],
+        };
+
+        assert!(matches!(
+            collect_artifacts_zip(root.path(), &spec, &config, "bld"),
+            Err(ArtifactError::UnsupportedFile { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_walk_prefixes_ignore_current_directory_components() {
+        assert_eq!(
+            artifact_walk_prefixes(&["./out/**".to_string()]),
+            vec![PathBuf::from("out")]
+        );
     }
 
     #[test]
