@@ -431,7 +431,7 @@ fn publication_rejects_symlinks_and_untrusted_archive_paths() {
 }
 
 #[test]
-fn transport_authenticates_same_uid_and_survives_invalid_request() {
+fn deadline_transport_authenticates_same_uid_and_survives_invalid_request() {
     for request in [
         b"not json".to_vec(),
         serde_json::to_vec(&Request::Capture {
@@ -445,7 +445,11 @@ fn transport_authenticates_same_uid_and_survives_invalid_request() {
             handle_connection(&mut server, &Fake::good(), uid()).unwrap()
         });
         write_frame(&mut client, &request).unwrap();
-        let bytes = read_frame(&mut client, MAX_ARCHIVE).unwrap();
+        let bytes = read_frame(
+            &mut DeadlineIo::new(&client, Duration::from_secs(5)).unwrap(),
+            MAX_ARCHIVE,
+        )
+        .unwrap();
         let (manifest, images) = decode_archive(&bytes).unwrap();
         if request == b"not json" {
             assert_eq!(manifest.status, "failed");
@@ -478,7 +482,96 @@ fn kernel_peer_identity_rejects_wrong_uid_before_reading_requests() {
 }
 
 #[test]
-fn absolute_transfer_deadlines_cannot_be_extended_by_partial_reads() {
+fn deadline_reader_drains_frame_after_peer_close() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let payload = b"complete buffered response";
+    write_frame(&mut server, payload).unwrap();
+    drop(server);
+    assert_eq!(
+        read_frame(
+            &mut DeadlineIo::new(&client, Duration::from_secs(5)).unwrap(),
+            MAX_ARCHIVE,
+        )
+        .unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn deadline_reader_drains_payload_when_peer_closes_after_header() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let payload = b"payload";
+    write_frame(&mut server, payload).unwrap();
+    let mut io = DeadlineIo::new(&client, Duration::from_secs(5)).unwrap();
+    let deadline = io.deadline;
+    let mut header = [0; 4];
+    io.read_exact(&mut header).unwrap();
+    assert_eq!(u32::from_be_bytes(header), payload.len() as u32);
+    drop(server);
+    let mut received = [0; 7];
+    io.read_exact(&mut received).unwrap();
+    assert_eq!(&received, payload);
+    assert_eq!(io.deadline, deadline);
+    assert_eq!(io.read(&mut [0; 1]).unwrap(), 0);
+}
+
+#[test]
+fn deadline_reader_reports_truncated_frame_as_eof() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    server.write_all(&100u32.to_be_bytes()).unwrap();
+    server.write_all(b"short").unwrap();
+    drop(server);
+    assert_eq!(
+        read_frame(
+            &mut DeadlineIo::new(&client, Duration::from_secs(5)).unwrap(),
+            MAX_ARCHIVE,
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
+fn deadline_writer_reports_closed_peer_without_sigpipe() {
+    let (client, server) = UnixStream::pair().unwrap();
+    drop(server);
+    let error = DeadlineIo::new(&client, Duration::from_secs(5))
+        .unwrap()
+        .write_all(b"request")
+        .unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ));
+}
+
+#[test]
+fn deadline_io_bounds_stalled_reads_and_backpressured_writes() {
+    let (client, _server) = UnixStream::pair().unwrap();
+    let mut io = DeadlineIo::new(&client, Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        io.read(&mut [0; 1]).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    // Larger than the Unix socket buffer; the peer deliberately never drains it.
+    let bytes = vec![0; MAX_ARCHIVE];
+    let mut io = DeadlineIo::new(&client, Duration::from_millis(20)).unwrap();
+    let deadline = io.deadline;
+    // Fail before a large send if descriptor mode regresses: MSG_DONTWAIT alone
+    // does not keep Darwin's Unix send path from blocking under backpressure.
+    let flags = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_ne!(flags & libc::O_NONBLOCK, 0);
+    assert_eq!(
+        io.write_all(&bytes).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(io.deadline, deadline);
+}
+
+#[test]
+fn deadline_expiry_cannot_be_extended_by_partial_reads() {
     let (client, _server) = UnixStream::pair().unwrap();
     let mut io = DeadlineIo {
         stream: &client,

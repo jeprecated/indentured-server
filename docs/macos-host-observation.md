@@ -222,7 +222,12 @@ Requests are limited to 4 KiB; an observation permits at most 32 images and
 63 MiB of PNGs in a 64 MiB transfer (manifest at most 1 MiB). Capture work has a
 45-second deadline, with at most 15 seconds per native tool. If an application
 exceeds these limits, select individual windows. Socket transfers also have
-absolute deadlines; a slow sender cannot extend them by trickling bytes.
+absolute deadlines; a slow sender cannot extend them by trickling bytes. Transfers
+put their private sockets in nonblocking descriptor mode and use nonblocking I/O
+with deadline-bounded polling, including for a stalled receiver. Darwin's Unix
+send path can still block with `MSG_DONTWAIT` alone, so descriptor mode is required. They drain buffered responses after the helper closes its connection.
+They do not repeatedly set socket timeouts: Darwin rejects those updates after
+peer close with `EINVAL`, even while a complete payload remains readable.
 
 ## Native acceptance gate
 
@@ -238,7 +243,13 @@ spellings, wrong-user/locked-session denials, and three equal-size displays with
 negative origins. Node is a pinned test-only dependency, not a helper runtime.
 On Darwin, `scripts/check-darwin.sh` additionally executes the shipped CF bridge
 against real, synthetic native CF collections and CGRect values without touching
-GUI contents or requesting permissions. These checks do **not** attest GUI/TCC.
+GUI contents or requesting permissions. The `host-observation-transport` flake
+check runs the Rust socket-deadline tests natively on each supported platform,
+including peer closure before the header or between header and payload reads,
+truncated frames, closed-peer writes, and stalled-transfer deadlines. This check
+is included in the Darwin gate; package builds alone disable Cargo tests and would
+not exercise these runtime socket semantics. Filesystem-ownership fixtures still
+run in the full local Cargo suite, outside Nix's isolated UID mapping. These checks do **not** attest GUI/TCC.
 Before declaring the deployed
 Mac usable, run these checks through its **actual LaunchAgent and authenticated
 Indentured host API/artifact flow**, not merely from Terminal:

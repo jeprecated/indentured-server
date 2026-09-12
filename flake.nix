@@ -134,6 +134,17 @@
           indentured-server-package = server;
           indentured-package = client;
           indentured-host-package = host;
+          # Pure socket tests also run inside native Nix sandboxes. Filesystem
+          # ownership fixtures remain in the full Cargo suite outside UID remapping.
+          host-observation-transport = server.overrideAttrs {
+            doCheck = true;
+            cargoTestFlags = [
+              "--lib"
+              "host_observation::tests::deadline_"
+              "--all-features"
+            ];
+            __darwinAllowLocalNetworking = true;
+          };
           host-observation-jxa = pkgs.runCommand "indentured-host-observation-jxa" { } ''
             export HOST_OBSERVATION_SCRIPT=${./src/host_observation/enumerate.js}
             ${pkgs.nodejs}/bin/node --test ${./tests/host_observation_jxa.cjs}

@@ -619,11 +619,15 @@ struct DeadlineIo<'a> {
     deadline: Instant,
 }
 impl<'a> DeadlineIo<'a> {
-    fn new(stream: &'a UnixStream, timeout: Duration) -> Self {
-        Self {
+    fn new(stream: &'a UnixStream, timeout: Duration) -> io::Result<Self> {
+        // Darwin's Unix send path can block despite MSG_DONTWAIT. These private
+        // transport sockets must also have nonblocking descriptor mode enabled.
+        // Unlike SO_RCVTIMEO, this remains valid after the peer has closed.
+        stream.set_nonblocking(true)?;
+        Ok(Self {
             stream,
             deadline: Instant::now() + timeout,
-        }
+        })
     }
     fn remaining(&self) -> io::Result<Duration> {
         self.deadline
@@ -636,17 +640,70 @@ impl<'a> DeadlineIo<'a> {
                 )
             })
     }
+    fn retry_io(
+        &self,
+        events: libc::c_short,
+        mut operation: impl FnMut() -> libc::ssize_t,
+    ) -> io::Result<usize> {
+        loop {
+            self.remaining()?;
+            let count = operation();
+            if count >= 0 {
+                return Ok(count as usize);
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {}
+                _ => return Err(error),
+            }
+            let mut poll = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let timeout = self.remaining()?.as_millis().clamp(1, i32::MAX as u128) as i32;
+            if unsafe { libc::poll(&mut poll, 1, timeout) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            // Readiness is only a hint. Retry nonblocking I/O even on HUP/ERR:
+            // a closed peer can still have a complete response buffered here.
+        }
+    }
 }
 impl Read for DeadlineIo<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(bytes)
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        // Darwin rejects SO_RCVTIMEO updates after peer close, even while data
+        // remains readable. Nonblocking I/O avoids those timeout updates.
+        self.retry_io(libc::POLLIN, || unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT,
+            )
+        })
     }
 }
 impl Write for DeadlineIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(bytes)
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.retry_io(libc::POLLOUT, || unsafe {
+            libc::send(
+                self.stream.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
@@ -657,7 +714,7 @@ fn handle_connection(stream: &mut UnixStream, backend: &dyn Backend, allow_uid: 
     check_peer(stream, allow_uid)?;
     let response = (|| {
         let bytes = read_frame(
-            &mut DeadlineIo::new(stream, Duration::from_secs(5)),
+            &mut DeadlineIo::new(stream, Duration::from_secs(5)).map_err(|e| e.to_string())?,
             MAX_REQUEST,
         )
         .map_err(|e| e.to_string())?;
@@ -666,7 +723,7 @@ fn handle_connection(stream: &mut UnixStream, backend: &dyn Backend, allow_uid: 
     })()
     .or_else(error_archive)?;
     write_frame(
-        &mut DeadlineIo::new(stream, Duration::from_secs(10)),
+        &mut DeadlineIo::new(stream, Duration::from_secs(10)).map_err(|e| e.to_string())?,
         &response,
     )
 }
@@ -756,11 +813,11 @@ fn connect(socket: &Path, request: &Request, peer_uid: u32) -> Result<Vec<u8>> {
     let stream = connect_bounded(socket)?;
     check_peer(&stream, peer_uid)?;
     write_frame(
-        &mut DeadlineIo::new(&stream, Duration::from_secs(5)),
+        &mut DeadlineIo::new(&stream, Duration::from_secs(5)).map_err(|e| e.to_string())?,
         &serde_json::to_vec(request).map_err(|e| e.to_string())?,
     )?;
     read_frame(
-        &mut DeadlineIo::new(&stream, Duration::from_secs(60)),
+        &mut DeadlineIo::new(&stream, Duration::from_secs(60)).map_err(|e| e.to_string())?,
         MAX_ARCHIVE,
     )
     .map_err(|error| {
