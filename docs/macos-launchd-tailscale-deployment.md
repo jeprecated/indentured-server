@@ -132,6 +132,17 @@ The managed-session regression uses only distinguishable fake file-backed extern
 
 This is package/protocol evidence, not a production security bypass or a native macOS/CoreSimulator runtime attestation. The supported unauthenticated loopback setting exists only inside the isolated test and does not change production defaults or bearer behavior. Tasks are trusted server-owned commands, not caller-provided shell authority. The harness uses no forge, SSH/remote-shell transport, source publication, Xcode, or remote Mac. It remains a Devenv/script check rather than a universal flake check because loopback networking and privilege setup are not portable across all Nix build sandboxes.
 
+## Optional graphical host observation
+
+For terminal/Zellij failures or app state outside the simulator driver, deploy
+[`indentured-host`](macos-host-observation.md) as a separate Aqua LaunchAgent.
+Its read-only app/window listing and selected-window/application/desktop PNG
+capture use ordinary session action artifacts. The observation socket is a
+separate, explicitly authorized boundary; do not expose the daemon's protected
+control socket or change the task identity to a personal desktop user. The guide
+includes a LaunchAgent/task fragment, first-use permission setup, local-image
+instructions for agents, and a native GUI/TCC acceptance gate.
+
 ## Reusable repository capability profiles
 
 Deploy schema 12 once with host profiles named for capabilities rather than individual repository scripts. `repo_check` runs each uploaded repository's conventional `indentured:check` Devenv task. `repo_session` fixes the host identity, limits, lifecycle, and artifact policy while the uploaded repository supplies conventional setup/start/action/stop tasks:

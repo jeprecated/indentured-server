@@ -27,6 +27,7 @@ The global active-build limit defaults to one. Admission uses an immediate non-w
 
 - `indentured-server`: host daemon.
 - `indentured`: client that pins and packages the current Jujutsu tree (or reviewed filesystem patterns outside Jujutsu), submits one named task, streams output, and stores non-destructive run evidence.
+- `indentured-host`: optional macOS GUI LaunchAgent/action helper that lists graphical apps/windows and returns exact-window, application-window, or whole-desktop PNGs. See [host observation](docs/macos-host-observation.md) for explicit permissions and deployment; it works independently of terminal/Zellij input.
 
 The service supports HTTP/HTTPS and explicitly enabled Unix-domain sockets. UDS is disabled by default and bypasses bearer authentication: its parent-directory ownership and socket mode are its entire authority boundary. Every enabled UDS deployment requires a root daemon, a configured non-root task identity distinct from the daemon/socket owner, no socket group, and mode `0600` or stricter. Startup fails closed otherwise. A hardened macOS deployment must not expose that socket to its build identity. Built-in rustls TLS is optional server-side transport encryption for generic direct deployments; it does not authenticate clients or accept a client-CA setting. Bearer authentication remains required wherever application authority is needed.
 
@@ -39,11 +40,13 @@ The flake exposes native packages and apps for `x86_64-linux`, `aarch64-linux`, 
 ```sh
 nix build --no-link .#indentured-server
 nix build --no-link .#indentured
+nix build --no-link .#indentured-host
 nix run .#indentured-server -- --help
 nix run .#indentured -- --help
+nix run .#indentured-host -- --help
 ```
 
-`nix build .` and `nix run .` default to the `indentured-server` daemon. The server and client packages are separate outputs of one Cargo compilation; each named package contains only its matching executable. `Cargo.lock` is the authoritative Rust dependency lock.
+`nix build .` and `nix run .` default to the `indentured-server` daemon. The server, client and host-helper packages are separate outputs of one Cargo compilation; each named package contains only its matching executable. Host screenshot capture is macOS-only; Linux builds attest its CLI/protocol and offline fake-backend tests, not a graphical capture backend. `Cargo.lock` is the authoritative Rust dependency lock.
 
 Run `nix flake check --print-build-logs` natively on each supported system. A Linux check builds only that native Linux system's outputs; evaluating the `aarch64-darwin` attributes from Linux does not attest Darwin SDK linkage or runtime behavior. On Apple-silicon Darwin, `scripts/check-darwin.sh` performs the native package/layout checks and package builds. The Darwin package and Devenv shell use the Nix-provided clang wrapper, Apple SDK/frameworks, and Rust toolchain without invoking ambient/host `xcrun` or `xcodebuild` and without depending on `/Applications/Xcode`; Nix-provided SDK tooling is allowed. The full `cargo:test` task remains a Linux validation obligation because its protected-runtime credential test currently uses Linux `/run/user/<uid>`; Darwin flake validation intentionally claims package/compile coverage only. The native hardened macOS deployment behavioral gate below also remains required.
 
@@ -101,6 +104,7 @@ The Cargo release build creates:
 
 - `target/release/indentured-server`
 - `target/release/indentured`
+- `target/release/indentured-host`
 
 ## Server configuration
 
@@ -471,6 +475,17 @@ Service stdout/stderr is drained continuously. Startup bytes remain part of the 
 Before the first service spawn the daemon durably records `starting_services` metadata in protected storage, then fsyncs recorded supervisor/service identities after every spawn. The daemon-control channel is established with close-on-exec protection before spawning; until `RunningService` owns it, an RAII guard closes control and performs bounded supervisor termination/reaping on every setup or status error, so the metadata write-after-spawn interval cannot orphan the service. Each supervisor moves into a process group separate from the daemon, owns the actual service group behind an armed RAII guard, and watches a daemon control pipe; daemon process-group death therefore leaves the supervisor alive to perform bounded TERM, configured shutdown wait, KILL escalation, and reap verification. Daemon-side stop independently terminates and verifies the recorded service group after bounded supervisor handling, so a dead or wedged supervisor is never trusted as the sole cleanup owner. Normal cleanup first cancels/joins the active operation, then stops services in reverse start order before idempotent teardown, workspace removal, and permit release. A pathological survivor records `service_cleanup_failed` without retaining the admission permit forever. If supervisor or service-group disappearance cannot be proven within the bound, protected metadata is deliberately retained for fail-closed startup reconciliation even though the workspace, in-memory session, and permit are released. Startup reconciliation never recovers a session: it waits conservatively for every recorded supervisor to disappear before teardown/removal, verifies that the recorded service leader and group are gone, and refuses unsafe cleanup rather than signaling a possibly reused PID.
 
 Initialization, actions, teardown, and services retain bounded whole-process-group termination and reaping behavior. Process groups are cleanup rather than a sandbox against deliberate escape. The contract adds no session list, reset, reconnect, generic service-control, arbitrary-command, workspace, or filesystem endpoint.
+
+## Remote graphical debugging
+
+When app automation or a terminal pane fails, use the optional
+[`indentured-host` capability](docs/macos-host-observation.md) to list running GUI
+apps and their windows, capture an exact window or all eligible windows of an
+app, or capture every desktop display. A separately provisioned Aqua LaunchAgent
+performs read-only capture; existing managed-session actions return PNGs through
+normal artifact downloads. The agent must open the downloaded local image with
+its image-capable tool. This does not grant remote shell or keyboard authority,
+change the daemon's identity, or enable desktop access by default.
 
 ## macOS launchd and Tailscale deployment
 

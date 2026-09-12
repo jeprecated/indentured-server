@@ -229,7 +229,11 @@ fn separate_start_action_and_stop_invocations_preserve_evidence_and_authority() 
     assert_eq!(provenance["session_id"], "ses_cli");
     assert_eq!(provenance["status"], "ready");
 
-    let archive = zip_artifact("screen.txt", b"pixels");
+    // Real image bytes must survive the action archive and become locally
+    // readable evidence, not merely a path printed by the remote task.
+    let image_path = ".indentured-output/action/host-test/image-0001.png";
+    let image = include_bytes!("fixtures/host-observation.png");
+    let archive = zip_artifact(image_path, image);
     let action_exit = format!(
         concat!(
             "{{\"type\":\"action\",\"session_id\":\"ses_cli\",\"action_id\":\"act_cli\",\"action\":\"observe\",\"status\":\"started\"}}\n",
@@ -292,8 +296,8 @@ fn separate_start_action_and_stop_invocations_preserve_evidence_and_authority() 
     assert_eq!(artifact_request.path, "/v1/builds/bld_cli/artifacts.zip");
     let result = only_result(&state);
     assert_eq!(
-        fs::read(result.join("artifacts/screen.txt")).unwrap(),
-        b"pixels"
+        fs::read(result.join("artifacts").join(image_path)).unwrap(),
+        image
     );
     let provenance: serde_json::Value =
         serde_json::from_slice(&fs::read(result.join("provenance.json")).unwrap()).unwrap();

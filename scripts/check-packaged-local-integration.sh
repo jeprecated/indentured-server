@@ -16,6 +16,7 @@ printf '%s\n' '{"probe":"devenv-stdin"}' | devenv tasks run integration:stdin-pr
 
 server_out=$(nix build --no-link --print-out-paths .#indentured-server)
 client_out=$(nix build --no-link --print-out-paths .#indentured)
+host_out=$(nix build --no-link --print-out-paths .#indentured-host)
 
 test "$(printf '%s\n' "$server_out" | wc -l | tr -d ' ')" -eq 1 || {
   echo "expected one server output path" >&2
@@ -26,10 +27,21 @@ test "$(printf '%s\n' "$client_out" | wc -l | tr -d ' ')" -eq 1 || {
   exit 1
 }
 
+test "$(printf '%s\n' "$host_out" | wc -l | tr -d ' ')" -eq 1 || {
+  echo "expected one host-helper output path" >&2
+  exit 1
+}
+
 test -x "$server_out/bin/indentured-server"
 test ! -e "$server_out/bin/indentured"
 test -x "$client_out/bin/indentured"
 test ! -e "$client_out/bin/indentured-server"
+test -x "$host_out/bin/indentured-host"
+test ! -e "$host_out/bin/indentured-server"
+test ! -e "$host_out/bin/indentured"
+test ! -e "$server_out/bin/indentured-host"
+test ! -e "$client_out/bin/indentured-host"
+"$host_out/bin/indentured-host" --help >/dev/null
 
 export INDENTURED_TEST_SERVER_BIN="$server_out/bin/indentured-server"
 export INDENTURED_TEST_CLIENT_BIN="$client_out/bin/indentured"

@@ -36,6 +36,7 @@
             outputs = [
               "out"
               "client"
+              "host"
             ];
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
@@ -56,12 +57,18 @@
             AWS_LC_SYS_CMAKE_BUILDER = "1";
 
             postInstall = ''
-              mkdir -p "$client/bin"
+              mkdir -p "$client/bin" "$host/bin"
               mv "$out/bin/indentured" "$client/bin/indentured"
+              mv "$out/bin/indentured-host" "$host/bin/indentured-host"
               test -x "$out/bin/indentured-server"
               test ! -e "$out/bin/indentured"
               test -x "$client/bin/indentured"
               test ! -e "$client/bin/indentured-server"
+              test -x "$host/bin/indentured-host"
+              test ! -e "$out/bin/indentured-host"
+              test ! -e "$client/bin/indentured-host"
+              test ! -e "$host/bin/indentured-server"
+              test ! -e "$host/bin/indentured"
             '';
 
             meta = {
@@ -81,6 +88,11 @@
           default = package;
           indentured-server = package;
           indentured = clientPackage;
+          indentured-host = package.host // {
+            meta = package.meta // {
+              mainProgram = "indentured-host";
+            };
+          };
         }
       );
 
@@ -102,6 +114,11 @@
           default = server;
           indentured-server = server;
           indentured = client;
+          indentured-host = {
+            type = "app";
+            program = "${self.packages.${system}.indentured-host}/bin/indentured-host";
+            meta.description = "Observe the macOS desktop through a private per-user helper";
+          };
         }
       );
 
@@ -111,15 +128,23 @@
           pkgs = import nixpkgs { inherit system; };
           server = self.packages.${system}.indentured-server;
           client = self.packages.${system}.indentured;
+          host = self.packages.${system}.indentured-host;
         in
         {
           indentured-server-package = server;
           indentured-package = client;
+          indentured-host-package = host;
           package-layout = pkgs.runCommand "indentured-package-layout" { } ''
             test -x "${server}/bin/indentured-server"
             test ! -e "${server}/bin/indentured"
             test -x "${client}/bin/indentured"
             test ! -e "${client}/bin/indentured-server"
+            test -x "${host}/bin/indentured-host"
+            test ! -e "${server}/bin/indentured-host"
+            test ! -e "${client}/bin/indentured-host"
+            test ! -e "${host}/bin/indentured-server"
+            test ! -e "${host}/bin/indentured"
+            "${host}/bin/indentured-host" --help >/dev/null
             touch "$out"
           '';
         }

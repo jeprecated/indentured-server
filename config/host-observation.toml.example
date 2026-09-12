@@ -1,0 +1,40 @@
+# Merge these tasks into a schema-12 daemon configuration; this is not a
+# standalone server configuration. Keep build.run_as_user/run_as_group unchanged.
+# See docs/macos-host-observation.md for the separate GUI LaunchAgent/socket.
+# Replace the pinned helper path, socket path, and GUI UID before enabling.
+
+[tasks.host_observation]
+executable = "/usr/bin/true"
+args = []
+cwd = "."
+timeout_sec = 30
+workspace = "fresh"
+environment = {}
+artifacts = { include = [], exclude = [] }
+
+[tasks.host_observation.session]
+idle_timeout_sec = 300
+max_lifetime_sec = 1800
+
+# Stopping the session cleans its workspace, not the independent GUI helper.
+[tasks.host_observation.session.teardown]
+executable = "/usr/bin/true"
+args = []
+timeout_sec = 10
+
+[tasks.host_observation.session.action_dispatcher]
+executable = "/nix/store/REPLACE_WITH_HOST_OUTPUT/bin/indentured-host"
+args = ["action", "--socket", "/Users/REPLACE_GUI_USER/.indentured-host/control.sock", "--peer-uid", "501"]
+timeout_sec = 120
+allow_unlisted = false
+
+[tasks.host_observation.session.action_dispatcher.actions.host-list]
+# Allow the helper's bounded connection/response failure to publish a manifest.
+timeout_sec = 120
+
+[tasks.host_observation.session.action_dispatcher.actions.host-capture]
+timeout_sec = 120
+
+[tasks.host_observation.session.action_dispatcher.artifacts]
+include = [".indentured-output/action/host-*/**"]
+exclude = []

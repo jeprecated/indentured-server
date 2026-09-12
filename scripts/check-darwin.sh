@@ -6,8 +6,30 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
   exit 2
 fi
 
+/usr/bin/plutil -lint launchd/indentured-host.plist.example
 nix flake check --print-build-logs
-nix build --no-link --print-build-logs .#indentured-server .#indentured
+nix build --no-link --print-build-logs .#indentured-server .#indentured .#indentured-host
+
+# Native package checks do not prove GUI/TCC or screenshot runtime behavior.
+# This optional operator gate must exercise the deployed LaunchAgent and remote
+# artifact flow described in docs/macos-host-observation.md.
+if [ -n "${INDENTURED_DARWIN_HOST_GATE:-}" ]; then
+  case "$INDENTURED_DARWIN_HOST_GATE" in
+    /*) ;;
+    *)
+      echo "INDENTURED_DARWIN_HOST_GATE must be an absolute executable path" >&2
+      exit 2
+      ;;
+  esac
+  test -x "$INDENTURED_DARWIN_HOST_GATE" || {
+    echo "INDENTURED_DARWIN_HOST_GATE is not executable" >&2
+    exit 2
+  }
+  "$INDENTURED_DARWIN_HOST_GATE"
+  echo "native host-observation deployment gate: attested by $INDENTURED_DARWIN_HOST_GATE"
+else
+  echo "native host-observation deployment gate: UNATTESTED (set INDENTURED_DARWIN_HOST_GATE to the operator-owned live gate)" >&2
+fi
 
 # Native package checks do not prove launchd task identity or CoreSimulator behavior.
 # Deployment automation may provide an absolute, operator-owned gate executable that

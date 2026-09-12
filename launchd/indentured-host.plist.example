@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.example.indentured-host</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/nix/store/REPLACE_WITH_HOST_OUTPUT/bin/indentured-host</string>
+    <string>serve</string>
+    <string>--socket</string>
+    <string>/Users/REPLACE_GUI_USER/.indentured-host/control.sock</string>
+    <!-- Exact existing build task UID, not the human GUI account. -->
+    <string>--allow-uid</string>
+    <string>502</string>
+    <!-- Operator-provisioned observation-only group, containing both accounts. -->
+    <string>--socket-group</string>
+    <string>503</string>
+    <!-- Add the request-permission option only for initial attended provisioning. -->
+  </array>
+  <!-- Install as a LaunchAgent in the selected user's gui/<UID> domain.
+       This is NOT a root LaunchDaemon; do not add UserName=root. -->
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE_GUI_USER</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_GUI_USER/.indentured-host/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_GUI_USER/.indentured-host/stderr.log</string>
+</dict>
+</plist>
