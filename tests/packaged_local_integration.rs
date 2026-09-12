@@ -1530,3 +1530,36 @@ fn packaged_managed_session_flow() {
     server.terminate();
     assert_no_packaged_binary_descendants(&server_bin, &client_bin);
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/host_builtin.rs"]
+mod host_builtin;
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Nix-packaged binaries; run integration:packaged-local"]
+fn packaged_host_observation_is_source_free_and_uses_normal_artifacts() {
+    if std::env::var_os("INDENTURED_HOST_TEST_ROOT").is_none() {
+        let status = Command::new("/bin/sh")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/check-packaged-host-isolated.sh"
+            ))
+            .arg(std::env::current_exe().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated packaged host fixture failed");
+        return;
+    }
+    let server = required_package_binary(
+        "INDENTURED_TEST_SERVER_BIN",
+        "indentured-server",
+        "indentured",
+    );
+    let client = required_package_binary(
+        "INDENTURED_TEST_CLIENT_BIN",
+        "indentured",
+        "indentured-server",
+    );
+    host_builtin::round_trip(&server, &client);
+}

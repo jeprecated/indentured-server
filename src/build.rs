@@ -2558,6 +2558,7 @@ timeout_sec = 1
             workspace: WorkspacePolicy::Fresh,
         };
         let config = Config {
+            host_observation: Default::default(),
             schema_version: CONFIG_SCHEMA_VERSION.to_string(),
             service: ServiceConfig::default(),
             build: BuildConfig {

@@ -10,10 +10,10 @@
     <string>serve</string>
     <string>--socket</string>
     <string>/Users/REPLACE_GUI_USER/.indentured-host/control.sock</string>
-    <!-- Exact existing build task UID, not the human GUI account. -->
+    <!-- Exact daemon UID (typically 0), never the build-task or GUI UID. -->
     <string>--allow-uid</string>
-    <string>502</string>
-    <!-- Operator-provisioned observation-only group, containing both accounts. -->
+    <string>0</string>
+    <!-- Observation-only group for daemon and GUI accounts, NOT build tasks. -->
     <string>--socket-group</string>
     <string>503</string>
     <!-- Add the request-permission option only for initial attended provisioning. -->

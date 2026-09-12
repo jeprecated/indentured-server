@@ -38,62 +38,29 @@ pub enum Request {
     Capture { target: Target },
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "action", deny_unknown_fields)]
-enum Envelope {
-    #[serde(rename = "host-list")]
-    List {
-        schema_version: String,
-        input: EmptyInput,
-    },
-    #[serde(rename = "host-capture")]
-    Capture {
-        schema_version: String,
-        input: Target,
-    },
-}
-
-struct EmptyInput;
-impl<'de> Deserialize<'de> for EmptyInput {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        // A derived empty struct also accepts []; the dispatcher contract is an
-        // actual JSON object, so deserialize a map explicitly.
-        let value =
-            std::collections::BTreeMap::<String, serde::de::IgnoredAny>::deserialize(deserializer)?;
-        if !value.is_empty() {
-            return Err(serde::de::Error::custom(
-                "host-list input must be an empty object",
-            ));
-        }
-        Ok(Self)
-    }
-}
-
-pub fn parse_envelope(bytes: &[u8]) -> Result<Request> {
+/// Bounded, identity-only request shared by the host API and GUI broker.
+pub fn parse_request(bytes: &[u8]) -> Result<Request> {
     if bytes.len() > MAX_REQUEST {
-        return Err("action input exceeds 4096 bytes".into());
+        return Err("host request exceeds 4096 bytes".into());
     }
-    let envelope: Envelope = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let (schema, request) = match envelope {
-        Envelope::List {
-            schema_version,
-            input,
-        } => {
-            let _ = input;
-            (schema_version, Request::List {})
-        }
-        Envelope::Capture {
-            schema_version,
-            input,
-        } => (schema_version, Request::Capture { target: input }),
-    };
-    if schema != "1" {
-        return Err("unsupported dispatcher schema_version".into());
-    }
+    let request: Request = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     validate_request(&request)?;
     Ok(request)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationResponse {
+    pub manifest: Manifest,
+    pub artifacts: Option<crate::protocol::ArtifactArchive>,
+    pub artifact_restrictions: Option<crate::protocol::ArtifactRestrictions>,
+}
+
+pub fn valid_observation_id(value: &str) -> bool {
+    value
+        .strip_prefix("host-")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .is_some_and(|id| value == format!("host-{id}"))
 }
 
 fn validate_request(request: &Request) -> Result<()> {
@@ -389,7 +356,7 @@ fn error_archive(error: String) -> Result<Vec<u8>> {
 
 /// Check PNG framing, dimensions, critical chunk ordering and CRCs. The actual
 /// image codec belongs to the OS; no decoding of untrusted pixels occurs here.
-fn validate_png(bytes: &[u8]) -> Result<()> {
+pub fn validate_png(bytes: &[u8]) -> Result<()> {
     let invalid = || "capture is not a valid nonempty PNG".to_string();
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err(invalid());
@@ -479,19 +446,22 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn read_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
+fn read_frame(stream: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let mut size = [0; 4];
     stream
         .read_exact(&mut size)
-        .map_err(|e| format!("read observation frame: {e}"))?;
+        .map_err(|e| io::Error::new(e.kind(), format!("read observation frame: {e}")))?;
     let size = u32::from_be_bytes(size) as usize;
     if size == 0 || size > max {
-        return Err("observation frame exceeds allowed size".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "observation frame exceeds allowed size",
+        ));
     }
     let mut bytes = vec![0; size];
     stream
         .read_exact(&mut bytes)
-        .map_err(|e| format!("read observation payload: {e}"))?;
+        .map_err(|e| io::Error::new(e.kind(), format!("read observation payload: {e}")))?;
     Ok(bytes)
 }
 
@@ -689,7 +659,8 @@ fn handle_connection(stream: &mut UnixStream, backend: &dyn Backend, allow_uid: 
         let bytes = read_frame(
             &mut DeadlineIo::new(stream, Duration::from_secs(5)),
             MAX_REQUEST,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         let request: Request = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         build_observation(backend, &request)
     })()
@@ -792,6 +763,19 @@ fn connect(socket: &Path, request: &Request, peer_uid: u32) -> Result<Vec<u8>> {
         &mut DeadlineIo::new(&stream, Duration::from_secs(60)),
         MAX_ARCHIVE,
     )
+    .map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+        ) {
+            format!(
+                "{error}; broker connection closed: inspect the GUI helper log and verify --allow-uid matches the daemon service UID ({})",
+                uid()
+            )
+        } else {
+            error.to_string()
+        }
+    })
 }
 
 fn decode_archive(bytes: &[u8]) -> Result<(Manifest, Vec<Vec<u8>>)> {
@@ -966,11 +950,15 @@ impl Drop for Staging {
     }
 }
 
+#[cfg(test)]
 fn publish(bytes: &[u8], cwd: &Path) -> Result<Manifest> {
-    let (mut manifest, images) = decode_archive(bytes)?;
+    let (manifest, images) = decode_archive(bytes)?;
+    publish_decoded(manifest, images, cwd)
+}
+
+fn publish_decoded(mut manifest: Manifest, images: Vec<Vec<u8>>, cwd: &Path) -> Result<Manifest> {
     let cwd = open_directory(cwd)?;
-    let output = mkdir_at(&cwd, ".indentured-output", true)?;
-    let parent = mkdir_at(&output, "action", true)?;
+    let parent = mkdir_at(&cwd, "observations", true)?;
     let name = format!(".host-staging-{}", uuid::Uuid::new_v4());
     let directory = mkdir_at(&parent, &name, false)?;
     let mut staging = Staging {
@@ -980,7 +968,7 @@ fn publish(bytes: &[u8], cwd: &Path) -> Result<Manifest> {
         names: vec![],
         published: false,
     };
-    let relative = format!(".indentured-output/action/{}", manifest.observation_id);
+    let relative = format!("observations/{}", manifest.observation_id);
     for (image, bytes) in manifest.images.iter_mut().zip(images) {
         staging.names.push(image.path.clone());
         write_file_at(&staging.directory, &image.path, &bytes)?;
@@ -1018,38 +1006,27 @@ fn publish(bytes: &[u8], cwd: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
-pub fn action(socket: &Path, peer_uid: Option<u32>) -> Result<()> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let response = (|| {
-        let mut bytes = Vec::new();
-        io::stdin()
-            .take(MAX_REQUEST as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let request = parse_envelope(&bytes)?;
-        connect(socket, &request, peer_uid.unwrap_or_else(uid))
-    })()
-    .or_else(error_archive)?;
-    let manifest = match publish(&response, &cwd) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let mut failed = Manifest::new();
-            failed.fail(format!("publish host observation: {error}"));
-            println!(
-                "{}",
-                serde_json::to_string(&failed).map_err(|e| e.to_string())?
-            );
-            return Err(failed.errors.join("; "));
-        }
-    };
-    println!(
-        "{}",
-        serde_json::to_string(&manifest).map_err(|e| e.to_string())?
-    );
-    if manifest.status == "failed" {
-        return Err(manifest.errors.join("; "));
-    }
-    Ok(())
+/// Called by the daemon under its own identity, never through a build task.
+/// Scratch must be a new private daemon-owned directory, removed by the caller.
+pub(crate) fn observe(
+    socket: &Path,
+    peer_uid: u32,
+    request: &Request,
+    scratch: &Path,
+) -> Result<Manifest> {
+    validate_request(request)?;
+    let (mut manifest, images) =
+        match connect(socket, request, peer_uid).and_then(|bytes| decode_archive(&bytes)) {
+            Ok(value) => value,
+            Err(error) => {
+                let mut manifest = Manifest::new();
+                manifest.fail(error);
+                (manifest, vec![])
+            }
+        };
+    // The broker cannot select or reuse the daemon's artifact identity.
+    manifest.observation_id = format!("host-{}", uuid::Uuid::new_v4());
+    publish_decoded(manifest, images, scratch)
 }
 
 pub fn permissions() -> Result<()> {

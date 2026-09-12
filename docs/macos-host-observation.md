@@ -1,164 +1,186 @@
-# Observe the Mac when app automation or the terminal breaks
+# Built-in, server-wide macOS host observation
 
-`indentured-host` supplies read-only graphical application/window enumeration and
-PNG capture through normal Indentured managed-session actions. It does not send
-keys, focus windows, depend on Zellij, expose a remote shell, or require the iOS
-app's automation driver to work. A desktop capture means every display, not a
-scrolling browser-page capture. Physical-device capture remains out of scope.
+Host observation is an optional **Indentured Server feature**, disabled by default.
+Enable it once on a Mac and every authorized client can list graphical applications
+and windows, capture an exact window or application's windows, or capture the whole
+desktop. It works from any project and from an empty directory. **No named task,
+source upload, project configuration, dispatcher, or managed session is involved.**
+It does not send keys, focus applications, or depend on Zellij/app automation.
 
 ## Architecture and authority
 
 ```text
-agent → authenticated Indentured session action → fixed indentured-host action
-      → private observation socket → selected user's Aqua LaunchAgent
-      → app/window inventory + PNG bytes → normal action artifacts
-      → client's local result directory → agent opens the PNG
+indentured host → authenticated daemon host API → private observation socket
+               → Aqua LaunchAgent → inventory/PNGs → ordinary artifact storage
+               → authenticated artifact download → client opens local PNGs
 ```
 
-The existing root LaunchDaemon and its bearer/control socket stay unchanged.
-Dropping a task to a user's UID does not enter that user's graphical login
-session. The helper must run as a LaunchAgent in the intended `gui/<UID>` domain,
-with a logged-in graphical user. Native tools are macOS's fixed
-`/usr/bin/osascript` (JXA/AppKit/CoreGraphics) and `/usr/sbin/screencapture`; the
-package needs no Node, simulator driver, Xcode project, or extra runtime install.
-Linux builds provide CLI/protocol tests, not a Linux screenshot backend.
+The daemon directly speaks the bounded broker protocol under its own service UID.
+It does not spawn a task or drop privileges to the build account for observation.
+The root LaunchDaemon cannot itself enter a graphical login session: the separate
+`indentured-host` Aqua LaunchAgent runs in the selected GUI account. Native tools
+remain `/usr/bin/osascript` and `/usr/sbin/screencapture`; no Node, simulator driver,
+Xcode project or extra runtime installation is required.
 
-**Do not change `build.run_as_user` to your personal desktop account to make
-screenshots work.** Uploaded repository tasks execute arbitrary code under that
-identity. Instead, explicitly grant the existing task UID access to the
-read-only observation socket. Every process running under that UID then has
-observation authority; action names are not isolation between uploaded projects.
-Screenshots and titles may reveal unrelated windows, notifications and secrets.
-Prefer a dedicated debugging Mac/GUI account and trusted repositories.
+Do not change `build.run_as_user` to a personal GUI account. Existing daemon/task
+identity isolation remains in force, even when the server has no named tasks.
+Grant broker access to the **daemon UID**, typically 0, not the build-task UID.
+Uploaded projects should not belong to the observation socket group. All authorized
+HTTP clients (and holders of the protected daemon control UDS) have the enabled
+host-wide capability; there is no per-project isolation of screenshots. Screenshots
+and titles may expose unrelated windows, notifications and secrets. Prefer a
+purpose-specific debugging GUI account.
 
-The observation socket is separate from the daemon's protected control socket.
-It authenticates the configured UID using kernel peer credentials, not a token
-in the uploaded workspace. It has no caller-controlled executable, filename,
-output directory or shell text. The client checks the expected GUI helper UID.
-This authenticates the account, not code identity: the GUI account is trusted
-and can impersonate its own helper. Do not expose this socket over TCP.
+The broker authenticates the exact daemon UID with kernel peer credentials. The
+daemon checks the configured GUI peer UID. This authenticates accounts, not code
+identity: the GUI account is trusted and can impersonate its own helper. The
+broker takes identities, never arbitrary executables, paths, shell text or input
+events. Do not expose its socket over TCP.
 
-## Provision once on the Mac
+## Enable once on the Mac
 
-Build the pinned package:
+Building/pushing packages does not activate services. Deployment automation owns
+installation, activation, and permissions. Install matching daemon/client builds
+as well as the helper; an older client will not know `indentured host`, and an
+older daemon will return an empty `404 Not Found` for its API. For that response,
+the client advises checking both the endpoint URL and daemon version; it does not
+assume the feature is merely disabled. Build `nix build --no-link .#indentured-host`
+and use the [LaunchAgent template](../launchd/indentured-host.plist.example).
+
+1. Keep the existing secretless build-task identity. Select the GUI account.
+   Provision an observation-only group for the GUI and daemon accounts, **not the
+   build account**. Create a short absolute GUI-owned socket directory, group-owned
+   by that group, mode `0710`. Ancestors must be real directories owned by root or
+   the GUI UID, not group/other-writable (root-owned sticky directories excepted).
+   Do not broadly loosen home-directory permissions; a separately provisioned
+   protected directory can be used instead.
+2. Install the root-controlled LaunchAgent with pinned helper path and arguments
+   `serve --socket <path> --allow-uid <daemon-uid> --socket-group <gid>`. Load it in
+   the selected user's Aqua `gui/<UID>` domain, not a root LaunchDaemon or terminal
+   pane. The helper creates a mode-`0660` socket and authorizes only the daemon UID.
+3. During attended provisioning, add `--request-permission` to that LaunchAgent.
+   Approve Screen Recording / Screen & System Audio Recording for the invocation
+   chain macOS identifies. Remove the option after setup; ordinary listing/capture
+   never requests permission. Restart the agent if macOS requires it. Approval
+   from `indentured-host permissions` in Terminal alone does not attest LaunchAgent
+   permission. Do not grant blanket Accessibility/Automation permissions.
+4. Enable the feature in the **daemon** configuration, using actual socket/GUI UID:
+
+   ```toml
+   [host_observation]
+   enabled = true
+   socket = "/Users/debug/.indentured-host/control.sock"
+   peer_uid = 501
+   ```
+
+   See the [feature fragment](../config/host-observation.toml.example). HTTP must
+   require bearer authentication when this is enabled. The protected daemon UDS
+   retains its existing filesystem authorization. No task is added to `[tasks]`;
+   that table may be empty or omitted. Existing schema-12 configurations default
+   to the feature being disabled. Apply configuration through your deployment.
+5. Test through `indentured host`, not a Terminal-only screenshot. Setting
+   `enabled = false` denies both new observations and downloads of retained host
+   artifacts. It does not delete old evidence or stop the independently managed
+   LaunchAgent. Existing artifact retention/GC settings govern stored evidence.
+
+If daemon and helper deliberately share a dedicated service account, omit broker
+`--allow-uid`/`--socket-group` and use a private `0700` directory / `0600` socket.
+The daemon configuration still specifies `peer_uid` explicitly. This is not a
+recommendation to share a personal GUI identity with uploaded builds.
+
+If the broker closes the connection without a complete response, inspect the GUI
+LaunchAgent's stderr log and verify `--allow-uid` matches the **daemon service UID**
+(normally 0), not the build-task UID. An unauthorized peer is deliberately rejected
+before any protocol response. The daemon includes this troubleshooting hint for
+EOF/reset errors, but a closed connection can also mean a helper crash; the hint
+is not proof of an authorization failure. Do not relax peer checks to diagnose it.
+
+Orderly SIGTERM/SIGINT removes the helper socket. After SIGKILL/crash, it refuses
+an existing socket: stop the agent, confirm no helper is running, remove only the
+stale socket, then restart. Package/OS changes or revocation may require renewed
+TCC consent; an unsigned Nix store path does not promise permanent permission.
+
+## Client usage (no project required)
+
+Set `INDENTURED_SERVER_ENDPOINT` and `INDENTURED_SERVER_TOKEN_FILE` or use the
+existing wrapper's global `--endpoint`/`--token-file`. A protected `unix://` endpoint
+also works. Host commands intentionally **ignore project client configuration**,
+including malformed configuration in the current directory. Connection flags and
+global environment, not repository discovery, select the server. A missing-endpoint
+error therefore asks for `--endpoint` or `INDENTURED_SERVER_ENDPOINT`, not a project
+config. `INDENTURED_SERVER_ENABLED=0` (or `false`) returns the same disabled-connection
+exit code **222** as other client commands, without creating a result directory or
+contacting the host.
 
 ```sh
-nix build --no-link .#indentured-host
+indentured host list
+indentured host capture window 123 456  # owner PID, window ID from fresh list
+indentured host capture application 123
+indentured host capture desktop
+# Optional absolute local evidence base (accepted anywhere after `host`):
+indentured host --result-root /absolute/results capture desktop
 ```
 
-Deployment automation owns installation and activation; nothing is enabled by
-building the package. Use
-[`launchd/indentured-host.plist.example`](../launchd/indentured-host.plist.example)
-and [`config/host-observation.toml.example`](../config/host-observation.toml.example)
-as templates. Replace every placeholder and numeric UID/GID with actual values.
+Only a fully successful invocation prints a JSON manifest to stdout. The client
+first downloads and validates **all** requested PNGs (framing, CRCs, dimensions,
+regular-file/byte limits), then adds an **absolute `local_path` for every image**.
+For example, `images[0].local_path` is immediately usable by an agent's image tool:
 
-1. Keep the daemon's existing secretless task UID. Select the GUI account whose
-   desktop may be observed. Provision an observation-only group containing both
-   accounts. Provision an absolute, short socket directory owned by the GUI
-   account, group-owned by that group, mode `0710`; its ancestors must permit
-   traversal without becoming task-writable. Do not loosen the user's home
-   directory broadly: if necessary choose a separately provisioned directory.
-2. Install the root-controlled LaunchAgent with the pinned helper path,
-   `serve --socket <path> --allow-uid <task-uid> --socket-group <gid>`. Load it in
-   the selected user's Aqua login session. Do not launch it through the failing
-   terminal pane or as a root LaunchDaemon. The task may connect to the socket,
-   but must not be able to replace the helper, plist or socket directory.
-3. During initial attended provisioning, add `--request-permission` to the
-   LaunchAgent's arguments. Approve **Screen & System Audio Recording** (called
-   Screen Recording on older macOS versions) in Privacy & Security for the
-   actual invocation chain macOS identifies. Remove this option after setup;
-   ordinary observations must not continually prompt. `indentured-host
-   permissions` is also available as a local diagnostic/request, but approval
-   from Terminal alone does not prove the LaunchAgent has permission.
-4. Restart the agent if macOS requires it, then test through the actual
-   Indentured action. Root privilege, matching UIDs and an earlier Terminal
-   screenshot are not substitutes for this check. AppKit/CoreGraphics listing
-   does not intentionally use System Events UI scripting; do not grant blanket
-   Accessibility/Automation permissions unless a native diagnostic establishes
-   a separate need.
-5. Merge the task fragment into the daemon's schema-12 configuration, keeping
-   its existing task identity. Set the action's `--peer-uid` to the GUI UID.
-   Normal authenticated session actions now cross only the explicit observation
-   boundary. No HTTP protocol/configuration-schema change is required.
-
-For a dedicated debugging GUI account that is already the intentionally chosen
-secretless task account, omit `--allow-uid`, `--socket-group` and `--peer-uid`:
-defaults use same-UID peers, a private `0700` directory and `0600` socket. This
-shortcut is not a recommendation to run arbitrary uploads as a personal user.
-
-The helper removes its socket on orderly SIGTERM/SIGINT shutdown. After a crash
-or SIGKILL, it refuses an existing socket rather than risk replacing a live
-helper. Stop the LaunchAgent, confirm no helper is running, remove only its stale
-socket, and restart it. Do not delete the directory or observation logs wholesale.
-
-macOS can require renewed consent after an OS upgrade, binary/path/identity
-change or revocation. A stable operator-managed signed identity can improve TCC
-continuity; the unsigned Nix store path does not promise permanent one-time
-permission. Test the deployed version and attribution rather than guessing.
-
-## Agent usage
-
-From the client machine, start the configured capability and list the remote
-GUI apps/windows. Each invocation prints its own **local result directory** to
-stderr:
-
-```sh
-session_id=$(indentured session start host_observation)
-printf '{}\n' | indentured session action "$session_id" host-list --input -
-
-# Capture exactly the window selected from that fresh inventory (owner PID + ID).
-printf '{"target":"window","pid":123,"window_id":456}\n' \
-  | indentured session action "$session_id" host-capture --input -
-
-# Capture each eligible window of this application separately.
-printf '{"target":"application","pid":123}\n' \
-  | indentured session action "$session_id" host-capture --input -
-
-# Capture the whole desktop: a separate PNG per display.
-printf '{"target":"desktop"}\n' \
-  | indentured session action "$session_id" host-capture --input -
-
-indentured session stop "$session_id"
+```json
+{"images":[{"path":"observations/host-<UUID>/image-0000.png","local_path":"/absolute/results/<invocation>/artifacts/observations/host-<UUID>/image-0000.png","display_id":123}]}
 ```
 
-The dispatcher executable receives the existing envelope, for example
-`{"schema_version":"1","action":"host-capture","input":{"target":"desktop"}}`.
-Do not add that envelope around the CLI's `--input`; the client supplies it.
-Unknown fields, action names and invalid numeric identifiers fail rather than
-becoming command-line options. No source updates or simulator initialization
-are needed for this observation-only session.
+The full manifest also includes `schema_version`, `observation_id`, `captured_at`,
+`status`, `inventory`, and `errors`. Multiple windows/displays return all local
+paths. No success/path JSON is printed for capture failure, failed download,
+invalid PNG or artifact restrictions; failures go to stderr and `result.json`.
+The private local evidence directory is always reported on stderr after creation.
+`remote-manifest.json` preserves the server response; `manifest.json` is written
+only after local image validation and includes local paths. No build/session
+provenance is synthesized. The daemon assigns a fresh observation ID independently
+of the broker.
 
-The helper emits one JSON manifest with `schema_version`, `observation_id`,
-`captured_at`, `status`, `inventory`, `images`, and `errors`. Each image's `path`
-is relative to the remote workspace, for example:
+The agent must **open each returned `images[].local_path` with an image-capable
+tool**. A remote path, base64 or ZIP filename is not visual input. Do not reconstruct
+paths from stdout logs or search for an arbitrary older observation.
 
-```text
-.indentured-output/action/host-<UUID>/image-0000.png
+The daemon publishes a fresh protected artifact archive using the ordinary artifact
+limits, restrictions, storage and GC. Scratch is daemon-private and removed after
+each observation; no project workspace or session history accumulates. Capture
+failure has no partial images. Artifact restriction/download failure is distinct
+from capture success: the client exits unsuccessfully if evidence is omitted or
+requested images are not downloaded. It checks the exact host artifact path before
+using the existing bounded, private, atomic ZIP extractor. Host artifact downloads
+reject all HTTP redirects, even same-origin redirects, so only that exact URL is
+requested; rejected redirects produce failure with no success/path JSON. Existing
+build/session download redirect behavior is unchanged.
+
+## Host API
+
+`POST /v1/host/observations` accepts only a bounded JSON request:
+
+```json
+{"operation":"list"}
+{"operation":"capture","target":{"target":"desktop"}}
+{"operation":"capture","target":{"target":"application","pid":123}}
+{"operation":"capture","target":{"target":"window","pid":123,"window_id":456}}
 ```
 
-The manifest is also saved as `manifest.json` in that observation directory.
-The **actual local image** is:
+The response contains `manifest`, `artifacts` (ordinary `path`/`size`, or null), and
+`artifact_restrictions`. Download through the returned host-specific
+`GET /v1/host/observations/host-<UUID>/artifacts.zip`. Build routes do not accept host
+IDs. Requests never contain task/session IDs or source data. Unknown fields and
+malformed identities fail; the old dispatcher envelope/`indentured-host action`
+interface is removed.
 
-```text
-<printed-local-result-directory>/artifacts/<image.path>
-```
-
-The agent must read/open that file with its image-capable tool. A shell's text
-output, remote pathname, base64 text or ZIP pathname is not visual input to the
-model. Indentured downloads PNG bytes; it cannot automatically attach images to
-every possible agent integration. Integration instructions should explicitly
-say: after `host-capture`, locate this invocation's manifest under `artifacts/`,
-check `status`/`errors`, then open every requested image. Prefer the current
-`observation_id`; never pick an arbitrary older PNG.
-
-Artifacts use a fresh private `host-<UUID>` directory on every invocation, so a
-failed capture cannot appear to succeed by reusing a previous PNG. Within a
-retained session, previous observations remain in the workspace and the
-configured artifact glob includes them. Stop/start the small observation-only
-session periodically to bound history and transfer size; no shared output
-folder is destructively cleared. Server artifact limits and restricted patterns
-still apply. Session stop removes the workspace, not the independent GUI
-LaunchAgent or the applications being inspected.
+Authentication precedes broker/filesystem access. Responses are `401` for missing
+HTTP authentication, `404 host_observation_disabled` when disabled, `400` for an
+invalid/oversized request, `408` for a body taking over five seconds, and `503 busy`
+when another observation is in flight. One dedicated observation permit is
+independent of build/session slots; disconnect cannot release it while bounded
+broker work is still running. Missing helper, wrong UID, unavailable GUI and TCC
+denial produce a failed observation manifest with no images. Artifact/publication
+failures return a server error. Clients must check status, not just HTTP 200.
 
 ## Inventory and capture semantics
 
@@ -204,7 +226,13 @@ absolute deadlines; a slow sender cannot extend them by trickling bytes.
 
 ## Native acceptance gate
 
-The offline tests use fake inventories and PNGs. `nix flake check` also executes
+The offline tests use fake inventories and PNGs. Packaged-local validation runs a
+real authenticated packaged daemon and client against a fake broker, including
+normal artifact storage/download and absolute local PNG paths. That one test uses
+a minimal private root filesystem inside the existing user/mount/PID namespace so
+credential/socket ancestor ownership is coherent; the Nix store is read-only.
+Production authority checks are not relaxed for the test. No project or GUI code
+executes. `nix flake check` also executes
 `enumerate.js` with opaque CF-reference fixtures, actual session dictionary key
 spellings, wrong-user/locked-session denials, and three equal-size displays with
 negative origins. Node is a pinned test-only dependency, not a helper runtime.
@@ -213,7 +241,7 @@ against real, synthetic native CF collections and CGRect values without touching
 GUI contents or requesting permissions. These checks do **not** attest GUI/TCC.
 Before declaring the deployed
 Mac usable, run these checks through its **actual LaunchAgent and authenticated
-Indentured artifact flow**, not merely from Terminal:
+Indentured host API/artifact flow**, not merely from Terminal:
 
 1. With Zellij unavailable, list a normal app, an accessory app and a running app
    with all windows closed; confirm all expected apps remain in inventory.
@@ -228,7 +256,7 @@ Indentured artifact flow**, not merely from Terminal:
 5. Deny/revoke then grant permission using the deployed invocation chain. Check
    logout/login, locked screen, no GUI session and fast user switching; never
    accept evidence from an unintended login session.
-6. Verify another UID cannot invoke the socket, the task cannot replace its
+6. Verify another UID (including the build-task UID) cannot invoke the broker socket or replace its
    directory/plist/helper, and malformed/oversized requests cannot introduce
    commands/paths or stop subsequent observations. Keep bearer/control paths
    inaccessible to both the task and GUI account.

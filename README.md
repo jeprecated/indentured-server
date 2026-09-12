@@ -27,7 +27,7 @@ The global active-build limit defaults to one. Admission uses an immediate non-w
 
 - `indentured-server`: host daemon.
 - `indentured`: client that pins and packages the current Jujutsu tree (or reviewed filesystem patterns outside Jujutsu), submits one named task, streams output, and stores non-destructive run evidence.
-- `indentured-host`: optional macOS GUI LaunchAgent/action helper that lists graphical apps/windows and returns exact-window, application-window, or whole-desktop PNGs. See [host observation](docs/macos-host-observation.md) for explicit permissions and deployment; it works independently of terminal/Zellij input.
+- `indentured-host`: optional macOS GUI LaunchAgent broker that lists graphical apps/windows and backs the built-in daemon-wide host observation feature. Use `indentured host list` / `indentured host capture` without a task, project, upload, or session. See [host observation](docs/macos-host-observation.md) for explicit permissions and deployment; it works independently of terminal/Zellij input.
 
 The service supports HTTP/HTTPS and explicitly enabled Unix-domain sockets. UDS is disabled by default and bypasses bearer authentication: its parent-directory ownership and socket mode are its entire authority boundary. Every enabled UDS deployment requires a root daemon, a configured non-root task identity distinct from the daemon/socket owner, no socket group, and mode `0600` or stricter. Startup fails closed otherwise. A hardened macOS deployment must not expose that socket to its build identity. Built-in rustls TLS is optional server-side transport encryption for generic direct deployments; it does not authenticate clients or accept a client-CA setting. Bearer authentication remains required wherever application authority is needed.
 
@@ -482,8 +482,12 @@ When app automation or a terminal pane fails, use the optional
 [`indentured-host` capability](docs/macos-host-observation.md) to list running GUI
 apps and their windows, capture an exact window or all eligible windows of an
 app, or capture every desktop display. A separately provisioned Aqua LaunchAgent
-performs read-only capture; existing managed-session actions return PNGs through
-normal artifact downloads. The agent must open the downloaded local image with
+performs read-only capture for the built-in, server-wide `[host_observation]`
+feature. Enable it once in daemon configuration, then use `indentured host list`
+and `indentured host capture` from any directory: no project configuration, task,
+source upload, or session is required. PNGs use normal artifact downloads, and
+success stdout includes an absolute `images[].local_path` for every PNG only after
+all downloads and image validation complete. The agent must open the downloaded local image with
 its image-capable tool. This does not grant remote shell or keyboard authority,
 change the daemon's identity, or enable desktop access by default.
 

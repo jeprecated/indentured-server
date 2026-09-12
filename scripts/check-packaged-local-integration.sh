@@ -43,6 +43,11 @@ test ! -e "$server_out/bin/indentured-host"
 test ! -e "$client_out/bin/indentured-host"
 "$host_out/bin/indentured-host" --help >/dev/null
 
+# Preserve the outer namespace identity so the optional host fixture can prove
+# it is mounting only inside the private namespace created below.
+INDENTURED_TEST_OUTER_MOUNT_NS=$(readlink /proc/self/ns/mnt)
+export INDENTURED_TEST_OUTER_MOUNT_NS
+
 export INDENTURED_TEST_SERVER_BIN="$server_out/bin/indentured-server"
 export INDENTURED_TEST_CLIENT_BIN="$client_out/bin/indentured"
 INDENTURED_TEST_ID_COMMAND=$(command -v id)

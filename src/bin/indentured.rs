@@ -1,3 +1,6 @@
+#[path = "indentured/host.rs"]
+mod host;
+
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -153,6 +156,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Observe the configured host without a project, task, or source upload.
+    Host(host::HostArgs),
     Run(RunArgs),
     Session(SessionArgs),
 }
@@ -1282,7 +1287,7 @@ fn reject_credential_overlap(
 
 fn reject_credential_result_overlap(credential: &Path, result_base: &Path) -> io::Result<()> {
     let credential = fs::canonicalize(credential)?;
-    let result_base = fs::canonicalize(result_base)?;
+    let result_base = canonicalize_intended(result_base)?;
     if credential.starts_with(&result_base) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1390,6 +1395,9 @@ fn prepare_session_evidence(
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Commands::Host(args) = &cli.command {
+        return host::command(args.clone(), cli.endpoint, cli.token_file).await;
+    }
 
     let run_dir = match env::current_dir() {
         Ok(dir) => dir,
@@ -1402,6 +1410,7 @@ async fn main() -> ExitCode {
     let mut session_interrupt = match &cli.command {
         Commands::Session(_) => Some(InterruptControl::install().await),
         Commands::Run(_) => None,
+        Commands::Host(_) => unreachable!("host command dispatched before project discovery"),
     };
 
     let config_path = find_client_config_path(&run_dir);
@@ -1445,6 +1454,7 @@ async fn main() -> ExitCode {
             Some(prepared)
         }
         Commands::Run(_) => None,
+        Commands::Host(_) => unreachable!("host command dispatched before project discovery"),
     };
     let client_config = if prepared_session.is_some() {
         let loading_path = config_path.clone();
@@ -1551,6 +1561,7 @@ async fn main() -> ExitCode {
     }
 
     match cli.command {
+        Commands::Host(_) => unreachable!("host command already dispatched"),
         Commands::Run(args) => {
             run_command(
                 args,
@@ -4481,6 +4492,23 @@ async fn download_and_extract(
     token: Option<&str>,
     run_directory: &Path,
 ) -> io::Result<()> {
+    download_and_extract_with_redirect_policy(
+        archive,
+        endpoint,
+        token,
+        run_directory,
+        reqwest::redirect::Policy::default(),
+    )
+    .await
+}
+
+async fn download_and_extract_with_redirect_policy(
+    archive: &ArtifactArchive,
+    endpoint: &Endpoint,
+    token: Option<&str>,
+    run_directory: &Path,
+    redirect_policy: reqwest::redirect::Policy,
+) -> io::Result<()> {
     const MAX_ARTIFACT_BYTES: u64 = 536_870_912;
     if archive.size > MAX_ARTIFACT_BYTES {
         return Err(io::Error::new(
@@ -4488,14 +4516,15 @@ async fn download_and_extract(
             "advertised artifact exceeds client transfer limit",
         ));
     }
+    let builder = Client::builder().redirect(redirect_policy);
     let (client, url, send_auth) = match endpoint {
         Endpoint::Http { base } => (
-            Client::builder().build().map_err(io::Error::other)?,
+            builder.build().map_err(io::Error::other)?,
             build_artifact_url(base, &archive.path),
             true,
         ),
         Endpoint::Unix { path } => (
-            Client::builder()
+            builder
                 .unix_socket(path.clone())
                 .build()
                 .map_err(io::Error::other)?,
@@ -4887,7 +4916,7 @@ mod tests {
                 assert_eq!(args.request_id.as_deref(), Some("req.1"));
                 assert_eq!(args.source, vec!["src/**"]);
             }
-            Commands::Session(_) => panic!("expected run command"),
+            Commands::Session(_) | Commands::Host(_) => panic!("expected run command"),
         }
     }
 

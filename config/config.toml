@@ -148,3 +148,10 @@ directory = "/var/log/indentured-server"
 max_bytes = 104857600
 max_files = 5
 console = false
+
+# Built-in host-wide capability; no task, project, upload, or session required.
+# Enabling also requires a provisioned Aqua helper and authenticated HTTP.
+[host_observation]
+enabled = false
+# socket = "/Users/debug/.indentured-host/control.sock"
+# peer_uid = 501

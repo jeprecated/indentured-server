@@ -66,7 +66,11 @@ pub struct Config {
     #[serde(default)]
     pub build: BuildConfig,
 
+    #[serde(default)]
     pub tasks: HashMap<String, TaskConfig>,
+
+    #[serde(default)]
+    pub host_observation: HostObservationConfig,
 
     #[serde(default)]
     pub sources: SourcesConfig,
@@ -269,12 +273,6 @@ impl Config {
             )));
         }
 
-        if self.tasks.is_empty() {
-            return Err(ConfigError::Invalid(
-                "tasks must include at least one named task".to_string(),
-            ));
-        }
-
         let mut has_script_task = false;
         for (name, task) in &self.tasks {
             task.validate(
@@ -325,12 +323,57 @@ impl Config {
             }
         }
 
+        self.host_observation.validate()?;
+        if self.host_observation.enabled
+            && self.service.http.enabled
+            && !self.service.http.auth.required
+        {
+            return Err(ConfigError::Invalid(
+                "host_observation requires authenticated HTTP".into(),
+            ));
+        }
         self.artifacts.validate()?;
 
         if let Err(err) = LoggingSettings::from_config(&self.logging) {
             return Err(ConfigError::Invalid(format!("{err}")));
         }
 
+        Ok(())
+    }
+}
+
+/// Optional host-wide observation authority, independent of build tasks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostObservationConfig {
+    pub enabled: bool,
+    pub socket: Option<PathBuf>,
+    pub peer_uid: Option<u32>,
+}
+
+impl HostObservationConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.enabled && (self.socket.is_none() || self.peer_uid.is_none()) {
+            return Err(ConfigError::Invalid(
+                "enabled host_observation requires socket and peer_uid".into(),
+            ));
+        }
+        if let Some(socket) = &self.socket {
+            if !socket.is_absolute()
+                || socket.file_name().is_none()
+                || socket.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+            {
+                return Err(ConfigError::Invalid(
+                    "host_observation.socket must be an absolute socket path without traversal"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1527,6 +1570,7 @@ mod tests {
         let mut service = ServiceConfig::default();
         service.http.enabled = true;
         Config {
+            host_observation: Default::default(),
             schema_version: CONFIG_SCHEMA_VERSION.to_string(),
             service,
             build: BuildConfig {

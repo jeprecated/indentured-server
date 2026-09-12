@@ -76,7 +76,7 @@ pub(super) fn client(socket: &Path, owner: u32) -> Result<()> {
     })?;
     if !metadata.file_type().is_socket() || metadata.uid() != owner {
         return Err(
-            "GUI helper endpoint must be a real socket owned by the expected --peer-uid".into(),
+            "GUI helper endpoint must be a real socket owned by the configured GUI peer UID".into(),
         );
     }
     let group = match metadata.mode() & 0o7777 {

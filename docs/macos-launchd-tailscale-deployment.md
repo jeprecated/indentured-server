@@ -134,14 +134,16 @@ This is package/protocol evidence, not a production security bypass or a native 
 
 ## Optional graphical host observation
 
-For terminal/Zellij failures or app state outside the simulator driver, deploy
-[`indentured-host`](macos-host-observation.md) as a separate Aqua LaunchAgent.
-Its read-only app/window listing and selected-window/application/desktop PNG
-capture use ordinary session action artifacts. The observation socket is a
-separate, explicitly authorized boundary; do not expose the daemon's protected
-control socket or change the task identity to a personal desktop user. The guide
-includes a LaunchAgent/task fragment, first-use permission setup, local-image
-instructions for agents, and a native GUI/TCC acceptance gate.
+Enable the built-in daemon-wide `[host_observation]` feature to list apps/windows
+and capture images independently of projects, uploaded tasks and managed sessions.
+It is disabled by default and uses the existing authenticated daemon API plus
+normal artifact storage/downloads. Clients use `indentured host list` and
+`indentured host capture`; no task fragment or project dispatcher is needed.
+Provision [`indentured-host`](macos-host-observation.md) once as a separate Aqua
+LaunchAgent. Its socket authorizes the daemon UID, NOT the build-task UID. Keep
+`build.run_as_user` unchanged and do not grant uploaded projects the observation
+socket group. Compilation/pushing does not install the agent or grant GUI/TCC
+permission; follow the linked provisioning and native acceptance steps.
 
 ## Reusable repository capability profiles
 

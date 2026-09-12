@@ -1,3 +1,5 @@
+mod host;
+
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -71,6 +73,7 @@ struct AppState {
     auth: Arc<AuthSecrets>,
     auth_required: bool,
     build_slots: Arc<Semaphore>,
+    host_slots: Arc<Semaphore>,
     sessions: SessionManager,
     managed_sessions_enabled: bool,
 }
@@ -433,6 +436,7 @@ pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
         auth,
         auth_required: false,
         build_slots,
+        host_slots: Arc::new(Semaphore::new(1)),
         sessions,
         managed_sessions_enabled,
     };
@@ -520,6 +524,11 @@ fn build_router(state: AppState, max_transfer_bytes: u64) -> Router {
     let max_body =
         usize::try_from(max_transfer_bytes.saturating_add(1024 * 1024)).unwrap_or(usize::MAX);
     Router::new()
+        .route("/v1/host/observations", post(host::observe))
+        .route(
+            "/v1/host/observations/:observation_id/artifacts.zip",
+            get(host::artifact),
+        )
         .route("/v1/builds", post(start_build))
         .route("/v1/builds/:build_id/artifacts.zip", get(get_artifact))
         .route("/v1/sessions", post(start_session))
@@ -1142,7 +1151,11 @@ async fn get_artifact(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let root = state.config.artifacts.storage_root.join(&build_id);
+    read_artifact(&state, &build_id).await
+}
+
+async fn read_artifact(state: &AppState, artifact_id: &str) -> Response {
+    let root = state.config.artifacts.storage_root.join(artifact_id);
     let candidate = root.join("artifacts.zip");
 
     let resolved_root = match std::fs::canonicalize(&root) {
@@ -3892,6 +3905,7 @@ mod tests {
         let mut service = ServiceConfig::default();
         service.http.enabled = true;
         let config = Config {
+            host_observation: Default::default(),
             schema_version: CONFIG_SCHEMA_VERSION.to_string(),
             service,
             build: BuildConfig {
@@ -4118,6 +4132,7 @@ mod tests {
                 auth: Arc::new(AuthSecrets::empty()),
                 auth_required: false,
                 build_slots: Arc::clone(&build_slots),
+                host_slots: Arc::new(Semaphore::new(1)),
                 sessions: sessions.clone(),
                 managed_sessions_enabled,
             },

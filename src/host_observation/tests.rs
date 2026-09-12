@@ -125,31 +125,29 @@ impl Backend for Fake {
 }
 
 #[test]
-fn strict_envelopes_reject_authority_and_invalid_ids() {
+fn strict_requests_reject_authority_and_invalid_ids() {
     for input in [
+        r#"{"operation":"list"}"#,
+        r#"{"operation":"capture","target":{"target":"desktop"}}"#,
+        r#"{"operation":"capture","target":{"target":"application","pid":123}}"#,
+        r#"{"operation":"capture","target":{"target":"window","pid":123,"window_id":456}}"#,
+    ] {
+        assert!(parse_request(input.as_bytes()).is_ok(), "{input}");
+    }
+    for input in [
+        r#"{"operation":"list","task":"any"}"#,
+        r#"{"operation":"list","source":{}}"#,
+        r#"{"operation":"shell"}"#,
+        r#"{"operation":"capture","target":{"target":"desktop","path":"/tmp"}}"#,
+        r#"{"operation":"capture","target":{"target":"window","pid":0,"window_id":1}}"#,
+        r#"{"operation":"capture","target":{"target":"application","pid":4294967295}}"#,
+        r#"{"operation":"capture","target":{"target":"application","pid":1,"pid":2}}"#,
         r#"{"schema_version":"1","action":"host-list","input":{}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"desktop"}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"application","pid":123}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"window","pid":123,"window_id":456}}"#,
+        "[]",
     ] {
-        assert!(parse_envelope(input.as_bytes()).is_ok(), "{input}");
+        assert!(parse_request(input.as_bytes()).is_err(), "{input}");
     }
-    for input in [
-        r#"{"schema_version":"2","action":"host-list","input":{}}"#,
-        r#"{"schema_version":"1","action":"shell","input":{}}"#,
-        r#"{"schema_version":"1","action":"host-list","input":{"path":"/tmp"}}"#,
-        r#"{"schema_version":"1","action":"host-list","input":{},"extra":1}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"desktop","pid":123}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"window","pid":0,"window_id":456}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"window","pid":123,"window_id":0}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"application","pid":4294967295}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"application","pid":-1}}"#,
-        r#"{"schema_version":"1","action":"host-capture","input":{"target":"application","pid":123,"pid":124}}"#,
-        r#"{"schema_version":"1","action":"host-list","input":[]}"#,
-    ] {
-        assert!(parse_envelope(input.as_bytes()).is_err(), "{input}");
-    }
-    assert!(parse_envelope(&vec![b' '; MAX_REQUEST + 1]).is_err());
+    assert!(parse_request(&vec![b' '; MAX_REQUEST + 1]).is_err());
 }
 
 #[test]
@@ -404,12 +402,9 @@ fn publication_is_fresh_private_and_failure_has_no_stale_images() {
     assert_ne!(failed.observation_id, manifest.observation_id);
     assert!(failed.images.is_empty());
     assert_eq!(
-        fs::read_dir(
-            cwd.join(".indentured-output/action")
-                .join(failed.observation_id)
-        )
-        .unwrap()
-        .count(),
+        fs::read_dir(cwd.join("observations").join(failed.observation_id))
+            .unwrap()
+            .count(),
         1
     );
 }
@@ -419,7 +414,7 @@ fn publication_rejects_symlinks_and_untrusted_archive_paths() {
     let cwd = TempDir::new().unwrap();
     let cwd = cwd.path().canonicalize().unwrap();
     let outside = TempDir::new().unwrap();
-    symlink(outside.path(), cwd.join(".indentured-output")).unwrap();
+    symlink(outside.path(), cwd.join("observations")).unwrap();
     assert!(publish(&error_archive("denied".into()).unwrap(), &cwd).is_err());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     for path in ["../outside.png", "/tmp/outside.png", "subdir/image.png"] {
