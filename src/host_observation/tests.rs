@@ -70,12 +70,10 @@ fn inventory() -> Inventory {
         displays: vec![
             Display {
                 display_id: 99,
-                index: 1,
                 bounds: bounds(),
             },
             Display {
                 display_id: 98,
-                index: 2,
                 bounds: bounds(),
             },
         ],
@@ -87,6 +85,7 @@ struct Fake {
     denied: bool,
     stale: bool,
     fail_second: bool,
+    display_change_at: Option<usize>,
 }
 impl Fake {
     fn good() -> Self {
@@ -95,6 +94,7 @@ impl Fake {
             denied: false,
             stale: false,
             fail_second: false,
+            display_change_at: None,
         }
     }
 }
@@ -106,6 +106,12 @@ impl Backend for Fake {
         let mut value = inventory();
         if self.stale && self.calls.get() > 0 {
             value.windows[0].pid = 999;
+        }
+        if self
+            .display_change_at
+            .is_some_and(|n| self.calls.get() >= n)
+        {
+            value.displays[0].bounds.x = -1920.;
         }
         self.calls.set(self.calls.get() + 1);
         Ok(value)
@@ -170,6 +176,119 @@ fn captures_all_app_windows_and_all_desktop_displays() {
         assert_eq!(images[0], png());
         assert_eq!(manifest.images[1].path, "image-0001.png");
     }
+}
+
+#[test]
+fn display_movement_before_or_after_either_capture_discards_all_images() {
+    for changed_at in 1..=4 {
+        let fake = Fake {
+            display_change_at: Some(changed_at),
+            ..Fake::good()
+        };
+        let (manifest, images) = decode_archive(
+            &build_observation(
+                &fake,
+                &Request::Capture {
+                    target: Target::Desktop {},
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, "failed", "changed at {changed_at}");
+        assert!(manifest.errors[0].contains("display topology changed"));
+        assert!(manifest.images.is_empty());
+        assert!(images.is_empty());
+    }
+}
+
+#[test]
+fn display_topology_checks_all_ids_and_bounds_but_not_enumeration_order() {
+    let mut expected = inventory();
+    expected.displays.sort_by_key(|d| d.display_id);
+    let mut reordered = expected.clone();
+    reordered.displays.reverse();
+    check_display_topology(&expected, reordered).unwrap();
+    for mutation in 0..4 {
+        let mut current = expected.clone();
+        match mutation {
+            0 => {
+                current.displays.pop();
+            }
+            1 => current.displays.push(Display {
+                display_id: 100,
+                bounds: bounds(),
+            }),
+            2 => current.displays[0].display_id = 101,
+            _ => current.displays[0].bounds.width = 200.,
+        }
+        assert!(check_display_topology(&expected, current).is_err());
+    }
+}
+
+#[test]
+fn display_capture_uses_explicit_rectangles_not_ordinals_or_pixel_sizes() {
+    // Three equally-sized screens: PNG dimensions cannot establish identity.
+    for (id, x, y) in [(303, 0., 0.), (101, -1920., 0.), (202, 0., -1080.)] {
+        let capture = Capture::Display {
+            display_id: id,
+            bounds: Bounds {
+                x,
+                y,
+                width: 1920.,
+                height: 1080.,
+            },
+        };
+        assert_eq!(
+            native::capture_arguments(&capture).unwrap(),
+            ["-x", "-t", "png", &format!("-R{x},{y},1920,1080")]
+        );
+    }
+    for bad in [f64::NAN, f64::INFINITY, 0.5, i32::MAX as f64 + 1.] {
+        let capture = Capture::Display {
+            display_id: 99,
+            bounds: Bounds { x: bad, ..bounds() },
+        };
+        assert!(native::capture_arguments(&capture).is_err());
+    }
+    for width in [0., -1.] {
+        assert!(native::capture_arguments(&Capture::Display {
+            display_id: 99,
+            bounds: Bounds { width, ..bounds() },
+        })
+        .is_err());
+    }
+    assert_eq!(
+        native::capture_arguments(&Capture::Window {
+            pid: 123,
+            window_id: 456
+        })
+        .unwrap(),
+        ["-x", "-t", "png", "-o", "-l", "456"]
+    );
+}
+
+#[test]
+fn too_many_displays_or_windows_are_rejected_before_capture() {
+    let mut value = inventory();
+    value.displays = (1..=MAX_IMAGES + 1)
+        .map(|id| Display {
+            display_id: id as u32,
+            bounds: bounds(),
+        })
+        .collect();
+    assert!(select(&value, &Target::Desktop {})
+        .unwrap_err()
+        .contains("image limit"));
+    value.windows = (1..=MAX_IMAGES + 1)
+        .map(|id| Window {
+            window_id: id as u32,
+            ..value.windows[0].clone()
+        })
+        .collect();
+    assert!(select(&value, &Target::Application { pid: 123 })
+        .unwrap_err()
+        .contains("image limit"));
 }
 
 #[test]

@@ -7,6 +7,17 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
 fi
 
 /usr/bin/plutil -lint launchd/indentured-host.plist.example
+# Run the actual JXA bridge against synthetic native CF collections. This is
+# deterministic/offline and does not inspect the logged-in user's desktop.
+bridge_result=$(/usr/bin/osascript -l JavaScript \
+  -e "$(cat src/host_observation/enumerate.js)" \
+  -e "$(cat tests/host_observation_bridge.js)")
+expected_bridge_result='native host-observation CF/CGRect bridge: passed (no GUI/TCC attestation)'
+if [ "$bridge_result" != "$expected_bridge_result" ]; then
+  echo "native bridge assertions did not produce the expected success marker: $bridge_result" >&2
+  exit 1
+fi
+printf '%s\n' "$bridge_result" >&2
 nix flake check --print-build-logs
 nix build --no-link --print-build-logs .#indentured-server .#indentured .#indentured-host
 

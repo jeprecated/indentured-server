@@ -134,7 +134,7 @@ pub struct Window {
     pub capturable: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bounds {
     pub x: f64,
@@ -143,12 +143,11 @@ pub struct Bounds {
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Display {
     pub display_id: u32,
-    /// One-based screencapture display selector, from NSScreen order.
-    pub index: u32,
+    /// CoreGraphics global screen points (top-left origin, y increases downward).
     pub bounds: Bounds,
 }
 
@@ -207,7 +206,7 @@ impl Manifest {
 #[derive(Debug, Clone)]
 pub enum Capture {
     Window { pid: u32, window_id: u32 },
-    Display { display_id: u32, index: u32 },
+    Display { display_id: u32, bounds: Bounds },
 }
 
 /// Implementations must honor the deadline and only write a new regular PNG at
@@ -224,7 +223,7 @@ fn select(inventory: &Inventory, target: &Target) -> Result<Vec<Capture>> {
             .iter()
             .map(|d| Capture::Display {
                 display_id: d.display_id,
-                index: d.index,
+                bounds: d.bounds.clone(),
             })
             .collect::<Vec<_>>(),
         Target::Application { pid } => {
@@ -253,7 +252,7 @@ fn select(inventory: &Inventory, target: &Target) -> Result<Vec<Capture>> {
                 return Err("window owner changed; refusing capture; list again".into());
             }
             if !window.capturable {
-                return Err("window is hidden, minimized, off-screen, or not capturable; no desktop fallback".into());
+                return Err("window is hidden, minimized, off-screen, on a nonzero layer, or not capturable; no desktop fallback".into());
             }
             vec![Capture::Window {
                 pid: *pid,
@@ -272,6 +271,14 @@ fn select(inventory: &Inventory, target: &Target) -> Result<Vec<Capture>> {
     Ok(selected)
 }
 
+fn check_display_topology(expected: &Inventory, mut current: Inventory) -> Result<()> {
+    current.displays.sort_by_key(|d| d.display_id);
+    if current.displays != expected.displays {
+        return Err("display topology changed; list again".into());
+    }
+    Ok(())
+}
+
 fn build_observation(backend: &dyn Backend, request: &Request) -> Result<Vec<u8>> {
     validate_request(request)?;
     let mut manifest = Manifest::new();
@@ -281,7 +288,7 @@ fn build_observation(backend: &dyn Backend, request: &Request) -> Result<Vec<u8>
         let mut inventory = backend.inventory(deadline)?;
         inventory.applications.sort_by_key(|a| a.pid);
         inventory.windows.sort_by_key(|w| w.window_id);
-        inventory.displays.sort_by_key(|d| d.index);
+        inventory.displays.sort_by_key(|d| d.display_id);
         manifest.inventory = Some(inventory.clone());
         if let Request::Capture { target } = request {
             let captures = select(&inventory, target)?;
@@ -305,17 +312,17 @@ fn build_observation(backend: &dyn Backend, request: &Request) -> Result<Vec<u8>
                             },
                         )?;
                     }
-                    Capture::Display { display_id, index } => {
-                        if !current
-                            .displays
-                            .iter()
-                            .any(|d| d.display_id == *display_id && d.index == *index)
-                        {
-                            return Err("display topology changed; list again".into());
-                        }
-                    }
+                    Capture::Display { .. } => check_display_topology(&inventory, current)?,
                 }
                 backend.capture(&capture, &path, deadline)?;
+                // A moved/added/removed display invalidates the whole observation,
+                // including images captured earlier. Never relabel a rectangle.
+                if matches!(capture, Capture::Display { .. }) {
+                    check_display_topology(&inventory, backend.inventory(deadline)?)?;
+                }
+                if Instant::now() >= deadline {
+                    return Err("host observation exceeded 45 second deadline".into());
+                }
                 let metadata = fs::symlink_metadata(&path)
                     .map_err(|e| format!("capture did not produce an image: {e}"))?;
                 if !metadata.is_file() || metadata.len() > MAX_ARCHIVE as u64 {

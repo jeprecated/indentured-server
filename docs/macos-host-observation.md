@@ -167,18 +167,32 @@ LaunchAgent or the applications being inspected.
   listed; this is not an inventory of every Unix process or every logged-in user.
 - Windows carry owner PID, window ID, title where available, bounds and visibility
   information. Missing/redacted titles are not grounds to omit an application.
+  Window and display bounds both use CoreGraphics global screen points: origin
+  at the main display's top-left, x rightward and y downward. Displays above or
+  left of the main display have negative coordinates. PNG dimensions are pixels,
+  not points, and may differ with Retina scaling.
 - Use a fresh inventory: PIDs/window IDs are ephemeral, not durable bookmarks.
   An exact-window request checks the owner and fails if stale; it never falls
   back to a similarly titled window, coordinate crop, or whole desktop.
 - Application capture returns eligible windows individually. An app with no
   capturable windows returns an explicit error, not an unrelated screenshot.
-- Whole-desktop capture returns one PNG per display with display identity.
-  Display ordinal and CoreGraphics display ID are different values. Captures
-  across displays are sequential, not an atomic panorama.
+- Whole-desktop capture returns one PNG per logical display with its CoreGraphics
+  display ID. Mirrored physical displays share a desktop; `NSScreen` lists one
+  representative, not duplicate captures of each connector. The helper uses the
+  explicit `CGDisplayBounds` rectangle with `screencapture -R`, never an assumed
+  mapping from `NSScreen` order to `screencapture -D`. There is no display ordinal
+  in the manifest. Nonintegral/invalid rectangles fail rather than being rounded.
+  All display IDs/bounds are rechecked before and after each capture; any detected
+  topology change discards the entire observation. Captures across displays are
+  sequential, not an atomic panorama; an undetected change-and-revert between
+  checks remains possible.
 - Minimized, hidden, off-Space, protected and transient windows may not be
-  capturable. Enumeration and capture cannot be atomic; a window can disappear
+  capturable. Only layer-zero windows are eligible; floating panels and
+  Picture-in-Picture windows on other layers are listed but not captured. Enumeration and capture cannot be atomic; a window can disappear
   between them. Permission denial/unavailable GUI and capture failures must be
   treated as failures, not evidence of a blank app.
+- `captured_at` records the observation's start, not a simultaneous exposure
+  time for all PNGs.
 - A valid PNG proves transport/encoding, not that DRM-protected or otherwise
   unavailable pixels became visible. Inspect the image and recorded errors.
 
@@ -190,7 +204,14 @@ absolute deadlines; a slow sender cannot extend them by trickling bytes.
 
 ## Native acceptance gate
 
-The offline tests use fake inventories and PNGs. Before declaring the deployed
+The offline tests use fake inventories and PNGs. `nix flake check` also executes
+`enumerate.js` with opaque CF-reference fixtures, actual session dictionary key
+spellings, wrong-user/locked-session denials, and three equal-size displays with
+negative origins. Node is a pinned test-only dependency, not a helper runtime.
+On Darwin, `scripts/check-darwin.sh` additionally executes the shipped CF bridge
+against real, synthetic native CF collections and CGRect values without touching
+GUI contents or requesting permissions. These checks do **not** attest GUI/TCC.
+Before declaring the deployed
 Mac usable, run these checks through its **actual LaunchAgent and authenticated
 Indentured artifact flow**, not merely from Terminal:
 
@@ -200,8 +221,10 @@ Indentured artifact flow**, not merely from Terminal:
    inspect the returned local PNG and verify it is the selected window.
 3. Capture an app with multiple windows and one with none. Close a selected
    window before capture; require an error, with no fallback or stale image.
-4. Capture every connected display; verify actual images against manifest IDs
-   on mixed Retina/non-Retina scales, negative origins, mirroring and hotplug.
+4. Capture every logical display; verify actual images against manifest IDs
+   on at least three displays (including equal-size screens), mixed Retina/non-Retina
+   scales, negative origins, mirroring and hotplug. Mirrored connectors share one
+   logical desktop. Match recognizable content, not merely PNG dimensions.
 5. Deny/revoke then grant permission using the deployed invocation chain. Check
    logout/login, locked screen, no GUI session and fast user switching; never
    accept evidence from an unintended login session.

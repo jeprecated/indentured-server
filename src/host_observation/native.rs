@@ -4,6 +4,41 @@ use std::time::Instant;
 
 pub struct Native;
 
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn capture_arguments(capture: &Capture) -> Result<Vec<String>> {
+    let mut args = vec!["-x".into(), "-t".into(), "png".into()];
+    match capture {
+        Capture::Window { window_id, .. } => {
+            args.extend(["-o".into(), "-l".into(), window_id.to_string()]);
+        }
+        Capture::Display { bounds, .. } => {
+            // screencapture -R uses CoreGraphics global screen points. Refuse
+            // unsupported geometry rather than rounding or using display ordinals.
+            if [bounds.x, bounds.y, bounds.width, bounds.height]
+                .iter()
+                .any(|v| {
+                    !v.is_finite()
+                        || v.fract() != 0.0
+                        || *v < i32::MIN as f64
+                        || *v > i32::MAX as f64
+                })
+                || bounds.width <= 0.0
+                || bounds.height <= 0.0
+            {
+                return Err(
+                    "display bounds must be finite integral screen points with positive size"
+                        .into(),
+                );
+            }
+            args.push(format!(
+                "-R{},{},{},{}",
+                bounds.x, bounds.y, bounds.width, bounds.height
+            ));
+        }
+    }
+    Ok(args)
+}
+
 #[cfg(not(target_os = "macos"))]
 impl Backend for Native {
     fn inventory(&self, _deadline: Instant) -> Result<Inventory> {
@@ -134,15 +169,7 @@ mod macos {
         }
         fn capture(&self, capture: &Capture, path: &Path, deadline: Instant) -> Result<()> {
             let mut command = Command::new("/usr/sbin/screencapture");
-            command.args(["-x", "-t", "png"]);
-            match capture {
-                Capture::Window { window_id, .. } => {
-                    command.args(["-o", "-l", &window_id.to_string()]);
-                }
-                Capture::Display { index, .. } => {
-                    command.args(["-D", &index.to_string()]);
-                }
-            }
+            command.args(capture_arguments(capture)?);
             command.arg(path);
             run(command, deadline).map(|_| ())
         }

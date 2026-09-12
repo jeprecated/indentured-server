@@ -134,6 +134,11 @@
           indentured-server-package = server;
           indentured-package = client;
           indentured-host-package = host;
+          host-observation-jxa = pkgs.runCommand "indentured-host-observation-jxa" { } ''
+            export HOST_OBSERVATION_SCRIPT=${./src/host_observation/enumerate.js}
+            ${pkgs.nodejs}/bin/node --test ${./tests/host_observation_jxa.cjs}
+            touch "$out"
+          '';
           package-layout = pkgs.runCommand "indentured-package-layout" { } ''
             test -x "${server}/bin/indentured-server"
             test ! -e "${server}/bin/indentured"

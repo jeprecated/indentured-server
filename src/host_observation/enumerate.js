@@ -3,6 +3,11 @@
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
 
+// CoreGraphics returns opaque CF refs in JXA. Toll-free bridge before unwrapping.
+function unwrapCF(ref) {
+    return ObjC.deepUnwrap(ObjC.castRefToObject(ref));
+}
+
 function run(argv) {
     try {
         if (argv[0] === 'permissions') {
@@ -11,9 +16,11 @@ function run(argv) {
             if (!granted) return JSON.stringify({error: 'Screen Recording access is not granted yet; approve the prompt or Settings entry and restart the helper'});
             return JSON.stringify({schema_version: '1', screen_recording: 'granted'});
         }
-        var session = ObjC.deepUnwrap($.CGSessionCopyCurrentDictionary());
-        if (!session || !session.kCGSessionOnConsoleKey ||
-            Number(session.kCGSessionUserIDKey) !== Number(argv[1]) ||
+        var session = unwrapCF($.CGSessionCopyCurrentDictionary());
+        // CGSession.h defines these CFSTR values with "CGSSession", not the
+        // "CGSession" spelling of the C macros (which JXA need not expose).
+        if (!session || !session.kCGSSessionOnConsoleKey ||
+            Number(session.kCGSSessionUserIDKey) !== Number(argv[1]) ||
             session.CGSSessionScreenIsLocked) {
             return JSON.stringify({error: 'GUI session unavailable, locked, or belongs to another user; run the helper as a LaunchAgent in the active logged-in user session'});
         }
@@ -33,8 +40,8 @@ function run(argv) {
                 bundle_id: ObjC.unwrap(app.bundleIdentifier) || null, hidden: hidden[pid]});
         }
         // Include off-screen/minimized windows in inventory, but not in capture eligibility.
-        var windows = ObjC.deepUnwrap($.CGWindowListCopyWindowInfo(16, 0));
-        if (!windows) return JSON.stringify({error: 'WindowServer inventory unavailable'});
+        var windows = unwrapCF($.CGWindowListCopyWindowInfo(16, 0));
+        if (!Array.isArray(windows)) return JSON.stringify({error: 'WindowServer inventory unavailable'});
         windows.forEach(function(w) {
             var b = w.kCGWindowBounds || {};
             var pid = Number(w.kCGWindowOwnerPID);
@@ -49,9 +56,13 @@ function run(argv) {
         var screens = $.NSScreen.screens;
         for (var j = 0; j < Number(screens.count); j++) {
             var screen = screens.objectAtIndex(j);
-            var frame = screen.frame;
-            result.displays.push({display_id: Number(ObjC.unwrap(screen.deviceDescription.objectForKey('NSScreenNumber'))),
-                index: j + 1, bounds: {x: Number(frame.origin.x), y: Number(frame.origin.y),
+            var displayID = Number(ObjC.unwrap(screen.deviceDescription.objectForKey('NSScreenNumber')));
+            // Match kCGWindowBounds: global screen points, top-left origin, y down.
+            // NSScreen order is NOT a screencapture -D selector. Capture the
+            // display's explicit rectangle instead; mirrored screens share it.
+            var frame = $.CGDisplayBounds(displayID);
+            result.displays.push({display_id: displayID,
+                bounds: {x: Number(frame.origin.x), y: Number(frame.origin.y),
                     width: Number(frame.size.width), height: Number(frame.size.height)}});
         }
         if (!result.displays.length) return JSON.stringify({error: 'No graphical displays available'});
