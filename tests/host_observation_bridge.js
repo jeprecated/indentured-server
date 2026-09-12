@@ -2,6 +2,15 @@
 // exercise the shipped unwrapCF with REAL native refs, without querying a GUI,
 // prompting for permission, or reading screen contents.
 function run() {
+    // Check the REAL shipped API bindings, without calling any permission or
+    // desktop inspection function. Synthetic CF tests alone miss absent APIs.
+    if (typeof $.CGPreflightScreenCaptureAccess !== 'function' ||
+        typeof $.CGRequestScreenCaptureAccess !== 'function' ||
+        typeof $.CGSessionCopyCurrentDictionary !== 'function' ||
+        typeof $.CGWindowListCopyWindowInfo !== 'function' ||
+        typeof $.CGDisplayBounds !== 'function') {
+        throw new Error('required CoreGraphics API binding unavailable');
+    }
     ObjC.import('Foundation');
     var array = unwrapCF($.CFArrayCreate(null, null, 0, null));
     var dictionary = unwrapCF($.CFDictionaryCreate(null, null, null, 0, null, null));
@@ -25,5 +34,5 @@ function run() {
         Number(rectangle.size.width) !== 1920 || Number(rectangle.size.height) !== 1080) {
         throw new Error('CoreGraphics rectangle bridging failed');
     }
-    return 'native host-observation CF/CGRect bridge: passed (no GUI/TCC attestation)';
+    return 'native host-observation CF/CGRect and API bindings: passed (no GUI/TCC attestation)';
 }

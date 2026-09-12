@@ -242,8 +242,15 @@ executes. `nix flake check` also executes
 spellings, wrong-user/locked-session denials, and three equal-size displays with
 negative origins. Node is a pinned test-only dependency, not a helper runtime.
 On Darwin, `scripts/check-darwin.sh` additionally executes the shipped CF bridge
-against real, synthetic native CF collections and CGRect values without touching
-GUI contents or requesting permissions. The `host-observation-transport` flake
+against real, synthetic native CF collections and CGRect values, and verifies
+that all required CoreGraphics functions are callable in JXA, without invoking
+permission APIs or touching GUI contents. Some macOS versions omit
+`CGPreflightScreenCaptureAccess` and `CGRequestScreenCaptureAccess` from JXA's
+framework metadata despite exporting the C symbols. The helper explicitly binds
+missing functions with their `bool(void)` signatures; binding does not request
+consent. Startup preflight skips the request when already granted, while inventory
+never requests permission. Offline JavaScript tests cover missing and existing
+metadata, granted access, and accepted/denied startup requests. The `host-observation-transport` flake
 check runs the Rust socket-deadline tests natively on each supported platform,
 including peer closure before the header or between header and payload reads,
 truncated frames, closed-peer writes, and stalled-transfer deadlines. This check

@@ -3,6 +3,16 @@
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
 
+// These exported C APIs are missing from CoreGraphics' JXA bridge metadata on
+// some macOS releases. Both signatures are bool function(void). Binding only
+// exposes the functions; consent is requested solely by the permissions path.
+if (typeof $.CGPreflightScreenCaptureAccess !== 'function') {
+    ObjC.bindFunction('CGPreflightScreenCaptureAccess', ['bool', []]);
+}
+if (typeof $.CGRequestScreenCaptureAccess !== 'function') {
+    ObjC.bindFunction('CGRequestScreenCaptureAccess', ['bool', []]);
+}
+
 // CoreGraphics returns opaque CF refs in JXA. Toll-free bridge before unwrapping.
 function unwrapCF(ref) {
     return ObjC.deepUnwrap(ObjC.castRefToObject(ref));
