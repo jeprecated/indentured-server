@@ -399,7 +399,11 @@ struct ErrorResponse {
 }
 
 pub async fn run(config: Arc<Config>) -> Result<(), HttpError> {
-    prepare_protected_directory(&config.build.workspace_root, 0o711)?;
+    let workspace_root_mode = config
+        .build
+        .parse_workspace_root_mode()
+        .map_err(|err| HttpError::Serve(err.to_string()))?;
+    prepare_protected_directory(&config.build.workspace_root, workspace_root_mode)?;
     crate::artifacts::prepare_artifact_storage_root(&config.artifacts.storage_root)
         .map_err(|err| HttpError::Serve(err.to_string()))?;
     crate::build::preflight_run_as(&config).map_err(|err| HttpError::Serve(err.to_string()))?;
@@ -3910,6 +3914,7 @@ mod tests {
             service,
             build: BuildConfig {
                 workspace_root: workspace_root.clone(),
+                workspace_root_mode: "0711".to_string(),
                 max_timeout_sec: 60,
                 max_output_bytes: 32 * 1024 * 1024,
                 run_as_user: None,

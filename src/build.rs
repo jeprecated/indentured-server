@@ -2563,6 +2563,7 @@ timeout_sec = 1
             service: ServiceConfig::default(),
             build: BuildConfig {
                 workspace_root: temp.path().join("workspaces"),
+                workspace_root_mode: "0711".to_string(),
                 max_timeout_sec: 60,
                 max_output_bytes: 1024,
                 run_as_user: None,

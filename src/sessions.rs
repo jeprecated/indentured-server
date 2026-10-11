@@ -2418,6 +2418,7 @@ mod tests {
             service: ServiceConfig::default(),
             build: BuildConfig {
                 workspace_root: root.join("workspaces"),
+                workspace_root_mode: "0711".to_string(),
                 max_timeout_sec: 10,
                 max_output_bytes: 1024 * 1024,
                 run_as_user: None,

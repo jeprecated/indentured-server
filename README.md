@@ -137,6 +137,11 @@ enabled = false
 
 [build]
 workspace_root = "/var/lib/indentured-server/workspaces"
+# Applied to workspace_root at startup. The default 0711 lets tasks traverse but
+# not list it. Use 0755 when task tooling must open the parent for reading, as
+# Nix 2.34 does for every parent of an evaluated path. Modes that let group or
+# other users write are rejected.
+workspace_root_mode = "0711"
 max_timeout_sec = 1800
 max_output_bytes = 67108864
 run_as_user = "indentured-build"

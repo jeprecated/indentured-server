@@ -232,6 +232,8 @@ impl Config {
             ));
         }
 
+        self.build.parse_workspace_root_mode()?;
+
         if self.service.max_concurrent_builds == 0 {
             return Err(ConfigError::Invalid(
                 "service.max_concurrent_builds must be greater than zero".to_string(),
@@ -531,6 +533,10 @@ pub struct BuildConfig {
     #[serde(default = "default_workspace_root")]
     pub workspace_root: PathBuf,
 
+    /// Four-digit octal mode applied to `workspace_root` at startup.
+    #[serde(default = "default_workspace_root_mode")]
+    pub workspace_root_mode: String,
+
     #[serde(default = "default_max_timeout_sec")]
     pub max_timeout_sec: u64,
 
@@ -548,6 +554,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             workspace_root: default_workspace_root(),
+            workspace_root_mode: default_workspace_root_mode(),
             max_timeout_sec: default_max_timeout_sec(),
             max_output_bytes: default_max_output_bytes(),
             run_as_user: None,
@@ -558,6 +565,26 @@ impl Default for BuildConfig {
 
 fn default_workspace_root() -> PathBuf {
     PathBuf::from("/var/lib/indentured-server/workspaces")
+}
+
+fn default_workspace_root_mode() -> String {
+    "0711".to_string()
+}
+
+impl BuildConfig {
+    /// The workspace root mode. Tasks need traversal; listing is optional.
+    pub fn parse_workspace_root_mode(&self) -> Result<u32, ConfigError> {
+        let invalid = || {
+            ConfigError::Invalid(
+                "build.workspace_root_mode must be a 4-digit octal mode from 0700 to 0755 that grants the owner rwx and no group or other write".to_string(),
+            )
+        };
+        let mode = parse_socket_mode(&self.workspace_root_mode).map_err(|_| invalid())?;
+        if mode & !0o777 != 0 || mode & 0o700 != 0o700 || mode & 0o022 != 0 {
+            return Err(invalid());
+        }
+        Ok(mode)
+    }
 }
 
 fn default_max_timeout_sec() -> u64 {
@@ -1584,6 +1611,37 @@ mod tests {
             sources: SourcesConfig::default(),
             artifacts,
             logging: LoggingConfig::default(),
+        }
+    }
+
+    #[test]
+    fn workspace_root_mode_defaults_to_traversal_only_and_rejects_writable_modes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = valid_config(temp.path());
+        assert_eq!(config.build.parse_workspace_root_mode().unwrap(), 0o711);
+
+        let raw = r#"
+schema_version = "12"
+tasks = {}
+[build]
+workspace_root_mode = "0755"
+"#;
+        let parsed = toml::from_str::<Config>(raw).expect("config with workspace_root_mode");
+        assert_eq!(parsed.build.parse_workspace_root_mode().unwrap(), 0o755);
+
+        for (mode, valid) in [
+            ("0755", true),
+            ("0750", true),
+            ("0700", true),
+            ("0775", false),
+            ("0757", false),
+            ("0611", false),
+            ("1755", false),
+            ("755", false),
+            ("07x5", false),
+        ] {
+            config.build.workspace_root_mode = mode.to_string();
+            assert_eq!(config.validate().is_ok(), valid, "{mode}");
         }
     }
 
