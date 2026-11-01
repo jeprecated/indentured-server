@@ -4540,7 +4540,7 @@ mod tests {
     ) {
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
         let names: Vec<String> = (0..zip.len())
-            .map(|index| zip.by_index(index).unwrap().name().to_string())
+            .map(|index| zip.by_index(index).unwrap().name().unwrap().into_owned())
             .collect();
         assert_eq!(names, expected_names);
         let mut file = zip.by_name(content_name).expect("artifact entry");

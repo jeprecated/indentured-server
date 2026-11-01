@@ -950,7 +950,8 @@ mod tests {
                     .by_index(index)
                     .expect("zip entry")
                     .name()
-                    .to_string(),
+                    .expect("zip entry name")
+                    .into_owned(),
             );
         }
         names

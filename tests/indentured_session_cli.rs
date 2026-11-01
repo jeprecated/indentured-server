@@ -447,7 +447,7 @@ fn update_posts_explicit_deterministic_source_and_prints_only_revision() {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(&request.body[zip_start..])).unwrap();
     assert_eq!(archive.len(), 1);
-    assert_eq!(archive.by_index(0).unwrap().name(), "changed.txt");
+    assert_eq!(archive.by_index(0).unwrap().name().unwrap(), "changed.txt");
     assert!(archive.by_name("undeclared.txt").is_err());
     assert!(archive.by_name("gone.txt").is_err());
 

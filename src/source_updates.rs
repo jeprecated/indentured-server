@@ -196,7 +196,10 @@ fn prepare_archive(
         let mut entry = archive
             .by_index(index)
             .map_err(|err| UpdateError::bad(format!("failed to read update zip entry: {err}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|err| UpdateError::bad(format!("invalid update zip entry name: {err}")))?
+            .into_owned();
         if !seen.insert(name.clone()) || !folded.insert(name.to_ascii_lowercase()) {
             return Err(UpdateError::bad(
                 "update archive contains duplicate or case-colliding paths",
