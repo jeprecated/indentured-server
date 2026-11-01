@@ -1427,7 +1427,10 @@ fn extract_source_archive_inner(
             BuildError::new("source_archive", format!("failed to read zip entry: {err}"))
         })?;
         let is_symlink = entry.is_symlink();
-        let normalized = normalized_zip_path(entry.name(), entry.is_dir(), max_depth)?;
+        let name = entry.name().map_err(|err| {
+            BuildError::new("source_archive", format!("invalid zip entry name: {err}"))
+        })?;
+        let normalized = normalized_zip_path(&name, entry.is_dir(), max_depth)?;
         let output = dest.join(&normalized);
         if entry.is_dir() {
             std::fs::create_dir_all(&output)
@@ -1546,7 +1549,10 @@ fn preflight_source_archive(
         }
         let is_dir = entry.is_dir();
         let is_symlink = entry.is_symlink();
-        let normalized = normalized_zip_path(entry.name(), is_dir, max_depth)?;
+        let name = entry.name().map_err(|err| {
+            BuildError::new("source_archive", format!("invalid zip entry name: {err}"))
+        })?;
+        let normalized = normalized_zip_path(&name, is_dir, max_depth)?;
         validate_zip_type(entry.unix_mode(), is_dir, is_symlink)?;
         if !exact.insert(normalized.clone()) || !folded.insert(normalized.to_ascii_lowercase()) {
             return Err(BuildError::new(

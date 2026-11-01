@@ -846,7 +846,7 @@ fn decode_archive(bytes: &[u8]) -> Result<(Manifest, Vec<Vec<u8>>)> {
     let mut names = BTreeSet::new();
     for i in 0..zip.len() {
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        if !names.insert(entry.name().to_string())
+        if !names.insert(entry.name().map_err(|e| e.to_string())?.into_owned())
             || entry.is_dir()
             || entry.is_symlink()
             || entry.size() > MAX_ARCHIVE as u64

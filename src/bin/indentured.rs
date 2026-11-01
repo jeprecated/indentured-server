@@ -3167,13 +3167,15 @@ async fn emit_session_id_controlled(
         Ok(false) => {}
         Err(err) => return ControlledIo::Completed(Err(err)),
     }
-    let output = match tokio::io::unix::AsyncFd::new(output) {
+    // SAFETY: `NonblockingStdout` owns its duplicated descriptor and never
+    // closes or replaces it while the `AsyncFd` owns it.
+    let output = match unsafe { tokio::io::unix::AsyncFd::register(output) } {
         Ok(output) => output,
         Err(err) => {
             if interrupt.poll_pending().await {
                 return ControlledIo::Interrupted;
             }
-            return ControlledIo::Completed(Err(err));
+            return ControlledIo::Completed(Err(err.into()));
         }
     };
     loop {
@@ -3591,7 +3593,9 @@ async fn read_nonblocking_descriptor(
     file: fs::File,
     wait_on_initial_eof: bool,
 ) -> io::Result<Vec<u8>> {
-    let descriptor = tokio::io::unix::AsyncFd::new(file)?;
+    // SAFETY: the owned `File` keeps its descriptor open and unchanged for the
+    // `AsyncFd`'s lifetime.
+    let descriptor = unsafe { tokio::io::unix::AsyncFd::register(file)? };
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -4620,7 +4624,11 @@ fn extract_zip_atomic(zip_path: &Path, run_directory: &Path) -> io::Result<()> {
         let entry = archive
             .by_index(index)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let name = entry.name().trim_end_matches('/').to_string();
+        let name = entry
+            .name()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .trim_end_matches('/')
+            .to_string();
         validate_zip_entry_path(&name)?;
         if name.split('/').count() > MAX_DEPTH {
             return Err(io::Error::new(
@@ -4688,8 +4696,10 @@ fn extract_zip_atomic(zip_path: &Path, run_directory: &Path) -> io::Result<()> {
             let mut entry = archive
                 .by_index(index)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            let name = entry.name().trim_end_matches('/');
-            let output = staging.join(name);
+            let name = entry
+                .name()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            let output = staging.join(name.trim_end_matches('/'));
             if entry.is_dir() {
                 fs::create_dir_all(&output)?;
                 continue;
